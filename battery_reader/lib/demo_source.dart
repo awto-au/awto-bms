@@ -24,7 +24,29 @@ class DemoBattery {
   Timer? _timer;
   int _tick = 0;
 
-  DemoBattery(this.onFrame, {this.startSoc = 50, this.mode = DemoMode.charging});
+  /// How long the virtual BMS takes to acknowledge a write (M2): the ack and
+  /// the refreshed status frames are emitted after this delay, so a caller's
+  /// read-back listener (subscribed right after the send) sees them.
+  final Duration ackLatency;
+
+  // Writable virtual state (M2). Gates start as a real pack would report them
+  // (charge MOS on; discharge MOS on unless charging), and every accepted write
+  // updates them so the next BAL_STATUS reflects the change.
+  bool _chargeMos = true;
+  late bool _dischargeMos = mode != DemoMode.charging;
+  bool _passiveBal = false;
+  int _heatGate = 0;
+  int _tempGate = 1;
+  int _smokeGate = 0;
+  bool _sleeping = false;
+  double _fullAh = 100.0;
+
+  DemoBattery(
+    this.onFrame, {
+    this.startSoc = 50,
+    this.mode = DemoMode.charging,
+    this.ackLatency = const Duration(milliseconds: 200),
+  });
 
   void start({Duration interval = const Duration(seconds: 1)}) {
     _timer?.cancel();
@@ -35,6 +57,50 @@ class DemoBattery {
   void stop() {
     _timer?.cancel();
     _timer = null;
+    _stopped = true;
+  }
+
+  bool _stopped = false;
+
+  /// M2: accept a command frame the app would have written to FCF1 and behave
+  /// like the BMS — update the virtual state and, after [ackLatency], emit the
+  /// matching ack plus a refreshed status frame so read-backs complete. Frames
+  /// the demo does not model (handshake, version, history) are accepted
+  /// silently. Never throws.
+  void handleWrite(List<int> bytes) {
+    if (bytes.length < 2) return;
+    final b0 = bytes[0] & 0xff, b1 = bytes[1] & 0xff;
+    List<int>? ack;
+    if (b0 == 0xC3 && b1 == 0x1E && bytes.length == 12) {
+      // CMD_GATE_CONTROL: 8 payload bytes, see battery_protocol.dart.
+      final p = bytes.sublist(2, 10);
+      _chargeMos = p[0] == 1;
+      _dischargeMos = p[1] == 1;
+      _tempGate = p[2] & 0xff;
+      _smokeGate = p[3] & 0xff;
+      _heatGate = p[4] & 0xff;
+      _passiveBal = p[6] == 1;
+      // restart [5] / factory [7]: a real pack reboots; the demo just acks.
+      ack = [0xD2, 0x7E, ...p.map((v) => v == 0 ? 0 : 1), 0xFA, 0x4B];
+    } else if (b0 == 0xAA && b1 == 0xCC && bytes.length == 6) {
+      // Sleep: AA CC 00 .. = sleep on, AA CC 01 .. = wake. Ack byte0==0 = on.
+      _sleeping = bytes[2] == 0;
+      ack = [0xAC, 0xCA, _sleeping ? 0 : 1, 0xDE, 0xED];
+    } else if (b0 == 0xC5 && b1 == 0x60 && bytes.length == 7) {
+      // CMD_BATTERY capacity write: 24-bit LE mAh.
+      final mah = (bytes[2] & 0xff) |
+          ((bytes[3] & 0xff) << 8) |
+          ((bytes[4] & 0xff) << 16);
+      _fullAh = mah / 1000.0;
+      ack = [0xAB, 0xBA, 0x04, 0xCD, 0xDC]; // SETTING_RESPOND type 4
+    }
+    if (ack == null) return;
+    final frame = ack;
+    Timer(ackLatency, () {
+      if (_stopped) return;
+      onFrame(frame);
+      _emitStatus(_socNow());
+    });
   }
 
   int _socNow() {
@@ -70,11 +136,8 @@ class DemoBattery {
       DemoMode.idle => 0.0,
     };
     final powerW = (packMv / 1000.0) * currentA;
-    const fullAh = 100.0;
-    final remainingAh = fullAh * soc / 100.0;
     final toFullSec = charging ? ((100 - soc) * 90) : 0;
     final toEmptySec = discharging ? (soc * 120) : 0;
-    final chargeState = charging ? 1 : (discharging ? 2 : 0);
 
     onFrame(_vol(cells));
     onFrame(_temp(28, 30));
@@ -90,14 +153,25 @@ class DemoBattery {
       powerDeciW: (powerW * 10).round(),
       cycles: 7,
     ));
-    onFrame(_mos(chargeMos: true, dischargeMos: !charging));
-    onFrame(_bal(
-      chargeState: chargeState,
-      chargeMos: true,
-      dischargeMos: !charging,
-    ));
-    onFrame(_soc(soc: soc, remainingAh: remainingAh, fullAh: fullAh));
+    _emitStatus(soc);
     onFrame(_est(toFullSec: toFullSec, toEmptySec: toEmptySec));
+    // A real BMS streams all three alarm frames every cycle; the packed
+    // `flags` log row is only written once every category is known (M8).
+    onFrame(_warnCur());
+    onFrame(_warnVol());
+    onFrame(_warnTemp());
+  }
+
+  /// The status frames that reflect the writable virtual state: MOS, BAL and
+  /// SOC. Emitted every cycle and again right after an accepted write.
+  void _emitStatus(int soc) {
+    final charging = mode == DemoMode.charging;
+    final discharging = mode == DemoMode.discharging;
+    final chargeState = charging ? 1 : (discharging ? 2 : 0);
+    final remainingAh = _fullAh * soc / 100.0;
+    onFrame(_mos(chargeMos: _chargeMos, dischargeMos: _dischargeMos));
+    onFrame(_bal(chargeState: chargeState));
+    onFrame(_soc(soc: soc, remainingAh: remainingAh, fullAh: _fullAh));
   }
 
   // --- frame builders ------------------------------------------------------
@@ -153,19 +227,23 @@ class DemoBattery {
         0xB4, 0xC7,
       ];
 
-  List<int> _bal({
-    required int chargeState,
-    required bool chargeMos,
-    required bool dischargeMos,
-  }) =>
-      [
+  List<int> _bal({required int chargeState}) => [
         0xA8, 0xAC,
         chargeState & 0xff,
-        chargeMos ? 1 : 0,
-        dischargeMos ? 1 : 0,
-        0, 0, 0, 0,
+        _chargeMos ? 1 : 0,
+        _dischargeMos ? 1 : 0,
+        _passiveBal ? 1 : 0,
+        _tempGate & 0xff,
+        _smokeGate & 0xff,
+        _heatGate & 0xff,
         0xB9, 0x21,
       ];
+
+  // Alarm frames, all clear (one flag byte per condition; unknown bytes 0).
+  List<int> _warnCur() => [0xA4, 0x8B, 0, 0, 0, 0, 0, 0xB5, 0xDD];
+  List<int> _warnVol() =>
+      [0xA5, 0x99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xB6, 0x17];
+  List<int> _warnTemp() => [0xA6, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0xB7, 0x72];
 
   List<int> _soc({
     required int soc,

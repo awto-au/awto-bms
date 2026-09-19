@@ -1,0 +1,259 @@
+/// Shared interval helpers (review pass C2, GitHub #51).
+///
+/// The charts page, the sparklines and the logger all reason about the SAME
+/// thing — held `[startMs, endMs]` runs of a value, with a gap wider than
+/// [BatteryLogger.gapMs] meaning "offline" — and each used to carry its own
+/// copy of the run / coverage / splice logic. This library holds the one
+/// implementation of each rule, plus the shared y-axis policy and look-back
+/// window, and is pure Dart (no Flutter, no DB) so every helper is unit-tested
+/// directly:
+///
+///  * [ReadingInterval] — the interval value type (moved here from the logger;
+///    battery_log.dart re-exports it).
+///  * [abuts] — the ONE gap rule: two spans abut iff `next.start - prev.end`
+///    is at most the threshold.
+///  * [splitRuns] — group time-ordered intervals into runs of abutting rows
+///    (offline gaps are never bridged).
+///  * [mergeCoverage] / [uncoveredGaps] — the union of covered time, and its
+///    complement within a window (the offline stretches the charts shade).
+///  * [spliceTail] — append the live in-memory tail onto the durable DB body
+///    without duplicating or dropping anything (audit H4).
+///  * [yBounds] — the 0-inclusive / symmetric-about-0 axis policy (#32).
+///  * [LookbackWindow] + [computeRange] — the selectable look-back windows and
+///    the from/to derivation the charts and sparklines share.
+library;
+
+/// Anything that spans `[startMs, endMs]`.
+abstract interface class TimeSpan {
+  int get startMs;
+  int get endMs;
+}
+
+/// A finalized (or in-progress) interval: one run of a single value for one
+/// (serial, metric). Immutable value type for queries and for the pure
+/// interval builder's output.
+class ReadingInterval implements TimeSpan {
+  final String serial;
+  final String metric;
+  final double? valueNum;
+  final String? valueText;
+  @override
+  final int startMs;
+  @override
+  final int endMs;
+
+  const ReadingInterval({
+    this.serial = '',
+    this.metric = '',
+    this.valueNum,
+    this.valueText,
+    required this.startMs,
+    required this.endMs,
+  });
+
+  /// The same interval clamped to start no earlier than [startMs].
+  ReadingInterval withStart(int startMs) => ReadingInterval(
+        serial: serial,
+        metric: metric,
+        valueNum: valueNum,
+        valueText: valueText,
+        startMs: startMs,
+        endMs: endMs,
+      );
+
+  @override
+  String toString() =>
+      'Interval($metric ${valueText ?? valueNum} $startMs..$endMs)';
+}
+
+/// THE gap rule. A span starting at [nextStartMs] abuts one that ended at
+/// [prevEndMs] iff the gap between them is at most [gapMs]; a wider gap is an
+/// offline window and is never bridged (by a run, a chart line, a band segment
+/// or the logger's open interval).
+bool abuts(int prevEndMs, int nextStartMs, int gapMs) =>
+    nextStartMs - prevEndMs <= gapMs;
+
+/// Group time-ordered intervals into runs of consecutive rows that abut
+/// (gap <= [gapMs]); a wider gap starts a new run so the offline window is left
+/// unbridged. [where] optionally drops rows (e.g. null-valued ones) BEFORE
+/// grouping, so a dropped row neither starts nor extends a run.
+List<List<T>> splitRuns<T extends TimeSpan>(
+  Iterable<T> ivs, {
+  required int gapMs,
+  bool Function(T iv)? where,
+}) {
+  final runs = <List<T>>[];
+  List<T>? cur;
+  for (final iv in ivs) {
+    if (where != null && !where(iv)) continue;
+    if (cur == null || !abuts(cur.last.endMs, iv.startMs, gapMs)) {
+      cur = <T>[iv];
+      runs.add(cur);
+    } else {
+      cur.add(iv);
+    }
+  }
+  return runs;
+}
+
+/// The union of covered time across [ivs] (any order): sorted, with spans that
+/// overlap or abut (within [gapMs]) merged into one `(start, end)`.
+List<(int, int)> mergeCoverage(Iterable<TimeSpan> ivs, {required int gapMs}) {
+  final covered = <(int, int)>[for (final iv in ivs) (iv.startMs, iv.endMs)];
+  if (covered.isEmpty) return const [];
+  covered.sort((a, b) => a.$1.compareTo(b.$1));
+  final merged = <(int, int)>[];
+  var (cs, ce) = covered.first;
+  for (var i = 1; i < covered.length; i++) {
+    final (s, e) = covered[i];
+    if (abuts(ce, s, gapMs)) {
+      if (e > ce) ce = e;
+    } else {
+      merged.add((cs, ce));
+      cs = s;
+      ce = e;
+    }
+  }
+  merged.add((cs, ce));
+  return merged;
+}
+
+/// Offline windows: the stretches of `[from, to]` not covered by ANY of [ivs]
+/// (the complement of [mergeCoverage]), keeping only gaps wider than [gapMs].
+/// Empty when nothing is covered at all (nothing to contrast against).
+List<(int, int)> uncoveredGaps(
+  Iterable<TimeSpan> ivs,
+  int from,
+  int to, {
+  required int gapMs,
+}) {
+  final merged = mergeCoverage(ivs, gapMs: gapMs);
+  if (merged.isEmpty) return const [];
+  final gaps = <(int, int)>[];
+  var cursor = from;
+  for (final (s, e) in merged) {
+    if (s > cursor) gaps.add((cursor, s < to ? s : to));
+    if (e > cursor) cursor = e;
+  }
+  if (cursor < to) gaps.add((cursor, to));
+  return [for (final g in gaps) if (g.$2 - g.$1 > gapMs) g];
+}
+
+/// Splice the live in-memory tail onto the durable DB body for one metric
+/// (audit H4 — shared by the logger's `mergedSeries` and the charts page's
+/// per-second live tick). EVERY DB row is kept; the in-memory segments are
+/// appended only where they extend past the newest DB `end_ms` (clamped to
+/// start there), so an open interval not yet flushed to SQLite is completed
+/// without duplicating it — and history from a previous session (which the
+/// in-memory buffer never held) is never dropped or replaced.
+List<ReadingInterval> spliceTail(
+  List<ReadingInterval> body,
+  List<ReadingInterval> buffer, {
+  int sinceMs = 0,
+}) {
+  var maxEnd = sinceMs;
+  for (final iv in body) {
+    if (iv.endMs > maxEnd) maxEnd = iv.endMs;
+  }
+  final tail = <ReadingInterval>[];
+  for (final iv in buffer) {
+    if (iv.endMs <= maxEnd) continue;
+    tail.add(iv.startMs < maxEnd ? iv.withStart(maxEnd) : iv);
+  }
+  if (tail.isEmpty) return body;
+  return [...body, ...tail];
+}
+
+/// The ONE y-axis policy (#32) for the charts and the sparklines. The axis
+/// ALWAYS includes 0:
+///  * explicit [minY]/[maxY] win (e.g. SOC 0..100);
+///  * [centreZero] metrics (signed current / power) get a symmetric −m..+m
+///    about 0 so the sign reads;
+///  * otherwise it spans 0..max (or min..0 for all-negative data) — never a
+///    zoomed band far from zero.
+/// [pad] is the fraction of the span added outward past the extreme so it is
+/// not flush with the frame (the charts use 0.1). With `pad == 0` (the
+/// sparklines) nothing is added — except that a perfectly flat series at 0 is
+/// widened to −1..+1 so its held line sits mid-height; with a positive pad a
+/// flat series at 0 keeps 0 as the hard floor (0..1). [lo]/[hi] are the data
+/// min/max; non-finite (no data) falls back to 0..1.
+(double, double) yBounds(
+  double lo,
+  double hi, {
+  double? minY,
+  double? maxY,
+  bool centreZero = false,
+  double pad = 0.1,
+}) {
+  if (minY != null && maxY != null) return (minY, maxY);
+  if (!lo.isFinite || !hi.isFinite) return (0, 1);
+  if (centreZero) {
+    final m = lo.abs() > hi.abs() ? lo.abs() : hi.abs();
+    final top = m == 0 ? 1.0 : m + m * pad;
+    return (-top, top);
+  }
+  final rawMin = lo < 0 ? lo : 0.0;
+  final rawMax = hi > 0 ? hi : 0.0;
+  final span = rawMax - rawMin;
+  if (span.abs() < 1e-9) return pad > 0 ? (0, 1) : (rawMin - 1, rawMax + 1);
+  final p = span * pad;
+  final yMin = rawMin < 0 ? rawMin - p : 0.0;
+  final yMax = rawMax > 0 ? rawMax + p : 0.0;
+  return (yMin, yMax);
+}
+
+/// Selectable look-back windows. The charts page offers [chartWindows]; the
+/// detail-page sparklines offer every value (wider, adding 7 days, #14).
+enum LookbackWindow {
+  h1('1h', 3600 * 1000),
+  h6('6h', 6 * 3600 * 1000),
+  h24('24h', 24 * 3600 * 1000),
+  d7('7d', 7 * 24 * 3600 * 1000),
+  all('All', null);
+
+  const LookbackWindow(this.label, this.spanMs);
+
+  /// Segment label.
+  final String label;
+
+  /// Milliseconds of look-back, or null for "all".
+  final int? spanMs;
+
+  /// The windows the charts page shows (no 7-day band there).
+  static const chartWindows = [h1, h6, h24, all];
+}
+
+/// The `[from, to]` range to plot for a look-back [spanMs] ending at [nowMs]:
+/// exactly `now - span .. now` for a fixed window, else (span null = "all")
+/// the extent of the data in [series] — from its earliest start (or one hour
+/// ago when there is none) to the later of its latest end and now, and never
+/// shorter than one minute.
+({int fromMs, int toMs}) computeRange(
+  Iterable<Iterable<TimeSpan>> series,
+  int? spanMs,
+  int nowMs,
+) {
+  if (spanMs != null) return (fromMs: nowMs - spanMs, toMs: nowMs);
+  int? lo, hi;
+  for (final list in series) {
+    for (final iv in list) {
+      lo = (lo == null || iv.startMs < lo) ? iv.startMs : lo;
+      hi = (hi == null || iv.endMs > hi) ? iv.endMs : hi;
+    }
+  }
+  final from = lo ?? (nowMs - 3600 * 1000);
+  var to = hi != null && hi > nowMs ? hi : nowMs;
+  if (to <= from) to = from + 60 * 1000;
+  return (fromMs: from, toMs: to);
+}
+
+/// A cheap change signature for an interval list, for `shouldRepaint` (L8).
+/// Two lists with the same signature are treated as the same data: length,
+/// first start, last start/end and last value — the only things a live
+/// append/extend can change — so an unchanged series never repaints.
+int intervalsSignature(List<ReadingInterval> ivs) {
+  if (ivs.isEmpty) return 0;
+  final f = ivs.first, l = ivs.last;
+  return Object.hash(ivs.length, f.startMs, f.valueNum, l.startMs, l.endMs,
+      l.valueNum, l.valueText);
+}

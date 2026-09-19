@@ -74,6 +74,15 @@ void main() {
     expect(state.temp2, -5);
   });
 
+  test('TEMP decodes all four channels as signed int8', () {
+    // bytes: [0]=0x12(18), [1]=0x19(25), [2]=0xFE(-2), [3]=0xFB(-5)
+    parser.addBytes([0xA1, 0x4F, 0x12, 0x19, 0xFE, 0xFB, 0xB2, 0xE3]);
+    expect(state.temp0, 18); // byte[0]
+    expect(state.temp1, 25); // byte[1]
+    expect(state.temp3, -2); // byte[2]
+    expect(state.temp2, -5); // byte[3]
+  });
+
   test('VOL decodes count-prefixed cells (little-endian mV)', () {
     parser.addBytes([0xA0, 0xC1, 0x02, 0xE4, 0x0C, 0xF8, 0x0C, 0xB1, 0xD2]);
     expect(state.cellsMv, [3300, 3320]);
@@ -121,6 +130,80 @@ void main() {
     expect(state.temperatureWarnings, contains('Chip over temperature protection'));
     expect(state.temperatureWarnings,
         contains('Under temperature discharge protection'));
+    expect(state.faultTemperature, isTrue);
+  });
+
+  test('temperature alarm bytes [2],[3],[6] never set the live fault', () {
+    // byte[2]=1 (latched over-temp, as on real hardware), byte[3]=1, byte[6]=1;
+    // NO genuine bit set.
+    parser.addBytes([
+      0xA6, 0xC0, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0xB7, 0x72, //
+    ]);
+    expect(state.temperatureWarnings, isEmpty);
+    expect(state.faultTemperature, isFalse); // must NOT count as over-temp
+    // #50: byte[2] is the first-class latched status, no longer an unknown.
+    expect(state.overTempLatched, isTrue);
+    expect(state.unknownBytes.containsKey('unknownTempB2'), isFalse);
+    // Bytes [3],[6] are still captured for change detection.
+    expect(state.unknownBytes['unknownTempB3'], 1);
+    expect(state.unknownBytes['unknownTempB6'], 1);
+  });
+
+  test('#50 temp-alarm byte[2] = latched over-temp protection: 1 -> warning, '
+      '0 (after restart) -> clear', () {
+    expect(state.temperatureAlarmSeen, isFalse);
+    parser.addBytes([0xA6, 0xC0, 0, 0, 1, 0, 0, 0, 0, 0xB7, 0x72]);
+    expect(state.temperatureAlarmSeen, isTrue);
+    expect(state.overTempLatched, isTrue);
+    expect(state.faultTemperature, isFalse, reason: 'a warning, not a fault');
+    // The BMS restart clears the latch.
+    parser.addBytes([0xA6, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0xB7, 0x72]);
+    expect(state.overTempLatched, isFalse);
+  });
+
+  test('a cleared temperature alarm records faultTemperature false', () {
+    parser.addBytes(
+        [0xA6, 0xC0, 0x01, 0, 0, 0, 0, 0, 0, 0xB7, 0x72]); // chip-over set
+    expect(state.faultTemperature, isTrue);
+    parser.addBytes(
+        [0xA6, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0xB7, 0x72]); // all clear
+    expect(state.faultTemperature, isFalse);
+    expect(state.temperatureWarnings, isEmpty);
+  });
+
+  test('current alarm sets/clears faultCurrent and captures bytes [3],[4]', () {
+    parser.addBytes([0xA4, 0x8B, 0x01, 0, 0, 0x07, 0x09, 0xB5, 0xDD]);
+    expect(state.faultCurrent, isTrue); // byte[0] = over-current discharge
+    expect(state.unknownBytes['unknownCurB3'], 7);
+    expect(state.unknownBytes['unknownCurB4'], 9);
+    parser.addBytes([0xA4, 0x8B, 0, 0, 0, 0, 0, 0xB5, 0xDD]);
+    expect(state.faultCurrent, isFalse);
+  });
+
+  test('voltage alarm captures unknown bytes [2],[4],[5],[8]', () {
+    parser.addBytes([
+      0xA5, 0x99, 0x00, 0x00, 0x02, 0x00, 0x04, 0x05, 0x00, 0x00, 0x08, //
+      0xB6, 0x17,
+    ]);
+    expect(state.unknownBytes['unknownVolB2'], 2);
+    expect(state.unknownBytes['unknownVolB4'], 4);
+    expect(state.unknownBytes['unknownVolB5'], 5);
+    expect(state.unknownBytes['unknownVolB8'], 8);
+  });
+
+  test('MOS_STATUS captures unknown bytes [2],[3],[4],[5]', () {
+    parser.addBytes([0xA3, 0x9F, 0x01, 0x01, 0x22, 0x33, 0x44, 0x55, 0xB4, 0xC7]);
+    expect(state.unknownBytes['unknownMosB2'], 0x22);
+    expect(state.unknownBytes['unknownMosB3'], 0x33);
+    expect(state.unknownBytes['unknownMosB4'], 0x44);
+    expect(state.unknownBytes['unknownMosB5'], 0x55);
+  });
+
+  test('OTHER (A7 4E) captures all nine unknown bytes', () {
+    parser.addBytes([0xA7, 0x4E, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    for (var i = 0; i < 9; i++) {
+      expect(state.unknownBytes['unknownOtherB$i'], i + 1);
+    }
   });
 
   test('SLEEP_SET_SUCCESS: byte0==0 => on, else off', () {
@@ -167,6 +250,42 @@ void main() {
     expect(state.packVoltage, closeTo(13.3, 1e-6));
   });
 
+  test('a stray 0x30 byte increments unrecognisedBytes and is surfaced', () {
+    // Issue #20: the resync path must COUNT the dropped stray byte (0x30) and
+    // report it, so no byte is ever silently dropped.
+    final dropped = <int>[];
+    final s = BatteryState();
+    final pp = BatteryParser(state: s, onUnrecognisedByte: dropped.add);
+    pp.addBytes([0x30, ...allData]); // stray 0x30 then a valid frame
+    expect(s.unrecognisedBytes, 1);
+    expect(dropped, [0x30]);
+    // The valid frame after the stray byte still decodes.
+    expect(s.packVoltage, closeTo(13.3, 1e-6));
+  });
+
+  test('each dropped byte increments the counter (multiple strays)', () {
+    parser.addBytes([0x30, 0x31, ...allData]); // two strays, then valid
+    expect(state.unrecognisedBytes, 2);
+    expect(state.packVoltage, closeTo(13.3, 1e-6));
+  });
+
+  test('a clean stream drops no bytes', () {
+    parser.addBytes(allData);
+    expect(state.unrecognisedBytes, 0);
+  });
+
+  test('lastFrameBytes exposes the exact frame bytes for logging', () {
+    final seen = <List<int>>[];
+    final s = BatteryState();
+    late final BatteryParser pp;
+    pp = BatteryParser(
+      state: s,
+      onEvent: (_) => seen.add(pp.lastFrameBytes),
+    );
+    pp.addBytes([0xA1, 0x4F, 0x00, 0x19, 0x00, 0xFB, 0xB2, 0xE3]); // temp frame
+    expect(seen.single, [0xA1, 0x4F, 0x00, 0x19, 0x00, 0xFB, 0xB2, 0xE3]);
+  });
+
   test('resyncs past leading garbage and a bad end sentinel', () {
     // garbage, then a frame whose end is wrong, then a valid ALL_DATA
     final bad = List<int>.from(allData)..[24] = 0x00; // corrupt end byte
@@ -190,6 +309,23 @@ void main() {
     ]);
     expect(state.temp1, 25);
     expect(state.packVoltage, closeTo(13.3, 1e-6));
+  });
+
+  test('events expose plain-English labels', () {
+    expect(const AllDataEvent().label, 'Battery data');
+    expect(const VoltageEvent().label, 'Cell voltages');
+    expect(const TempEvent().label, 'Temperatures');
+    expect(const MosEvent().label, 'MOS status');
+    expect(const BalancerEvent().label, 'Balancer status');
+    expect(const SocEvent().label, 'State of charge');
+    expect(const EstTimeEvent().label, 'Time estimate');
+    expect(const VersionEvent().label, 'Firmware version');
+    expect(const SleepEvent().label, 'Sleep');
+    expect(const SettingRespondEvent().label, 'Setting ack');
+    expect(const GateSetEvent().label, 'Gate set');
+    expect(const WarningEvent('current').label, 'Current alarm');
+    expect(const WarningEvent('voltage').label, 'Voltage alarm');
+    expect(const WarningEvent('temperature').label, 'Temperature alarm');
   });
 
   test('DemoBattery frames round-trip through the parser', () {

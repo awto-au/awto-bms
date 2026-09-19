@@ -276,6 +276,26 @@ The three alarm frames (`CMD_WARN_CUR_ALARM` A4 8B / `CMD_WARN_VOL_ALARM` A5 99 
 `CMD_WARN_TEMP_ALARM` A6 C0) are one flag byte per condition (`== 1` sets it); the exact
 bit-to-string mapping is in the Dart codec's `_warnCur` / `_warnVol` / `_warnTemp` tables.
 
+#### `CMD_WARN_TEMP_ALARM` — byte meanings (live-confirmed additions)
+
+```
+A6 C0  b0 b1 b2 b3 b4 b5 b6  B7 72      end at p7,p8
+```
+
+| Off | Meaning | Live fault? |
+|---|---|---|
+| p0 | chip over-temperature protection | yes |
+| p1 | chip under-temperature protection | yes |
+| p2 | **LATCHED over-temperature protection** — set by a *past* over-temp event and held at 1 after the pack has cooled; while set the BMS **inhibits charging** (observed: charger present, 0 A, cells stuck at 3.33 V for a full day). Cleared only by a BMS restart (`CMD_GATE_CONTROL` restart byte). Live-confirmed 2026-09-19/20: p2 went 1 → 0 after the restart and the SOC was re-derived 100 % → 93 %. | no — a warning (charging inhibited), not a live over-temp |
+| p3 | MOS flag, meaning unknown (the app ORs p2 \| p3 into one "MOS over-temp" string) | no |
+| p4 | under-temperature discharge protection | yes |
+| p5 | under-temperature charge protection | yes |
+| p6 | MOS flag, meaning unknown (the app shows it as "MOS protect") | no |
+
+Only p0, p1, p4, p5 are genuine live temperature faults. p2 is decoded as its own latched
+status (`overTempLatched` in the Dart codec, `overTempLatched` metric in the store); p3 and p6
+remain unknown-meaning MOS flags and are captured as unknown-byte metrics so any change is caught.
+
 ### `CMD_BAL_STATUS` — the status frame (BM L530–L548)
 
 ```

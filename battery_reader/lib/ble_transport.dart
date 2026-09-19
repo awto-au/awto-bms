@@ -25,6 +25,9 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart' as fbp;
 import 'package:universal_ble/universal_ble.dart' as ub;
 
 import 'battery_protocol.dart';
+import 'diagnostics.dart';
+
+const _source = 'BleTransport';
 
 /// A transport-neutral scan hit: advertised name, device id string and RSSI.
 class BleScanHit {
@@ -199,9 +202,9 @@ class _FbpLink implements BleLink {
   Future<void> disconnect() async {
     await _notifySub?.cancel();
     _notifySub = null;
-    try {
-      await _device.disconnect();
-    } catch (_) {/* best effort */}
+    // Best effort (already gone / adapter off): recorded, never thrown.
+    await guard<void>('fbp disconnect $deviceId', _device.disconnect,
+        source: _source);
   }
 }
 
@@ -209,9 +212,25 @@ class _FbpLink implements BleLink {
 // universal_ble implementation (Windows / WinRT) — same behaviour, same UUIDs.
 // ===========================================================================
 
+/// L13: the back-off before discovery attempt [attempt] (0-based) of
+/// [attempts] is retried — 200 ms, 400 ms, 600 ms, 800 ms between five
+/// attempts (~2 s worst case) — or null after the FINAL attempt, so a failed
+/// discovery throws immediately instead of sleeping first. Pure.
+Duration? discoveryRetryDelay(int attempt, {int attempts = 5}) =>
+    attempt + 1 >= attempts
+        ? null
+        : Duration(milliseconds: 200 * (attempt + 1));
+
 class UniversalBleTransport implements BleTransport {
   final _scanController = StreamController<List<BleScanHit>>.broadcast();
   bool _wired = false;
+
+  /// L13: generation of the current scan. The auto-stop timer armed by
+  /// [startScan] captures the generation it was armed for and is a no-op if a
+  /// newer scan has started (or [stopScan] ran) since — a stale timer from an
+  /// earlier scan can no longer stop a later one.
+  int _scanGen = 0;
+  Timer? _autoStop;
 
   void _wire() {
     if (_wired) return;
@@ -230,13 +249,11 @@ class UniversalBleTransport implements BleTransport {
     };
   }
 
-  static String _normalizeUuid(String u) {
-    try {
-      return ub.BleUuidParser.string(u).toLowerCase();
-    } catch (_) {
-      return u.toLowerCase();
-    }
-  }
+  static String _normalizeUuid(String u) =>
+      guardSync<String>('normalise uuid $u',
+          () => ub.BleUuidParser.string(u).toLowerCase(),
+          fallback: u.toLowerCase(), source: _source) ??
+      u.toLowerCase();
 
   @override
   Stream<List<BleScanHit>> get scanResults {
@@ -249,15 +266,26 @@ class UniversalBleTransport implements BleTransport {
     Duration timeout = const Duration(seconds: 15),
   }) async {
     _wire();
+    final gen = ++_scanGen;
+    _autoStop?.cancel();
     await ub.UniversalBle.startScan();
-    // FBP auto-stops after its timeout; universal_ble does not, so mirror it.
-    Timer(timeout, () {
-      ub.UniversalBle.stopScan().catchError((_) {});
+    // FBP auto-stops after its timeout; universal_ble does not, so mirror it —
+    // but only for THIS scan (L13): if a later startScan/stopScan has bumped
+    // the generation, the timer does nothing.
+    _autoStop = Timer(timeout, () {
+      if (gen != _scanGen) return;
+      unawaited(guard<void>('auto-stop scan', ub.UniversalBle.stopScan,
+          source: _source));
     });
   }
 
   @override
-  Future<void> stopScan() => ub.UniversalBle.stopScan();
+  Future<void> stopScan() {
+    _scanGen++; // L13: retire any pending auto-stop for the scan just ended
+    _autoStop?.cancel();
+    _autoStop = null;
+    return ub.UniversalBle.stopScan();
+  }
 
   @override
   Future<BleLink> connect(
@@ -266,10 +294,11 @@ class UniversalBleTransport implements BleTransport {
     int mtu = 512,
   }) async {
     await ub.UniversalBle.connect(deviceId, connectionTimeout: timeout);
-    // Best-effort MTU bump (matches the FBP mtu: 512 request); ignore failures.
-    try {
-      await ub.UniversalBle.requestMtu(deviceId, mtu);
-    } catch (_) {/* platform may not support it */}
+    // Best-effort MTU bump (matches the FBP mtu: 512 request); the platform
+    // may not support it — recorded, never fatal.
+    await guard<int>('request mtu $mtu on $deviceId',
+        () => ub.UniversalBle.requestMtu(deviceId, mtu),
+        source: _source);
     return _UniversalBleLink(deviceId);
   }
 }
@@ -289,7 +318,35 @@ class _UniversalBleLink implements BleLink {
 
   @override
   Future<void> discoverAndSubscribe(void Function(List<int> data) onData) async {
-    final services = await ub.UniversalBle.discoverServices(deviceId);
+    // WinRT frequently reports services as empty or throws 'Failed to get
+    // services: Unreachable' in the first moments after a connect — especially
+    // at weak signal (issue #49). Retry a few times with a short, growing
+    // backoff before treating discovery as a failed connect; connectTo then
+    // falls through to the normal disconnect + reconnect path.
+    List<ub.BleService> services = const [];
+    Object? lastErr;
+    const attempts = 5;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      try {
+        services = await ub.UniversalBle.discoverServices(deviceId);
+        if (services.isNotEmpty) {
+          lastErr = null;
+          break;
+        }
+      } catch (e) {
+        lastErr = e;
+      }
+      // 200ms, 400ms, 600ms, 800ms between the five attempts (~2s worst case);
+      // L13: no sleep after the final failed attempt — throw straight away.
+      final delay = discoveryRetryDelay(attempt, attempts: attempts);
+      if (delay == null) break;
+      await Future<void>.delayed(delay);
+    }
+    if (services.isEmpty) {
+      throw StateError(
+          'Failed to get services${lastErr != null ? ': $lastErr' : ''}');
+    }
+
     ub.BleService? svc;
     for (final s in services) {
       if (s.uuid.toLowerCase() == BleUuids.service) svc = s;
@@ -309,7 +366,12 @@ class _UniversalBleLink implements BleLink {
 
     _valueSub = ub.UniversalBle
         .characteristicValueStream(deviceId, notifyUuid)
-        .listen(onData);
+        // Stream errors are recorded, not propagated: a transport hiccup on
+        // the notify channel is a drop to recover from, not a fatal unhandled
+        // async error (issue #49).
+        .listen(onData,
+            onError: (Object e) => AppLog.instance
+                .record(_source, 'notify stream $deviceId: $e'));
     await ub.UniversalBle.setNotifiable(
       deviceId,
       BleUuids.service,
@@ -334,8 +396,9 @@ class _UniversalBleLink implements BleLink {
   Future<void> disconnect() async {
     await _valueSub?.cancel();
     _valueSub = null;
-    try {
-      await ub.UniversalBle.disconnect(deviceId);
-    } catch (_) {/* best effort */}
+    // Best effort (already gone / adapter off): recorded, never thrown.
+    await guard<void>('universal_ble disconnect $deviceId',
+        () => ub.UniversalBle.disconnect(deviceId),
+        source: _source);
   }
 }

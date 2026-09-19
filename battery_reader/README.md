@@ -46,6 +46,27 @@ sentinel, with no length field or checksum. The parser buffers notifications
 and resyncs a byte at a time on any mismatch, so it recovers from a dropped byte
 (the original app does not).
 
+## Alarm bytes: what is known
+
+`CMD_WARN_TEMP_ALARM` (`A6 C0 …`) byte **[2]** is a **latched over-temperature
+protection** flag (live-confirmed, #50): it is set by a *past* over-temp event,
+stays at 1 — inhibiting charging — until the BMS is restarted, and a restart
+clears it (observed 1 → 0). The app decodes it as `BatteryState.overTempLatched`,
+logs it as the `overTempLatched` metric, and shows an amber **warning** (with a
+"Restart BMS to clear" button) rather than a live temperature fault. Bytes [3]
+and [6] of the same frame remain unexplained status bits: captured as
+`unknownTempB3` / `unknownTempB6`, never counted as a fault.
+
+## Gate writes are refused without a fresh gate base
+
+Every `CMD_GATE_CONTROL` write re-sends all eight gate bytes, so it must be built
+from the pack's *current* gates. `BatteryConnection.sendGateControl` (and the
+fleet output write) **throws** unless `hasFreshGateState`: connected, all six
+gates reported, and a `BAL_STATUS` decoded within the last 5 s. It never falls
+back to zeros — a zero-filled base would write chargeMos = dischargeMos = 0
+(cutting output) or tempControlGate = 0 (disabling low-temp protection). The UI
+disables every gate button and shows the reason until a fresh status arrives.
+
 ## Read-only by design
 
 The app's handshake ends with a `CMD_GATE_CONTROL` write (`setLowTemProtect`)

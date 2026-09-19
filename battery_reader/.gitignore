@@ -1,15 +1,18 @@
-# Flutter/Dart
+# Flutter/Dart/Pub — build outputs and caches only.
 .dart_tool/
-.packages
-build/
 .flutter-plugins
 .flutter-plugins-dependencies
-pubspec.lock
+.packages
+build/
 
-# Generated platform folders (run `flutter create .` to regenerate)
-android/
-ios/
-linux/
-macos/
-windows/
-web/
+# IDE / misc
+*.iml
+.idea/
+.metadata
+
+# NOTE: the platform folders (android/, ios/, windows/, ...) ARE tracked — they
+# hold essential hand-edited config (BLE + notification permissions, the
+# foreground-service declaration, gradle desugaring / NDK version, the Windows
+# runner). Only each platform's BUILD OUTPUTS are ignored, via its own nested
+# .gitignore (android/.gitignore, windows/.gitignore, ...). pubspec.lock is
+# tracked (this is an application) for reproducible builds.

@@ -21,6 +21,17 @@ dependencies:
   sqflite_common_ffi: ^2.3.0
   path: ^1.9.0 # join() for the database path
   fl_chart: ^0.69.0 # line/area charts for the history screens
+  # Verbose raw-log file (issue #19): path_provider resolves the per-platform
+  # directory for the single append-only raw log (external files dir on Android,
+  # app-support dir on desktop); share_plus provides the "Share raw log" action.
+  path_provider: ^2.1.5
+  share_plus: ^13.0.0
+  # Issue #27: durable fleet membership. The in-fleet serials are persisted here
+  # so the fleet survives an app kill/restart and is re-applied to each pack as
+  # it is (re)discovered (see lib/fleet_store.dart).
+  shared_preferences: ^2.3.2
+  flutter_local_notifications: ^22.3.1
+  flutter_foreground_task: ^11.0.3
 dev_dependencies:
   flutter_test:
     sdk: flutter

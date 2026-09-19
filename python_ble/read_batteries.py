@@ -420,7 +420,7 @@ class Parser:
             if len(self.buf) < total:
                 return 0
             self._raw = bytes(self.buf[0:total])
-            self.emit("RX_OTHER", "9 bytes read and discarded by the app")
+            self.emit("RX_OTHER_DATA", "9 bytes read and discarded by the app")
             return total
         if key in self.HISTORY_BEGINS:                 # CMD_HISTORY (variable)
             return self._history()
@@ -471,12 +471,12 @@ class Parser:
         cells = [u16(self.buf[3 + i * 2], self.buf[4 + i * 2]) for i in range(count)]
         self.state["cells"] = cells
         self._raw = bytes(self.buf[0:total])
-        self.emit("RX_VOL", " ".join(f"{c/1000:.3f}V" for c in cells))
+        self.emit("RX_CELL_VOLTAGES", " ".join(f"{c/1000:.3f}V" for c in cells))
         return total
 
     def _temp(self, p):
         self.state["t1"], self.state["t2"] = s8(p[1]), s8(p[3])
-        self.emit("RX_TEMPUTER",
+        self.emit("RX_TEMPERATURE",
                   f"t1=[1]={self.state['t1']}C  t2=[3]={self.state['t2']}C")
 
     def _all(self, p):
@@ -494,7 +494,7 @@ class Parser:
         st["cycles"] = u16(p[18], p[19])
         st["avg"] = (u16(p[20], p[21]) // 10) / 100.0
         self.emit(
-            "RX_ALL_DATA",
+            "RX_BATTERY_DATA",
             f"{st['volt']:.1f}V {st['cur']:.1f}A {st['power']:.0f}W "
             f"max={st['max']:.3f} min={st['min']:.3f} avg={st['avg']:.3f} "
             f"chip={st['chip']}C cyc={st['cycles']} "
@@ -503,7 +503,7 @@ class Parser:
 
     def _mos(self, p):
         self.state["mos"] = p[0] == 1 and p[1] == 1
-        self.emit("RX_MOS_STATUS",
+        self.emit("RX_OUTPUT_MOS",
                   f"on={self.state['mos']} ([0]={p[0]} [1]={p[1]})")
 
     def _bal(self, p):
@@ -516,7 +516,7 @@ class Parser:
         self.state["smoke_gate"] = p[5]
         self.state["heat_gate"] = p[6]
         self.emit(
-            "RX_BAL_STATUS",
+            "RX_BALANCER_STATUS",
             f"state=[0]={cs} chgMos=[1]={p[1]==1} disMos=[2]={p[2]==1} "
             f"passiveBal=[3]={p[3]==1} tempGate=[4]={p[4]} "
             f"smokeGate=[5]={p[5]} heatGate=[6]={p[6]}",
@@ -527,28 +527,28 @@ class Parser:
         full = u24(p[1], p[2], p[3]) / 1000.0
         rem = u24(p[4], p[5], p[6]) / 1000.0
         self.state.update(soc=soc, full=full, rem=rem)
-        self.emit("RX_SOC",
+        self.emit("RX_STATE_OF_CHARGE",
                   f"{soc}% ([0])  remaining=[4:6]={rem:.1f}Ah  full=[1:3]={full:.1f}Ah")
 
     def _est(self, p):
         self.emit(
-            "RX_EST_TIME",
+            "RX_TIME_ESTIMATE",
             f"[0:2]={hms(u24(p[0],p[1],p[2]))}  [3:5]={hms(u24(p[3],p[4],p[5]))}",
         )
 
     def _ver(self, p):
         v = bytes(p[0:5]).decode("ascii", "replace")
         self.state["fw"] = v
-        self.emit("RX_VERSION", v)
+        self.emit("RX_FIRMWARE_VERSION", v)
 
     def _warn_cur(self, p):
-        self._warn("RX_WARN_CUR_ALARM", "current", p, WARN_CUR)
+        self._warn("RX_CURRENT_ALARM", "current", p, WARN_CUR)
 
     def _warn_voltage(self, p):
-        self._warn("RX_WARN_VOL_ALARM", "voltage", p, WARN_VOLTAGE)
+        self._warn("RX_VOLTAGE_ALARM", "voltage", p, WARN_VOLTAGE)
 
     def _warn_temp(self, p):
-        self._warn("RX_WARN_TEMP_ALARM", "temperature", p, WARN_TEMP)
+        self._warn("RX_TEMPERATURE_ALARM", "temperature", p, WARN_TEMP)
 
     def _warn(self, tag, category, p, table):
         # show which payload byte tripped each alarm, for traceability
@@ -563,10 +563,10 @@ class Parser:
     def _sleep(self, p):
         on = p[0] == 0  # app: byte0 == 0 -> sleep mode on
         self.state["sleep"] = on
-        self.emit("RX_SLEEP_SET_SUCCESS", f"{'on' if on else 'off'} ([0]={p[0]})")
+        self.emit("RX_SLEEP_ACK", f"{'on' if on else 'off'} ([0]={p[0]})")
 
     def _setting(self, p):
-        self.emit("RX_SETTING_RESPOND",
+        self.emit("RX_SETTING_ACK",
                   f"ack [0]={p[0]} ({self.SETTING_TYPE.get(p[0], 'unknown')})")
 
     def _gate_set(self, p):
@@ -605,7 +605,7 @@ async def _sleep_interruptible(seconds, stop):
         await asyncio.sleep(0.25)
 
 
-async def stream(device, name, parser, stop, get_history=True):
+async def stream(device, name, parser, stop):
     """Keep this battery connected until stop: connect, stream, and on any
     drop or error, mark it offline and reconnect, until killed."""
     while not stop.is_set():
@@ -623,13 +623,14 @@ async def stream(device, name, parser, stop, get_history=True):
                         await client.write_gatt_char(
                             WRITE_CHAR, cmd, response=True)
 
+                # History is a dead end in every firmware build (stubbed, no
+                # responder — 0 history frames ever seen), so we do NOT request
+                # it. The parser still recognises a history frame defensively.
                 handshake = [
-                    ("TX_BEGIN", CMD_BEGIN),
-                    ("TX_GET_EST", CMD_GET_EST),
-                    ("TX_GET_VERSION", CMD_GET_VERSION),
+                    ("TX_WAKE", CMD_BEGIN),
+                    ("TX_REQUEST_ESTIMATE", CMD_GET_EST),
+                    ("TX_REQUEST_VERSION", CMD_GET_VERSION),
                 ]
-                if get_history:
-                    handshake.append(("TX_GET_HISTORY", CMD_GET_HISTORY))
                 for tag, cmd in handshake:
                     await tx(cmd)
                     parser.log_tx(tag, cmd)     # log the command we sent
@@ -644,7 +645,7 @@ async def stream(device, name, parser, stop, get_history=True):
                     if "fw" not in parser.state and \
                             time.monotonic() - last_ver > 2:
                         await tx(CMD_GET_VERSION)
-                        parser.log_tx("TX_GET_VERSION", CMD_GET_VERSION)
+                        parser.log_tx("TX_REQUEST_VERSION", CMD_GET_VERSION)
                         last_ver = time.monotonic()
                 await client.stop_notify(NOTIFY_CHAR)
         except Exception as e:  # noqa: BLE001
@@ -720,7 +721,7 @@ async def controller(batteries, seconds, stop):
     stop.set()
 
 
-async def run(name_filter, seconds, scan_secs, rescan_secs, echo, db, get_history):
+async def run(name_filter, seconds, scan_secs, rescan_secs, echo, db):
     os.makedirs(LOG_DIR, exist_ok=True)
 
     stop = asyncio.Event()
@@ -755,7 +756,7 @@ async def run(name_filter, seconds, scan_secs, rescan_secs, echo, db, get_histor
         if rssi is not None:
             parser.emit("RSSI", f"{rssi} dBm")
         tasks.add(asyncio.create_task(
-            stream(device, name, parser, stop, get_history=get_history)))
+            stream(device, name, parser, stop)))
 
     async def discover():
         # Scan on start and then keep scanning, so batteries powered on or
@@ -802,8 +803,6 @@ def main():
                          "(default: logs/battery.db)")
     ap.add_argument("--no-db", action="store_true",
                     help="do not log to the database")
-    ap.add_argument("--no-history", action="store_true",
-                    help="do not request the stored history log on connect")
     args = ap.parse_args()
 
     # Build the database writer (SQLite, default logs/battery.db).
@@ -822,7 +821,7 @@ def main():
     try:
         return asyncio.run(
             run(args.name, args.seconds, args.scan_secs, args.rescan_secs,
-                args.echo, db, not args.no_history))
+                args.echo, db))
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 0
