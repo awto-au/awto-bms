@@ -1,0 +1,39 @@
+# --- APK analysis artifacts ---
+# raw/ (the split APKs) + jadx/ (Java decompile) + the .xapk are kept as the
+# source of truth and the analysis. apktool/ (smali + resources) and
+# unpacked-base/ (the base APK simply re-unzipped) are bulky and fully
+# regenerable from raw/, so they are not committed:
+#   apktool d raw/<pkg>.apk -o apktool
+#   unzip raw/<pkg>.apk -d unpacked-base
+artifacts/*/apktool/
+artifacts/*/unpacked-base/
+
+# --- Dart / Flutter (battery_reader) ---
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+battery_reader/build/
+battery_reader/.packages
+battery_reader/.idea/
+battery_reader/.metadata
+battery_reader/*.iml
+battery_reader/logs/
+
+# --- Python (python_ble) ---
+__pycache__/
+*.pyc
+.venv/
+
+# --- captured data / logs (never commit; large + regenerable) ---
+python_ble/logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- misc ---
+*.log
+.DS_Store
+
+# --- competitor APK evidence (heavy; kept locally, regenerable by re-download) ---
+artifacts/_comparison/

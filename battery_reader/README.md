@@ -1,0 +1,94 @@
+# battery_reader
+
+A Flutter app that connects to a JoySuny BMS over Bluetooth Low Energy and
+displays **all** telemetry the battery streams: state of charge, pack voltage
+and current, power, per-cell voltages, temperatures, capacity, time-to-full /
+time-to-empty, MOS and gate status, firmware version, and the current / voltage
+/ temperature alarm lists.
+
+Supports both re-badges of the same firmware:
+
+- **Sphere Battery** (`com.joysuny.batteryutil`), advertised name prefix `JS`
+- **RV Battery** (`com.joysuny.mimibattery`), advertised name prefix `RV`
+
+## Where the protocol comes from
+
+Reverse-engineered from the decompiled 1.0.24 Sphere app in
+`../artifacts/sphere-battery-1.0.24/`. The full wire format is documented in
+that folder's `PROTOCOL.md`. The parser mirrors `BatteryManager.java`
+(`ProcessWatchRunnable`) and `BatteryCMD.java` byte-for-byte, including the
+app's little-endian helpers and its truncating integer divisions.
+
+> **Not verified against a live battery.** All field layouts are read from the
+> app's own parser, but no physical BMS has confirmed them. Treat readings as
+> best-effort until checked against a known-good pack.
+
+## Layout
+
+| File | Role |
+|---|---|
+| `lib/battery_protocol.dart` | Pure-Dart codec: TX command builders, streaming RX parser, typed `BatteryState`. No Flutter dependency. |
+| `lib/battery_connection.dart` | BLE transport (flutter_blue_plus): scan, connect, subscribe, handshake. |
+| `lib/main.dart` | Live display UI. |
+| `test/battery_protocol_test.dart` | Parser tests using synthetic frames — runs without hardware. |
+
+## Transport summary
+
+| | |
+|---|---|
+| Service | `0000FCF0-0000-1000-8000-00805F9B34FB` |
+| Write (app → BMS) | `0000FCF1-…` |
+| Notify (BMS → app) | `0000FCF2-…` |
+
+After a short handshake the BMS streams frames on FCF2 unsolicited. Each frame
+is a 2-byte begin sentinel, a fixed or count-prefixed payload, and a 2-byte end
+sentinel, with no length field or checksum. The parser buffers notifications
+and resyncs a byte at a time on any mismatch, so it recovers from a dropped byte
+(the original app does not).
+
+## Read-only by design
+
+The app's handshake ends with a `CMD_GATE_CONTROL` write (`setLowTemProtect`)
+whose payload turns charge MOS, discharge MOS and the temp-control gate on. That
+can change the battery's state. This tool **omits that frame by default** and
+only sends the read-safe openers (`CMD_BEGIN`, `CMD_GET_EST`, `AT+V`). If a
+particular BMS refuses to stream without the full handshake, construct
+`BatteryConnection(sendLowTempGate: true)` — understanding it may flip gates.
+
+This tool never sends MOS, balancing, factory-reset, capacity or time-set
+commands; it only reads.
+
+## Build & run
+
+Prerequisites: Flutter SDK 3.19+ (`flutter --version`).
+
+```bash
+cd battery_reader
+flutter create .          # generates android/ ios/ windows/ etc. once
+flutter pub get
+flutter test              # runs the protocol tests, no device needed
+flutter run               # on a phone with Bluetooth
+```
+
+`flutter create .` only adds the missing platform folders; it leaves `lib/`,
+`test/` and `pubspec.yaml` intact.
+
+### Platform permissions
+
+- **Android**: add to `android/app/src/main/AndroidManifest.xml`:
+  `BLUETOOTH_SCAN` (with `usesPermissionFlags="neverForLocation"` if you don't
+  need location), `BLUETOOTH_CONNECT`, and for Android ≤ 11 `ACCESS_FINE_LOCATION`.
+- **iOS / macOS**: add `NSBluetoothAlwaysUsageDescription` to `Info.plist`.
+- **Windows / Linux**: BLE works via flutter_blue_plus with no extra manifest.
+
+## Using the codec on its own
+
+`lib/battery_protocol.dart` has no Flutter import, so you can reuse it in a
+`dart:io` CLI or a server. Feed it bytes from any transport:
+
+```dart
+final state = BatteryState();
+final parser = BatteryParser(state: state, onEvent: (e) => print(e));
+parser.addBytes(bytesFromNotification);
+print('SOC ${state.socPercent}%  ${state.packVoltage} V  ${state.packCurrent} A');
+```

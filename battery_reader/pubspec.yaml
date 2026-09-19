@@ -1,0 +1,30 @@
+name: battery_reader
+description: Reads and displays all telemetry from a JoySuny BMS (Sphere / RV Battery) over BLE.
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: ^2.3.12 # BLE transport on iOS + Android
+  # universal_ble is the Windows (WinRT) BLE backend. flutter_blue_plus has no
+  # Windows support, so the transport layer (lib/ble_transport.dart) uses FBP on
+  # mobile and universal_ble on Windows desktop.
+  universal_ble: ^0.18.0
+  sqflite: ^2.3.0 # on-device time-series store (SQLite) — mobile
+  # sqflite has no desktop implementation; on Windows main() swaps in the FFI
+  # factory (sqfliteFfiInit / databaseFactoryFfi) so the same schema opens there.
+  sqflite_common_ffi: ^2.3.0
+  path: ^1.9.0 # join() for the database path
+  fl_chart: ^0.69.0 # line/area charts for the history screens
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
