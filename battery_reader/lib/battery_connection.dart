@@ -14,6 +14,31 @@ import 'raw_log.dart';
 
 enum ConnState { idle, scanning, connecting, connected, disconnected }
 
+/// #62: what the AT+V probe found about a connected but silent link.
+///
+/// Live finding (2026-09-20): the BLE bridge is a separate module. A pack
+/// whose BMS MCU is not running still connects, answers AT+V with ONLY the
+/// bridge's single 0x30 status byte (no AC 9A version frame) and ignores
+/// every framed command — nothing over Bluetooth wakes it.
+enum StreamClass {
+  /// No probe yet on this link.
+  unknown,
+
+  /// Telemetry frames are flowing.
+  streaming,
+
+  /// AT+V answered with only the bridge's 0x30 and no version frame: the
+  /// bridge is alive, the BMS MCU is not running.
+  dormant,
+
+  /// AT+V answered with a version frame but no telemetry followed: the BMS is
+  /// awake and merely not streaming (CMD_BEGIN is re-sent).
+  awakeNotStreaming,
+
+  /// Nothing came back within the probe window (not even the 0x30).
+  noResponse,
+}
+
 /// Something attached to a connection that must be released with it (M11):
 /// the logger's stream subscriptions. Returned by `BatteryLogger.attach`,
 /// stored as [BatteryConnection.loggerAttachment] and cancelled by
@@ -59,6 +84,7 @@ class BatteryConnection {
     BleTransport? transport,
     this.now = DateTime.now,
     this.connectTimeout = defaultConnectTimeout,
+    this.probeWindow = defaultProbeWindow,
   })  : transport = transport ?? defaultBleTransport,
         commands = BatteryCommands(profile),
         state = BatteryState() {
@@ -68,6 +94,20 @@ class BatteryConnection {
         // C1: a decoded BAL_STATUS is the ONLY thing that makes the gate base
         // fresh enough to build a gate-control write from.
         lastFrameMs = now().millisecondsSinceEpoch; // #59 streaming watchdog
+        // #61 / #62 / #53: frame bookkeeping for the live indicator, the
+        // dormant-BMS probe and the one-cycle background sample.
+        frameCount++;
+        totalFrameCount++;
+        if (e is VersionEvent) {
+          lastVersionFrameMs = lastFrameMs;
+        } else if (isTelemetryEvent(e)) {
+          // Only the STREAM counts as "streaming": a version frame or an
+          // ack answers a command and must not clear the silence.
+          lastTelemetryMs = lastFrameMs;
+          lastFrameEverMs = lastFrameMs;
+          _cycleSeen.add(e.runtimeType);
+          streamClass = StreamClass.streaming;
+        }
         if (e is BalancerEvent) {
           lastGateStatusMs = lastFrameMs;
           _noteGateAvailability();
@@ -87,8 +127,13 @@ class BatteryConnection {
         runningCount: state.unrecognisedBytes,
       ),
       // #60: the known AT+V status byte — logged as such, never counted.
-      onAtStatusByte: (b) =>
-          RawLogger.instance.logAtStatus(state.serial ?? '', b),
+      // #62: also counted, so the probe can tell "bridge answered with only
+      // its 0x30" (dormant) from "nothing at all".
+      onAtStatusByte: (b) {
+        atStatusCount++;
+        lastAtStatusMs = now().millisecondsSinceEpoch;
+        RawLogger.instance.logAtStatus(state.serial ?? '', b);
+      },
     );
   }
 
@@ -157,6 +202,12 @@ class BatteryConnection {
     } else if (s == ConnState.connected) {
       _connectedAtMs = now().millisecondsSinceEpoch; // #59
       lastFrameMs = null;
+      lastTelemetryMs = null;
+      // #61 / #62 / #53: per-link counters and the probe result start over.
+      frameCount = 0;
+      streamClass = StreamClass.unknown;
+      lastProbeMs = null;
+      _cycleSeen.clear();
       expectedDisconnect = false;
       _linkError = false;
       if (_rebaselineOnReconnect) {
@@ -176,7 +227,8 @@ class BatteryConnection {
   /// any UI rebuild timing (#55).
   int? lastGateStatusMs;
 
-  /// A persistent gate toggle (output, passive balancing, heater, …) is only
+  /// A persistent gate toggle (charge / output switch, passive balancing,
+  /// heater, …) is only
   /// allowed while the gate base is younger than this. #55: was 5 s, which
   /// re-locked the controls on every short stall of a weak link (JS-2C14B8 at
   /// −90 dBm stalled ≥ 5 s nine times and re-handshook 82 times in one
@@ -222,58 +274,78 @@ class BatteryConnection {
       '(needs one within ${gateFreshnessMs ~/ 1000} s)';
 
   /// #59: a connected link with no decoded telemetry frame for this long is
-  /// reported as "not streaming" (the pack may have idled into low-power
-  /// sleep) instead of "waiting for gate status".
+  /// reported as "not streaming" instead of "waiting for gate status", and
+  /// (#62) the AT+V probe classifies why — see [watchdogTick].
   static const int notStreamingMs = 10000;
 
-  /// Reason text for a connected link that has gone silent (#59).
-  static String reasonNotStreaming(int silenceMs) =>
-      'Connected but not streaming — no telemetry for '
-      '${(silenceMs / 1000).round()} s (the battery may be asleep)';
+  /// Reason text for a connected link that has gone silent (#59), refined by
+  /// the #62 probe result [cls]. Always starts with "Connected but not
+  /// streaming" (Diagnostics keys on that prefix). Never says "asleep": the
+  /// BMS's standby flag is a stored setting, not a state we can observe.
+  static String reasonNotStreaming(int silenceMs,
+      [StreamClass cls = StreamClass.unknown]) {
+    final silent = 'no telemetry for ${(silenceMs / 1000).round()} s';
+    return switch (cls) {
+      StreamClass.dormant => 'Connected but not streaming — $dormantState',
+      StreamClass.awakeNotStreaming =>
+        'Connected but not streaming — $awakeNotStreamingState ($silent)',
+      StreamClass.noResponse =>
+        'Connected but not streaming — $noResponseState ($silent)',
+      _ => 'Connected but not streaming — $silent (checking whether the '
+          'BMS is in Bluetooth standby)',
+    };
+  }
 
   /// Epoch-ms of the last decoded frame of ANY kind on this link, or null.
   int? lastFrameMs;
+
+  /// Epoch-ms of the last decoded TELEMETRY frame on this link (the cyclic
+  /// stream — not a version frame or an ack, #62), or null. Silence and the
+  /// live indicator (#61) are measured from this.
+  int? lastTelemetryMs;
   int? _connectedAtMs;
 
-  /// Milliseconds since the last decoded frame on this link (or since the
-  /// link came up, if none yet); null while not connected.
+  /// Milliseconds since the last decoded telemetry frame on this link (or
+  /// since the link came up, if none yet); null while not connected.
   int? get silenceMs {
     if (connState != ConnState.connected) return null;
-    final since = lastFrameMs ?? _connectedAtMs;
+    final since = lastTelemetryMs ?? _connectedAtMs;
     return since == null ? null : now().millisecondsSinceEpoch - since;
   }
 
   /// True while connected but silent for at least [notStreamingMs] (#59).
   bool get notStreaming => (silenceMs ?? 0) >= notStreamingMs;
 
-  /// Why gate writes that CAN TURN SOMETHING OFF (output OFF, passive
-  /// balancing / heater OFF, factory reset — anything built from the live gate
+  /// Why gate writes that CAN TURN SOMETHING OFF (charge / output / both OFF,
+  /// passive balancing / heater OFF, factory reset — anything built from the live gate
   /// base) are refused right now, or null when they are allowed. The text
   /// never implies a user approval step: every reason clears by itself once
   /// the battery is connected and reporting.
   String? get gateControlsDisabledReason {
     if (connState != ConnState.connected) return reasonNotConnected;
-    if (notStreaming) return reasonNotStreaming(silenceMs!);
+    if (notStreaming) return reasonNotStreaming(silenceMs!, streamClass);
     if (gateBase == null) return reasonNoGateStatus;
     final ageMs = gateStatusAgeMs!;
     if (ageMs >= gateFreshnessMs) return reasonGateStatusStale(ageMs);
     return null;
   }
 
-  /// #59: why the SAFE writes — Output ON and Restart — are refused, or null.
-  /// A write that cannot turn anything off is never blocked on a connected
-  /// battery: JS-2C14AA had its output OFF, the fresh-status gate refused
-  /// "Output ON", and the pack idled into sleep unreachable. See
-  /// [safeWriteBase] for the frame such a write carries without a fresh base.
+  /// #59: why the SAFE writes — Charge ON, Output ON, Both ON and Restart —
+  /// are refused, or null. A write that cannot turn anything off is never
+  /// blocked on a connected battery: JS-2C14AA had its output OFF, the
+  /// fresh-status gate refused "Output ON", and the pack idled into sleep
+  /// unreachable. See [safeWriteBase] for the frame such a write carries
+  /// without a fresh base.
   String? get safeWritesDisabledReason =>
       connState != ConnState.connected ? reasonNotConnected : null;
 
-  /// #59: true for the writes that cannot turn anything off: Output ON (both
-  /// MOS = 1) and Restart. NOT passive / heater ON: without a fresh base their
-  /// frame would also have to force both MOS bytes to 1, silently turning the
-  /// output on as a side effect, so they keep the fresh-status gate.
+  /// #59 / #58: true for the writes that cannot turn anything off: a MOS
+  /// switch ON (Charge ON, Output ON, Both ON) and Restart. NOT passive /
+  /// heater ON: without a fresh base their frame would also have to force
+  /// the MOS bytes to 1, silently turning a switch on as a side effect, so
+  /// they keep the fresh-status gate.
   static bool isSafeWrite(GateAction action, {required bool on}) =>
-      (action == GateAction.output && on) || action == GateAction.restart;
+      (isMosAction(action) && on) || action == GateAction.restart;
 
   /// The applicable refusal reason for [action] / [on] (null = allowed).
   String? disabledReasonFor(GateAction action, {bool on = true}) =>
@@ -285,24 +357,59 @@ class BatteryConnection {
   /// (the state object survives reconnects; only [lastGateStatusMs] resets).
   GateSnapshot? get lastKnownGates => GateSnapshot.fromState(state);
 
-  /// #59: the base a SAFE write (Output ON / Restart) is built from when there
-  /// is no fresh status: both MOS bytes = 1 (it cannot cut output), the other
-  /// gates from [lastKnownGates] — the last decoded status on this row, any
-  /// link, any age — and, for a row that has never decoded one, protective
-  /// defaults: tempControlGate = 1 (low-temp protection ON is the safe
-  /// direction; 0 would switch it off), smokeGate = 0 and heatGate = 0,
-  /// passiveBalancing = 0 (what every observed pack reports at rest). The
-  /// momentary flags are 0 unless the action itself sets one.
-  GateSnapshot safeWriteBase() {
+  /// #59 / #58: the base a SAFE write is built from when there is no fresh
+  /// status. The MOS bytes:
+  ///
+  ///  * Charge ON forces ONLY byte[0] to 1; Output ON forces ONLY byte[1].
+  ///    The OTHER switch keeps its last-known value on this row (any link,
+  ///    any age) — it is never silently switched on. Only when that switch
+  ///    has NEVER been reported (no status on any link) is it written as 1,
+  ///    the one direction that cannot cut anything; the confirmation says so.
+  ///  * Both ON and Restart force both MOS bytes to 1 (the #59 rule).
+  ///
+  /// The other gates come from [lastKnownGates] and, for a row that has never
+  /// decoded a status, protective defaults: tempControlGate = 1 (low-temp
+  /// protection ON is the safe direction; 0 would switch it off), smokeGate =
+  /// 0 and heatGate = 0, passiveBalancing = 0 (what every observed pack
+  /// reports at rest). The momentary flags are 0 unless the action sets one.
+  GateSnapshot safeWriteBase(GateAction action) {
     final known = lastKnownGates;
+    final forceBoth =
+        action == GateAction.restart || action == GateAction.bothMos;
     return GateSnapshot(
-      chargeMos: true,
-      dischargeMos: true,
+      chargeMos: forceBoth ||
+          action == GateAction.chargeMos ||
+          (state.chargeMos ?? true),
+      dischargeMos: forceBoth ||
+          action == GateAction.dischargeMos ||
+          (state.dischargeMos ?? true),
       tempControlGate: known?.tempControlGate ?? 1,
       smokeGate: known?.smokeGate ?? 0,
       heatGate: known?.heatGate ?? 0,
       passiveBalancing: known?.passiveBalancing ?? false,
     );
+  }
+
+  /// #58: what a safe write's frame carries for the MOS bytes without a fresh
+  /// status, in words for the confirmation and Diagnostics — e.g.
+  /// "output ON (discharge MOS byte = 1); the charge switch keeps its
+  /// last-known value (ON)".
+  String safeWriteMosText(GateAction action) {
+    if (action == GateAction.restart || action == GateAction.bothMos) {
+      return 'charge and output ON (both MOS bytes = 1)';
+    }
+    final charge = action == GateAction.chargeMos;
+    final own = charge
+        ? 'charge ON (charge MOS byte = 1)'
+        : 'output ON (discharge MOS byte = 1)';
+    final other = charge ? 'output' : 'charge';
+    final otherKnown = charge ? state.dischargeMos : state.chargeMos;
+    if (otherKnown == null) {
+      return '$own and, with no $other state ever received from this '
+          'battery, $other ON too';
+    }
+    return '$own; the $other switch keeps its last-known value '
+        '(${otherKnown ? 'ON' : 'OFF'})';
   }
 
   /// One line for Diagnostics: connection state, streaming state, gate-status
@@ -322,8 +429,14 @@ class BatteryConnection {
     final avail = reason == null
         ? 'controls available'
         : 'controls unavailable: $reason'
-            '${safeWritesDisabledReason == null ? ' (Output ON / Restart still available)' : ''}';
-    return '$serial: ${connState.name}$stream · $ageText · $avail';
+            '${safeWritesDisabledReason == null ? ' (Charge ON / Output ON / Restart still available)' : ''}';
+    // #61: frame counter + last-frame age; #62: the probe's verdict.
+    final frames = connState != ConnState.connected
+        ? ''
+        : ' · frames $frameCount'
+            ' · last frame ${lastTelemetryMs == null ? 'none' : '${_fmtAge(silence!)} ago'}'
+            '${streamClass == StreamClass.unknown ? '' : ' · stream ${streamClass.name}'}';
+    return '$serial: ${connState.name}$stream$frames · $ageText · $avail';
   }
 
   static String _fmtAge(int ms) => ms < 10000
@@ -475,15 +588,20 @@ class BatteryConnection {
     return cumulativeThroughputAh / full;
   }
 
+  /// #53: the widest gap the session integrator bridges. 10 s while
+  /// continuous; the manager raises it to (interval + margin) in background
+  /// sampling mode so sparse samples are held to the next one.
+  int maxIntegrateGapMs = 10000;
+
   /// Integrate |signedCurrent| over the time since the last event. Long gaps
   /// (disconnects) are skipped so offline windows do not accrue throughput.
   void _integrateThroughput(int nowMs) {
     final last = _lastEfcMs;
     _lastEfcMs = nowMs;
     if (last == null) return;
-    final dtH = (nowMs - last) / 3600000.0;
-    if (dtH <= 0 || dtH > 10 / 3600.0) return; // ignore <=0 and >10 s gaps
-    cumulativeThroughputAh += signedCurrent.abs() * dtH;
+    final dtMs = nowMs - last;
+    if (dtMs <= 0 || dtMs > maxIntegrateGapMs) return; // <=0 and offline gaps
+    cumulativeThroughputAh += signedCurrent.abs() * (dtMs / 3600000.0);
   }
 
   BleLink? _link;
@@ -684,31 +802,56 @@ class BatteryConnection {
   /// non-zero heat byte. Driven through [sendGateControl] with [GateAction.heatGate].
   bool get isHeatOn => (state.heatGate ?? 0) != 0;
 
-  /// #42 sleep: the BMS is in sleep mode iff the last SLEEP_SET_SUCCESS said so.
+  /// #42 / #62: the STORED "Bluetooth standby (power saving)" setting as the
+  /// last SLEEP_SET_SUCCESS ack reported it. A setting, never "asleep now":
+  /// the pack keeps streaming while a central is connected.
   bool get isSleepModeOn => state.sleepModeOn ?? false;
 
   /// #38: the pack's current rated / full capacity in Ah (from SOC frames), the
   /// basis the UI shows before a capacity write and validates the read-back against.
   double? get ratedCapacityAh => state.fullAh;
 
-  /// The single "Output" state the UI shows (issue #26): the vendor drives both
-  /// FETs together, so output is ON iff BOTH the charge and discharge MOS report
-  /// on. If either FET is off, output is treated as off.
-  bool get isOutputOn => (state.chargeMos ?? false) && (state.dischargeMos ?? false);
+  /// #58: the "Charge" switch (charge MOS, gate byte[0]) as last reported.
+  bool get isChargeOn => state.chargeMos ?? false;
 
-  /// Read-back for a control write (issue #24). After sending an Output command,
-  /// watch the streamed BAL_STATUS frames and complete `true` as soon as the pack
-  /// reports both FETs at [expectedOn], or `false` if it has not within [timeout]
-  /// (e.g. you sent "output OFF" but chgMos/disMos are still 1). Lets the UI warn
-  /// the user that the command did not take effect on the hardware.
-  Future<bool> confirmOutputState(
+  /// #58: the "Output" switch (discharge MOS, gate byte[1]) as last reported.
+  /// (Until #58 this was the single "Output" state = both switches on.)
+  bool get isOutputOn => state.dischargeMos ?? false;
+
+  /// #58: both switches on (what the MOS_STATUS frame's `mosOn` also reports).
+  bool get areBothOn => isChargeOn && isOutputOn;
+
+  /// The reported state of the switch [action] drives (null = not reported).
+  /// [GateAction.bothMos] is on iff both are on.
+  bool? mosState(GateAction action) => switch (action) {
+        GateAction.chargeMos => state.chargeMos,
+        GateAction.dischargeMos => state.dischargeMos,
+        GateAction.bothMos =>
+          state.chargeMos == null || state.dischargeMos == null
+              ? null
+              : areBothOn,
+        _ => null,
+      };
+
+  /// Read-back for a MOS switch write (issue #24 / #58). After sending a
+  /// Charge / Output / Both command, watch the streamed BAL_STATUS frames and
+  /// complete `true` as soon as the pack reports THAT switch at [expectedOn]
+  /// (for [GateAction.bothMos]: both bytes), or `false` if it has not within
+  /// [timeout] (e.g. you sent "output OFF" but disMos is still 1). Lets the UI
+  /// warn the user that the command did not take effect on the hardware.
+  Future<bool> confirmMosState(
+    GateAction action,
     bool expectedOn, {
     Duration timeout = const Duration(seconds: 4),
   }) {
     // Only a fresh BAL_STATUS frame confirms the change: wait for the next one
     // (or any event that arrives with the state already reflecting the target).
-    bool matches() =>
-        (state.chargeMos == expectedOn) && (state.dischargeMos == expectedOn);
+    bool matches() => switch (action) {
+          GateAction.chargeMos => state.chargeMos == expectedOn,
+          GateAction.dischargeMos => state.dischargeMos == expectedOn,
+          _ => state.chargeMos == expectedOn &&
+              state.dischargeMos == expectedOn,
+        };
     return _confirmVia(matches, timeout);
   }
 
@@ -716,16 +859,18 @@ class BatteryConnection {
   /// Only the [action] byte changes; every other gate keeps its current value
   /// (read from the last BAL_STATUS frame). Restart/factory ignore [on].
   ///
-  /// SAFETY (audit C1 / #59): with a FRESH base ([gateControlsDisabledReason]
-  /// null — connected, streaming, all six gates from a BAL_STATUS within
-  /// [gateFreshnessMs]) every action is built from the live gates. Without
-  /// one, only a SAFE write ([isSafeWrite]: Output ON, Restart) goes out, on
-  /// any connected link, built from [safeWriteBase] (both MOS = 1, so it can
-  /// cut nothing). Everything else is REFUSED with a [StateError] — a frame
-  /// built from a stale or unknown base could write chargeMos = dischargeMos
-  /// = 0 (cutting output) or tempControlGate = 0 (disabling protection). A
-  /// refusal, and a safe write sent without a fresh base, are recorded in
-  /// Diagnostics.
+  /// SAFETY (audit C1 / #59 / #58): with a FRESH base
+  /// ([gateControlsDisabledReason] null — connected, streaming, all six gates
+  /// from a BAL_STATUS within [gateFreshnessMs]) every action is built from
+  /// the live gates. Without one, only a SAFE write ([isSafeWrite]: Charge
+  /// ON, Output ON, Both ON, Restart) goes out, on any connected link, built
+  /// from [safeWriteBase] (its own MOS byte = 1, the other at its last-known
+  /// value, so it can cut nothing). Everything else — any write that turns a
+  /// switch OFF — is REFUSED with a [StateError]: a frame built from a stale
+  /// or unknown base could write chargeMos = dischargeMos = 0 (cutting
+  /// output / stopping charge) or tempControlGate = 0 (disabling
+  /// protection). A refusal, and a safe write sent without a fresh base, are
+  /// recorded in Diagnostics.
   Future<void> sendGateControl(GateAction action, {bool on = true}) async {
     final GateSnapshot base;
     final freshReason = gateControlsDisabledReason;
@@ -733,19 +878,15 @@ class BatteryConnection {
       base = gateBase!;
     } else if (isSafeWrite(action, on: on) &&
         safeWritesDisabledReason == null) {
-      base = safeWriteBase();
+      base = safeWriteBase(action);
       AppLog.instance.record(
           _source,
-          'safe write ${action.name} on ${state.serial ?? '?'} sent without a '
-          'fresh gate status ($freshReason): MOS forced ON, other gates '
+          'safe write ${mosSwitchName(action)} on ${state.serial ?? '?'} sent '
+          'without a fresh gate status ($freshReason): '
+          '${safeWriteMosText(action)}, other gates '
           '${lastKnownGates == null ? 'defaults' : 'last known'}');
     } else {
-      final why = disabledReasonFor(action, on: on) ?? 'gate state unknown';
-      AppLog.instance.record(_source,
-          'refused gate write ${action.name} on ${state.serial ?? '?'}: $why');
-      throw StateError('Refusing gate write ${action.name}: '
-          '$why — a write built from a stale or '
-          'unknown gate base could cut output or disable protection.');
+      throw _refusal(action, on: on);
     }
     final frame = buildGateControlFrame(base: base, action: action, on: on);
     if (action == GateAction.restart || action == GateAction.factory) {
@@ -757,7 +898,286 @@ class BatteryConnection {
       _rebaselineOnReconnect = true;
       _unknownBaseline.clear();
     }
-    await _send(frame, label: 'gate control ${action.name} ${on ? 'on' : 'off'}');
+    await _send(frame, label: 'gate control ${mosSwitchName(action)} ${on ? 'on' : 'off'}');
+  }
+
+  /// The recorded [StateError] for a refused gate write (C1).
+  StateError _refusal(GateAction action, {required bool on}) {
+    final why = disabledReasonFor(action, on: on) ?? 'gate state unknown';
+    AppLog.instance.record(_source,
+        'refused gate write ${mosSwitchName(action)} on ${state.serial ?? '?'}: $why');
+    return StateError('Refusing gate write ${mosSwitchName(action)}: '
+        '$why — a write built from a stale or '
+        'unknown gate base could cut output, stop charging or disable '
+        'protection.');
+  }
+
+  // --- #62 standby-off before a switch-off (SAFETY-CRITICAL) ---------------
+  // Live incident: a pack whose output was turned OFF while its Bluetooth
+  // standby ("sleep") mode was ON went DORMANT and unwakeable — with both MOS
+  // off no current can flow through it (in a parallel bank the sibling takes
+  // every amp), and this firmware wakes only on current; the BLE bridge cannot
+  // wake the MCU. So EVERY switch-off (Charge / Output / Both, per battery or
+  // fleet) turns standby OFF first when it is ON or unknown.
+
+  /// How long a switch-off waits for the standby-OFF ack (AC CA) before
+  /// sending the gate frame anyway.
+  static const Duration standbyAckTimeout = Duration(seconds: 3);
+
+  /// #62: true when a switch-off must turn Bluetooth standby OFF first —
+  /// standby is reported ON, or has never been reported on this row.
+  bool get needsStandbyOffFirst => state.sleepModeOn != false;
+
+  /// #62: turn the MOS switch [action] OFF safely. Order:
+  ///  1. the C1 pre-check — a switch-off that would be refused sends NOTHING
+  ///     (not even the standby-off);
+  ///  2. when [needsStandbyOffFirst]: CMD_CLOSE_SLEEP_CONTROL
+  ///     (AA CC 01 01 DD EE), then wait for the AC CA ack or
+  ///     [standbyAckTimeout];
+  ///  3. the gate frame that flips ONLY that switch ([sendGateControl]).
+  Future<void> turnSwitchOff(GateAction action) async {
+    if (!isMosAction(action)) {
+      throw ArgumentError.value(action, 'action', 'not a MOS switch');
+    }
+    if (disabledReasonFor(action, on: false) != null) {
+      throw _refusal(action, on: false);
+    }
+    if (needsStandbyOffFirst) {
+      final serial = state.serial ?? '?';
+      final was = state.sleepModeOn == null ? 'unknown' : 'ON';
+      AppLog.instance.record(
+          _source,
+          '#62 Bluetooth standby $was on $serial: turning standby OFF before '
+          '${mosSwitchName(action)} OFF');
+      await setSleepMode(false);
+      final acked =
+          await confirmSleepState(false, timeout: standbyAckTimeout);
+      AppLog.instance.record(
+          _source,
+          acked
+              ? 'standby OFF acked by $serial'
+              : 'no standby-OFF ack from $serial within '
+                  '${standbyAckTimeout.inSeconds} s — sending '
+                  '${mosSwitchName(action)} OFF anyway');
+    }
+    await sendGateControl(action, on: false);
+  }
+
+  // --- #62 dormant-BMS classification + recovery ladder --------------------
+  // Verified live: a pack whose BMS MCU is not running still connects, answers
+  // AT+V with ONLY the bridge's 0x30 status byte and ignores every framed
+  // command. A pack whose BMS is awake answers AT+V with '0' + the AC 9A
+  // version frame; if it is merely not streaming, CMD_BEGIN restarts the
+  // stream. The ladder below is USER-initiated (never silent, #62 item 5).
+
+  /// How long the AT+V probe waits for an answer (injectable for tests).
+  final Duration probeWindow;
+  static const Duration defaultProbeWindow = Duration(milliseconds: 1500);
+
+  /// A silent link is re-probed no more often than this while it stays silent.
+  static const int probeRepeatMs = 30000;
+
+  /// How long a ladder step waits for the stream to resume.
+  static const Duration resumeTimeout = Duration(seconds: 5);
+
+  /// What the last probe found on this link (reset on connect; any telemetry
+  /// frame flips it to [StreamClass.streaming]).
+  StreamClass streamClass = StreamClass.unknown;
+
+  /// Epoch-ms the last probe started on this link, or null.
+  int? lastProbeMs;
+
+  /// #61: frames decoded on THIS link (reset on connect) / on this row ever.
+  int frameCount = 0;
+  int totalFrameCount = 0;
+
+  /// Epoch-ms of the last decoded frame on ANY link of this row (never reset)
+  /// — the "sampled … ago" age in background sampling mode (#53).
+  int? lastFrameEverMs;
+
+  /// Epoch-ms of the last AC 9A version frame / the last bridge 0x30 status
+  /// byte on this row, and how many 0x30s have been seen (#62 probe).
+  int? lastVersionFrameMs;
+  int? lastAtStatusMs;
+  int atStatusCount = 0;
+
+  Completer<StreamClass>? _probe;
+
+  /// True while an AT+V probe is running.
+  bool get probeInFlight => _probe != null;
+
+  // #62 texts (pinned by tests).
+  static const String dormantState =
+      'BMS dormant (bridge answers, no telemetry)';
+  static const String awakeNotStreamingState = 'BMS awake, not streaming';
+  static const String noResponseState = 'no reply to AT+V';
+
+  /// What to tell the user about a dormant pack. Recovery is physical.
+  static const String dormantMessage =
+      'BMS is not running — it entered Bluetooth standby with its output off '
+      'and cannot be woken over Bluetooth. Isolate this pack from the bank '
+      'and connect a charger to it alone, or use its reset button.';
+
+  /// Telemetry = the cyclic frames (voltage, temperature, all-data, MOS,
+  /// balancer, SOC, estimate, alarms, other). Acks and the version frame are
+  /// answers to commands, not the stream.
+  static bool isTelemetryEvent(BatteryEvent e) =>
+      e is! VersionEvent &&
+      e is! SleepEvent &&
+      e is! SettingRespondEvent &&
+      e is! GateSetEvent;
+
+  /// The not-streaming watchdog, driven by the UI tick (~300 ms): a link
+  /// that is connected, silent for [notStreamingMs] and not probed in the
+  /// last [probeRepeatMs] gets an AT+V probe. Cheap when nothing is due.
+  void watchdogTick() {
+    if (connState != ConnState.connected || !notStreaming || _probe != null) {
+      return;
+    }
+    final nowMs = now().millisecondsSinceEpoch;
+    final last = lastProbeMs;
+    if (last != null && nowMs - last < probeRepeatMs) return;
+    unawaited(probeStreaming());
+  }
+
+  /// The AT+V classification. Sends AT+V and, within [probeWindow]:
+  ///  * a telemetry frame            -> [StreamClass.streaming];
+  ///  * a version frame, no stream   -> [StreamClass.awakeNotStreaming] and
+  ///    CMD_BEGIN is re-sent;
+  ///  * only the bridge's 0x30       -> [StreamClass.dormant];
+  ///  * nothing                      -> [StreamClass.noResponse].
+  /// Deduped: a probe already running returns its result.
+  Future<StreamClass> probeStreaming() {
+    final running = _probe;
+    if (running != null) return running.future;
+    if (connState != ConnState.connected) {
+      return Future.value(StreamClass.unknown);
+    }
+    final c = Completer<StreamClass>();
+    _probe = c;
+    lastProbeMs = now().millisecondsSinceEpoch;
+    unawaited(_runProbe(c));
+    return c.future;
+  }
+
+  Future<void> _runProbe(Completer<StreamClass> c) async {
+    final serial = state.serial ?? '?';
+    final atBefore = atStatusCount;
+    var sawVersion = false, sawTelemetry = false;
+    final answered = Completer<void>();
+    final sub = events.listen((e) {
+      if (e is VersionEvent) {
+        sawVersion = true;
+      } else if (isTelemetryEvent(e)) {
+        sawTelemetry = true;
+      }
+      if ((sawVersion || sawTelemetry) && !answered.isCompleted) {
+        answered.complete();
+      }
+    });
+    StreamClass result;
+    try {
+      parser.atVersionSent = true; // #60: its '0' is a status byte
+      await _send(BatteryCommands.getVersion, label: 'AT+V probe (#62)');
+      await answered.future.timeout(probeWindow, onTimeout: () {});
+      if (sawTelemetry) {
+        result = StreamClass.streaming;
+      } else if (sawVersion) {
+        result = StreamClass.awakeNotStreaming;
+        await _send(BatteryCommands.begin,
+            label: 're-send wake (CMD_BEGIN) after AT+V probe');
+      } else if (atStatusCount > atBefore) {
+        result = StreamClass.dormant;
+      } else {
+        result = StreamClass.noResponse;
+      }
+    } catch (e) {
+      AppLog.instance.record(_source, '$serial AT+V probe failed: $e');
+      result = StreamClass.unknown;
+    } finally {
+      await sub.cancel();
+    }
+    // Telemetry that arrived meanwhile already set `streaming`; never
+    // downgrade it.
+    if (streamClass != StreamClass.streaming ||
+        result == StreamClass.streaming) {
+      streamClass = result;
+    }
+    AppLog.instance.record(
+        _source,
+        '$serial AT+V probe: ${result.name}'
+        ' (version frame ${sawVersion ? 'yes' : 'no'}, status byte '
+        '${atStatusCount > atBefore ? 'yes' : 'no'}, telemetry '
+        '${sawTelemetry ? 'yes' : 'no'})');
+    _probe = null;
+    _noteGateAvailability();
+    if (!c.isCompleted) c.complete(result);
+  }
+
+  /// Completes true as soon as a telemetry frame is decoded (on any link of
+  /// this row), false after [timeout].
+  Future<bool> awaitStreaming({Duration timeout = resumeTimeout}) {
+    final c = Completer<bool>();
+    late StreamSubscription<BatteryEvent> sub;
+    Timer? timer;
+    void finish(bool ok) {
+      if (c.isCompleted) return;
+      timer?.cancel();
+      sub.cancel();
+      c.complete(ok);
+    }
+
+    sub = events.listen((e) {
+      if (isTelemetryEvent(e)) finish(true);
+    });
+    timer = Timer(timeout, () => finish(false));
+    return c.future;
+  }
+
+  /// Ladder step (i): re-send CMD_BEGIN (the handshake's start-streaming
+  /// command; changes nothing on the pack). True iff the stream resumed
+  /// within [timeout]. Throws if the send fails (not connected).
+  Future<bool> resendWake({Duration timeout = resumeTimeout}) async {
+    final resumed = awaitStreaming(timeout: timeout);
+    AppLog.instance.record(
+        _source, '#62 ladder: re-send wake (CMD_BEGIN) to ${state.serial}');
+    await _send(BatteryCommands.begin, label: 'wake (CMD_BEGIN, #62 ladder)');
+    return resumed;
+  }
+
+  /// Ladder step (ii): the both-MOS-on frame from [safeWriteBase] (the vendor
+  /// app's de-facto wake). A SAFE write — it can cut nothing. True iff the
+  /// stream resumed within [timeout].
+  Future<bool> switchesOnToWake({Duration timeout = resumeTimeout}) async {
+    final resumed = awaitStreaming(timeout: timeout);
+    AppLog.instance.record(
+        _source, '#62 ladder: both switches ON to ${state.serial}');
+    await sendGateControl(GateAction.bothMos, on: true);
+    return resumed;
+  }
+
+  // --- #53 one full telemetry cycle (background sample) --------------------
+
+  /// The frame types one ~1 Hz cycle carries; a sample is complete once each
+  /// has been decoded on this link.
+  static const Set<Type> requiredCycleTypes = {
+    VoltageEvent,
+    TempEvent,
+    AllDataEvent,
+    MosEvent,
+    BalancerEvent,
+    SocEvent,
+  };
+  final Set<Type> _cycleSeen = {};
+
+  /// True once every [requiredCycleTypes] frame has been decoded on this link.
+  bool get cycleComplete => requiredCycleTypes.every(_cycleSeen.contains);
+
+  /// Completes true once [cycleComplete], false after [timeout].
+  Future<bool> awaitFullCycle(
+      {Duration timeout = const Duration(seconds: 12)}) {
+    if (cycleComplete) return Future.value(true);
+    return _confirmVia(() => cycleComplete, timeout);
   }
 
   // --- #42 sleep control (SAFETY-CRITICAL) ---------------------------------

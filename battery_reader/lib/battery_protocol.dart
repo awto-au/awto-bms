@@ -128,8 +128,8 @@ class BatteryCommands {
 // Frame: begin sentinel C3 1E + 8 payload bytes + end sentinel D4 3B. The 8
 // payload bytes, in order (verified against ../../docs/PROTOCOL.md
 // "CMD_GATE_CONTROL payload" and artifacts/reverse/01-ble-protocol.md §1.5):
-//   [0] chargeMos       1=on   0=off
-//   [1] dischargeMos    1=on   0=off   (a.k.a. output)
+//   [0] chargeMos       1=on   0=off   (the "Charge" switch, #58)
+//   [1] dischargeMos    1=on   0=off   (the "Output" switch, #58)
 //   [2] tempControlGate 1=on   0=off
 //   [3] smokeGate       1=on   0=off
 //   [4] heatGate        1=on   0=off
@@ -147,16 +147,16 @@ class BatteryCommands {
 
 /// Which gate a [buildGateControlFrame] call targets.
 ///
-/// [output] mirrors the VENDOR app's setMos exactly (issue #26): it writes BOTH
-/// FET bytes together — byte[0] (chargeMos) AND byte[1] (dischargeMos) set to the
-/// SAME target value. The vendor never toggles the two FETs individually, and
-/// flipping one alone did NOT take effect on hardware. [chargeMos]/[dischargeMos]
-/// remain for the pure per-byte frame builder / unit tests, but the UI drives the
-/// hardware only through [output].
+/// #58: the BMS has two independent MOSFET switches, carried as separate
+/// bytes — [chargeMos] is byte[0] (the "Charge" switch: current INTO the
+/// pack) and [dischargeMos] is byte[1] (the "Output" switch: current OUT of
+/// the pack). Each flips ONLY its own byte. [bothMos] is the convenience
+/// "Both on / Both off" that writes byte[0] AND byte[1] to the same value —
+/// the vendor app's setMos (issue #26).
 enum GateAction {
   chargeMos,
   dischargeMos,
-  output,
+  bothMos,
   tempControlGate,
   smokeGate,
   heatGate,
@@ -164,6 +164,22 @@ enum GateAction {
   passiveBalance,
   factory,
 }
+
+/// #58: the user-facing name of the switch a MOS action drives — "charge"
+/// (byte[0]), "output" (byte[1]) or "charge + output" (both). Other actions
+/// give their enum name. Nothing user-facing says just "MOS".
+String mosSwitchName(GateAction action) => switch (action) {
+      GateAction.chargeMos => 'charge',
+      GateAction.dischargeMos => 'output',
+      GateAction.bothMos => 'charge + output',
+      _ => action.name,
+    };
+
+/// #58: true for the three actions that drive a MOSFET switch.
+bool isMosAction(GateAction action) =>
+    action == GateAction.chargeMos ||
+    action == GateAction.dischargeMos ||
+    action == GateAction.bothMos;
 
 /// CMD_GATE_CONTROL sentinels and payload byte positions.
 class GateControl {
@@ -262,9 +278,9 @@ List<int> buildGateControlFrame({
       p[GateControl.iChargeMos] = v;
     case GateAction.dischargeMos:
       p[GateControl.iDischargeMos] = v;
-    case GateAction.output:
-      // Vendor setMos (issue #26): both FET bytes move together to the SAME
-      // value. byte[0]=byte[1]=v; every other gate keeps its cached value.
+    case GateAction.bothMos:
+      // "Both on / off" (#58; the vendor setMos of issue #26): byte[0] AND
+      // byte[1] move together to v; every other gate keeps its cached value.
       p[GateControl.iChargeMos] = v;
       p[GateControl.iDischargeMos] = v;
     case GateAction.tempControlGate:
@@ -787,6 +803,16 @@ class BatteryParser {
         continue;
       }
       _buf.removeRange(0, consumed);
+    }
+    // #62: a LONE trailing 0x30 — the bridge's whole answer to AT+V on a
+    // pack whose BMS is not running — would otherwise sit here waiting for a
+    // second byte that never comes. No frame begins with 0x30, so once AT+V
+    // has gone out it is consumed as the status byte at once.
+    if (_buf.length == 1 &&
+        (_buf[0] & 0xff) == atStatusByte &&
+        atVersionSent) {
+      onAtStatusByte?.call(atStatusByte);
+      _buf.clear();
     }
   }
 

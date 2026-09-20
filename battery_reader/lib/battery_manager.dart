@@ -19,6 +19,10 @@ import 'ble_transport.dart';
 import 'bms_families.dart';
 import 'demo_source.dart';
 import 'diagnostics.dart';
+import 'intervals.dart' show sampleGapMs;
+import 'sample_scheduler.dart';
+
+export 'sample_scheduler.dart' show SampleScheduler;
 
 /// M13: a short, user-facing explanation of a scan failure. Pure; the raw
 /// error is kept in [BatteryManager.lastScanError] for Diagnostics.
@@ -229,6 +233,7 @@ class BatteryManager {
   /// list and the fleet total are populated without hardware.
   void startDemoFleet() {
     stopLive();
+    _stopSampling();
     disposeAll();
     _live = false;
     _liveStarted = false; // #52: rows are demo rows; resumeLive -> startLive
@@ -260,6 +265,7 @@ class BatteryManager {
   /// re-scan that discovers newly-appeared packs and reconnects dropped ones.
   Future<void> startLive() async {
     stopLive();
+    _stopSampling();
     disposeAll();
     _live = true;
     _liveStarted = true;
@@ -293,6 +299,7 @@ class BatteryManager {
   Future<void> pauseLive() async {
     _released = true;
     stopLive();
+    _stopSampling(); // #53: a pause also ends background sampling
     _aggTimer?.cancel();
     _aggTimer = null;
     for (final b in List.of(batteries)) {
@@ -466,6 +473,185 @@ class BatteryManager {
       // the device is never left stuck in _connecting and un-retryable.
       _connecting.remove(deviceId);
     }
+  }
+
+  /// #62 ladder step (iii): drop and reconnect [conn] now (its backoff is
+  /// cleared) and report whether telemetry resumed within [timeout]. Throws
+  /// a [StateError] when the row has no known Bluetooth address or the
+  /// reconnect itself fails (the rescan keeps retrying it).
+  Future<bool> reconnect(BatteryConnection conn,
+      {Duration timeout = const Duration(seconds: 8)}) async {
+    final serial = conn.state.serial ?? 'this battery';
+    final id = deviceIdOf(conn) ?? conn.rememberedRemoteId;
+    if (id == null) {
+      throw StateError('No Bluetooth address is known for $serial yet');
+    }
+    _byId[id] ??= conn;
+    _backoffMs.remove(id);
+    _nextAttemptMs.remove(id);
+    AppLog.instance.record(_source, '#62 ladder: reconnect $serial ($id)');
+    await conn.disconnect();
+    final resumed = conn.awaitStreaming(timeout: timeout);
+    await _connect(conn, id, conn.state.serial ?? id);
+    if (conn.connState != ConnState.connected) {
+      throw StateError('Reconnect to $serial failed — it will be retried on '
+          'the next scan');
+    }
+    return resumed;
+  }
+
+  // -------------------------------------------------------------------------
+  // #53 background sampling: instead of holding every BLE link while the app
+  // is backgrounded, release the packs and, once per interval, reconnect each
+  // one, capture ONE full telemetry cycle and disconnect. The radio is idle in
+  // between. WHEN is the pure [SampleScheduler]; the connect goes through the
+  // same [_connect] dedupe + backoff path as a normal reconnect (#49), so a
+  // failed sample just waits for the next tick.
+  // -------------------------------------------------------------------------
+
+  /// The scheduler (pure); exposed for the UI's "next in …" and tests.
+  final SampleScheduler scheduler = SampleScheduler();
+
+  bool _sampling = false;
+  Timer? _sampleTimer;
+  bool _sampleInFlight = false;
+
+  /// True while in background sampling mode.
+  bool get isSampling => _sampling;
+
+  /// True while a sample (connect / capture / disconnect) is running.
+  bool get sampleInFlight => _sampleInFlight;
+
+  /// Epoch-ms of the next due sample while sampling, else null.
+  int? get nextSampleDueMs => _sampling ? scheduler.nextDueMs : null;
+
+  /// How long one sample waits for a full cycle before giving up.
+  static const Duration sampleCaptureTimeout = Duration(seconds: 12);
+
+  /// The rows a sample visits: every row with a known Bluetooth address (its
+  /// live id, or the remembered one for a favourite not yet rediscovered).
+  List<(BatteryConnection, String)> get sampleTargets => [
+        for (final b in batteries)
+          if ((deviceIdOf(b) ?? b.rememberedRemoteId) case final String id)
+            (b, id),
+      ];
+
+  /// Enter (or re-arm with a new [interval]) background sampling: stop the
+  /// continuous scan/reconnect loop, disconnect every pack (an EXPECTED
+  /// disconnect — no alarm), widen the logger's gap rule and arm the first
+  /// sample one interval from now.
+  Future<void> enterSampling(Duration interval) async {
+    final ms = interval.inMilliseconds;
+    if (ms <= 0) return exitSampling();
+    if (_sampling) {
+      if (scheduler.intervalMs != ms) {
+        scheduler.intervalMs = ms;
+        _applySampleGap(ms);
+        _armSampleTimer();
+      }
+      return;
+    }
+    _sampling = true;
+    _released = false;
+    stopLive();
+    scheduler.enter(now().millisecondsSinceEpoch, intervalMs: ms);
+    _applySampleGap(ms);
+    AppLog.instance.record(_source,
+        '#53 background sampling every ${ms ~/ 1000} s — releasing every pack');
+    for (final b in List.of(batteries)) {
+      if (b.connState == ConnState.connected ||
+          b.connState == ConnState.connecting) {
+        await b.disconnect();
+      }
+    }
+    _armSampleTimer();
+  }
+
+  /// Leave sampling mode. With [resume] (the default: the app is back in the
+  /// foreground) every known pack is reconnected IMMEDIATELY and the
+  /// continuous scan loop restarts; without it (a pause) the packs stay
+  /// released.
+  Future<void> exitSampling({bool resume = true}) async {
+    final was = _sampling;
+    _stopSampling();
+    if (!was || !resume) return;
+    AppLog.instance
+        .record(_source, '#53 foreground: continuous again, reconnecting');
+    for (final e in _byId.entries.toList()) {
+      if (e.value.connState == ConnState.disconnected) {
+        unawaited(_connect(e.value, e.key, e.value.state.serial ?? e.key));
+      }
+    }
+    await resumeLive();
+  }
+
+  void _stopSampling() {
+    _sampleTimer?.cancel();
+    _sampleTimer = null;
+    if (!_sampling) return;
+    _sampling = false;
+    _applySampleGap(0);
+  }
+
+  /// The logger's gap rule + tagging and every row's session integrator
+  /// follow the interval in effect.
+  void _applySampleGap(int intervalMs) {
+    BatteryLogger.instance.sampleIntervalMs = intervalMs;
+    final gap = sampleGapMs(intervalMs);
+    for (final b in batteries) {
+      b.maxIntegrateGapMs = gap;
+    }
+  }
+
+  void _armSampleTimer() {
+    _sampleTimer?.cancel();
+    _sampleTimer = null;
+    if (!_sampling) return;
+    final wait = scheduler.msUntilDue(now().millisecondsSinceEpoch) ??
+        scheduler.intervalMs;
+    _sampleTimer = Timer(Duration(milliseconds: wait), () {
+      unawaited(sampleOnce());
+    });
+  }
+
+  /// One sample: connect every target (in parallel), capture one full cycle
+  /// each, disconnect. Returns true iff at least one pack yielded telemetry.
+  /// Never throws; never overlaps another sample; re-arms the next tick.
+  Future<bool> sampleOnce() async {
+    if (!_sampling || _sampleInFlight) return false;
+    _sampleInFlight = true;
+    scheduler.started(now().millisecondsSinceEpoch);
+    var anyOk = false;
+    try {
+      final results = await Future.wait(
+          [for (final (b, id) in sampleTargets) _sampleOne(b, id)]);
+      anyOk = results.any((r) => r);
+    } catch (e) {
+      AppLog.instance.record(_source, '#53 sample failed: $e');
+    } finally {
+      _sampleInFlight = false;
+      scheduler.finished(now().millisecondsSinceEpoch, ok: anyOk);
+      AppLog.instance.record(
+          _source,
+          '#53 sample ${anyOk ? 'captured' : 'got nothing'}'
+          ' (${scheduler.consecutiveFailures} consecutive misses)');
+      _armSampleTimer();
+    }
+    return anyOk;
+  }
+
+  Future<bool> _sampleOne(BatteryConnection b, String id) async {
+    // Already linked (the foreground came back mid-way): nothing to do.
+    if (b.connState == ConnState.connected) return true;
+    _byId[id] ??= b;
+    await _connect(b, id, b.state.serial ?? id); // backoff-aware, never throws
+    if (b.connState != ConnState.connected) return false;
+    final full = await b.awaitFullCycle(timeout: sampleCaptureTimeout);
+    // The foreground came back while capturing: keep the link.
+    if (!_sampling) return true;
+    final captured = full || b.frameCount > 0;
+    await b.disconnect();
+    return captured;
   }
 
   /// Test hook (M13): run one scan pass through the real error-recording path.
@@ -789,56 +975,81 @@ class BatteryManager {
         'connect all to use fleet controls';
   }
 
-  /// C1: why the fleet OUTPUT buttons (real gate writes) are disabled, or null
-  /// when every member is connected AND has a fresh gate base. Stricter than
-  /// [fleetControlsDisabledReason]: a connected member whose BAL_STATUS has not
-  /// arrived yet (or is stale) blocks the whole fleet write, because a frame
-  /// built from its unknown gates could cut that pack's output.
+  /// C1: why the fleet switch-OFF buttons (real gate writes) are disabled, or
+  /// null when every member is connected AND has a fresh gate base. Stricter
+  /// than [fleetControlsDisabledReason]: a connected member whose BAL_STATUS
+  /// has not arrived yet (or is stale) blocks the whole fleet write, because
+  /// a frame built from its unknown gates could cut that pack's output.
   String? get fleetGateWriteDisabledReason =>
-      fleetOutputWriteDisabledReason(on: false);
+      fleetMosWriteDisabledReason(GateAction.bothMos, on: false);
 
-  /// Why a fleet-wide output write to [on] is refused, or null. #59: output
-  /// ON is a SAFE write (it cannot cut anything) and only needs every member
-  /// connected; output OFF additionally needs every member's fresh gate base.
-  String? fleetOutputWriteDisabledReason({required bool on}) {
+  /// Why a fleet-wide write of the switch [action] (charge / output / both)
+  /// to [on] is refused, or null. #59: switch ON is a SAFE write (it cannot
+  /// cut anything) and only needs every member connected; switch OFF
+  /// additionally needs every member's fresh gate base.
+  String? fleetMosWriteDisabledReason(GateAction action, {required bool on}) {
     final conn = fleetControlsDisabledReason;
     if (conn != null) return conn;
     for (final b in fleetMembers) {
-      final r = b.disabledReasonFor(GateAction.output, on: on);
+      final r = b.disabledReasonFor(action, on: on);
       if (r != null) return '${b.state.serial ?? 'a fleet battery'}: $r';
     }
     return null;
   }
 
-  /// Apply an Output change to every fleet member. Issue #26: this now mirrors
-  /// the vendor setMos — [GateAction.output] moves BOTH FET bytes together —
-  /// rather than toggling the discharge MOS alone. Callers MUST confirm first and
-  /// gate on [fleetGateWriteDisabledReason]; this fires real writes.
+  /// #58: how many fleet members report the Charge switch on.
+  int get fleetChargeOnCount => fleetMembers.where((b) => b.isChargeOn).length;
+
+  /// #58: how many fleet members report the Output switch on.
+  int get fleetOutputOnCount => fleetMembers.where((b) => b.isOutputOn).length;
+
+  /// #62: the fleet members whose Bluetooth standby is ON or unknown — a
+  /// fleet switch-off turns standby OFF on each of them first.
+  List<BatteryConnection> get fleetNeedingStandbyOff =>
+      [for (final b in fleetMembers) if (b.needsStandbyOffFirst) b];
+
+  /// Apply a MOS switch change — [GateAction.chargeMos] (Charge),
+  /// [GateAction.dischargeMos] (Output) or [GateAction.bothMos] (both, the
+  /// vendor setMos of issue #26) — to every fleet member (#58). Each frame
+  /// flips ONLY the target byte(s); the other gates come from that member's
+  /// fresh status. Callers MUST confirm first; this fires real writes.
   ///
   /// SAFETY (audit C1): REFUSES with a [StateError] — before sending anything —
-  /// unless EVERY member has [BatteryConnection.hasFreshGateState]. A member
-  /// without a fresh BAL_STATUS would otherwise get a frame built from unknown
-  /// gates (chargeMos = dischargeMos = 0 = output cut). No partial writes.
+  /// unless EVERY member allows the write ([BatteryConnection.disabledReasonFor]:
+  /// connected for a switch ON, a fresh gate base for a switch OFF). A member
+  /// without a fresh BAL_STATUS would otherwise get an OFF frame built from
+  /// unknown gates (chargeMos = dischargeMos = 0 = output cut). No partial
+  /// writes.
   ///
   /// M3: once the pre-check passes, every member is attempted even if an
   /// earlier one throws (link dropped mid-write, GATT failure, a base that
   /// went stale in between); the per-member outcome is returned rather than
   /// aborting on the first failure.
-  Future<FleetWriteResult> fleetSetOutput(bool on) async {
-    final reason = fleetOutputWriteDisabledReason(on: on);
+  Future<FleetWriteResult> fleetSetMos(GateAction action,
+      {required bool on}) async {
+    if (!isMosAction(action)) {
+      throw ArgumentError.value(action, 'action', 'not a MOS switch');
+    }
+    final name = mosSwitchName(action);
+    final reason = fleetMosWriteDisabledReason(action, on: on);
     if (reason != null) {
-      throw StateError('Refusing fleet output write: $reason');
+      throw StateError('Refusing fleet $name write: $reason');
     }
     final ok = <String>[];
     final failed = <String, Object>{};
     for (final b in fleetMembers) {
       final serial = b.state.serial ?? 'unknown';
       try {
-        await b.sendGateControl(GateAction.output, on: on);
+        // #62: a switch-off turns Bluetooth standby OFF first (per member).
+        if (on) {
+          await b.sendGateControl(action, on: true);
+        } else {
+          await b.turnSwitchOff(action);
+        }
         ok.add(serial);
       } catch (e) {
         AppLog.instance.record(_source,
-            'fleet write: $serial output ${on ? 'ON' : 'OFF'} failed: $e');
+            'fleet write: $serial $name ${on ? 'ON' : 'OFF'} failed: $e');
         failed[serial] = e;
       }
     }
@@ -933,6 +1144,7 @@ class BatteryManager {
   void disposeAll() {
     _aggTimer?.cancel();
     _aggTimer = null;
+    _stopSampling();
     for (final b in batteries) {
       b.dispose();
     }

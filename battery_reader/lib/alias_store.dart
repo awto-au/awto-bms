@@ -12,6 +12,19 @@ library;
 
 import 'prefs_store.dart';
 
+/// #56: the three distinct, non-failing outcomes of the rename dialog.
+enum AliasEditOutcome {
+  /// Cancel / tap outside / back: nothing changed.
+  dismissed,
+
+  /// Saved with an empty or whitespace-only name: alias cleared, the display
+  /// reverts to the bare serial.
+  cleared,
+
+  /// Saved with real text: the alias was set.
+  renamed,
+}
+
 class AliasStore extends PrefsStore {
   static const _key = 'battery_aliases_v1';
 
@@ -35,11 +48,21 @@ class AliasStore extends PrefsStore {
   String? aliasFor(String? serial) =>
       (serial == null || serial.isEmpty) ? null : _cache[serial];
 
-  /// Set (or, with an empty/blank value, clear) the alias for [serial] and
-  /// persist. An empty alias removes the entry so the display reverts to the
-  /// bare serial.
-  Future<void> setAlias(String serial, String? alias) async {
-    if (serial.isEmpty) return;
+  /// #56: classify a dialog result: null = dismissed (no change), blank =
+  /// clear, anything else = rename. Pure.
+  static AliasEditOutcome outcomeFor(String? result) => result == null
+      ? AliasEditOutcome.dismissed
+      : result.trim().isEmpty
+          ? AliasEditOutcome.cleared
+          : AliasEditOutcome.renamed;
+
+  /// Set (or, with a null / empty / blank value, clear) the alias for
+  /// [serial] and persist. A cleared alias removes the entry so the display
+  /// reverts to the bare serial. Never throws: the cache is updated first so
+  /// the UI reflects the change at once, and the persist is best-effort (a
+  /// failure is recorded in Diagnostics).
+  Future<AliasEditOutcome> setAlias(String serial, String? alias) async {
+    if (serial.isEmpty) return AliasEditOutcome.dismissed;
     final trimmed = (alias ?? '').trim();
     if (trimmed.isEmpty) {
       _cache.remove(serial);
@@ -47,6 +70,7 @@ class AliasStore extends PrefsStore {
       _cache[serial] = trimmed;
     }
     await writeJson(_key, _cache);
+    return trimmed.isEmpty ? AliasEditOutcome.cleared : AliasEditOutcome.renamed;
   }
 }
 

@@ -12,17 +12,30 @@ import 'fakes.dart';
 /// toasts and the read-back / warning wiring to what the hand-written handlers
 /// produced before — so the refactor is provably behaviour-preserving.
 void main() {
+  // Standby known OFF: the #62 standby-off note (standby_62_test.dart) stays
+  // out of these pins.
   BatteryConnection conn([String serial = 'JS-A']) =>
-      BatteryConnection(transport: FakeTransport())..state.serial = serial;
+      BatteryConnection(transport: FakeTransport())
+        ..state.serial = serial
+        ..state.sleepModeOn = false;
 
-  group('the double-confirm set is exactly: output OFF, sleep ON, restart, '
-      'factory reset, fleet output OFF', () {
+  group('the double-confirm set is exactly: charge / output / both OFF, sleep '
+      'ON, restart, factory reset, fleet charge / output / both OFF', () {
     test('dangerous actions carry a stern warning; the rest do not', () {
       final c = conn();
       final m = BatteryManager()..batteries.add(c);
       m.setInFleet(c, true);
       expect(outputAction(c, target: false).dangerous, isTrue);
       expect(outputAction(c, target: true).dangerous, isFalse);
+      // #58: the Charge switch and Both follow the same rule.
+      expect(chargeAction(c, target: false).dangerous, isTrue);
+      expect(chargeAction(c, target: true).dangerous, isFalse);
+      expect(bothMosAction(c, target: false).dangerous, isTrue);
+      expect(bothMosAction(c, target: true).dangerous, isFalse);
+      expect(fleetChargeAction(m, on: false).dangerous, isTrue);
+      expect(fleetChargeAction(m, on: true).dangerous, isFalse);
+      expect(fleetBothMosAction(m, on: false).dangerous, isTrue);
+      expect(fleetBothMosAction(m, on: true).dangerous, isFalse);
       expect(sleepAction(c, target: true).dangerous, isTrue);
       expect(sleepAction(c, target: false).dangerous, isFalse);
       expect(restartAction(c).dangerous, isTrue);
@@ -51,7 +64,7 @@ void main() {
     });
   });
 
-  group('output (#26 / #24)', () {
+  group('output switch (#26 / #24 / #58: the discharge MOS)', () {
     test('OFF: two-step confirm, read-back, warning names the live state', () {
       final c = conn();
       c.state
@@ -60,11 +73,9 @@ void main() {
       final a = outputAction(c, target: false);
       expect(a.busyKey, 'output');
       expect(a.title, 'Turn output OFF');
-      expect(a.message,
-          'Turn the output (charge + discharge MOS) OFF on JS-A?');
+      expect(a.message, 'Turn the output switch (discharge MOS) OFF on JS-A?');
       expect(a.sternWarning,
-          "This cuts JS-A's output — anything powered by it will lose power, "
-          'and it will stop charging.');
+          "This cuts JS-A's output — anything powered by it will lose power.");
       expect(a.confirmLabel, 'Turn output OFF');
       expect(a.label, 'output OFF');
       expect(a.sentToast(), 'Sent: output OFF to JS-A');
@@ -78,7 +89,7 @@ void main() {
     test('ON: single confirm', () {
       final a = outputAction(conn(), target: true);
       expect(a.title, 'Turn output on');
-      expect(a.message, 'Turn the output (charge + discharge MOS) ON on JS-A?');
+      expect(a.message, 'Turn the output switch (discharge MOS) ON on JS-A?');
       expect(a.confirmLabel, 'Turn ON');
       expect(a.danger, isFalse);
       expect(a.label, 'output ON');
@@ -133,46 +144,46 @@ void main() {
 
     test('a dangerousWhenOff toggle double-confirms with the off warning', () {
       final a = gateToggleAction(conn(),
-          label: 'Charge MOS',
+          label: 'Low-temp protection',
           busyKey: 'x',
           isOn: true,
-          action: GateAction.chargeMos,
+          action: GateAction.tempControlGate,
           dangerousWhenOff: true);
-      expect(a.title, 'Turn Charge MOS OFF');
-      expect(a.message, 'Turn Charge MOS OFF on JS-A?');
-      expect(a.sternWarning, 'This turns Charge MOS off on JS-A.');
-      expect(a.confirmLabel, 'Turn Charge MOS OFF');
+      expect(a.title, 'Turn Low-temp protection OFF');
+      expect(a.message, 'Turn Low-temp protection OFF on JS-A?');
+      expect(a.sternWarning, 'This turns Low-temp protection off on JS-A.');
+      expect(a.confirmLabel, 'Turn Low-temp protection OFF');
     });
   });
 
-  group('sleep (#42)', () {
-    test('sleep ON: two-step, read-back, but NO warning on timeout', () {
+  group('Bluetooth standby (#42 / #62)', () {
+    test('standby ON: two-step, read-back, but NO warning on timeout', () {
       final a = sleepAction(conn(), target: true);
       expect(a.busyKey, 'sleep');
-      expect(a.title, 'Put BMS to sleep');
-      expect(a.message, 'Put JS-A into sleep mode?');
-      expect(a.sternWarning,
-          'Sleeping the BMS may DROP the BLE link and STOP telemetry from '
-          'JS-A — you may lose the connection and live data until it wakes.');
-      expect(a.confirmLabel, 'Sleep now');
-      expect(a.label, 'sleep ON');
-      expect(a.sentToast(), 'Sent: sleep ON to JS-A');
+      expect(a.title, 'Turn Bluetooth standby on');
+      expect(a.message,
+          'Turn Bluetooth standby (power saving) ON on JS-A?\n\n'
+          '$standbyExplanation');
+      expect(a.sternWarning, contains('STOP its Bluetooth comms'));
+      expect(a.confirmLabel, 'Turn standby ON');
+      expect(a.label, 'standby ON');
+      expect(a.sentToast(), 'Sent: Bluetooth standby ON to JS-A');
       expect(a.readBack, isNotNull);
       expect(a.warnTitle, isNull, reason: 'the link may drop before any ack');
     });
 
-    test('wake: single confirm, warns when not confirmed', () {
+    test('standby OFF: single confirm, warns when not confirmed', () {
       final a = sleepAction(conn(), target: false);
-      expect(a.title, 'Wake BMS');
-      expect(a.message, 'Wake JS-A from sleep mode?');
-      expect(a.confirmLabel, 'Wake');
+      expect(a.title, 'Turn Bluetooth standby off');
+      expect(a.message, 'Turn Bluetooth standby (power saving) OFF on JS-A?');
+      expect(a.confirmLabel, 'Turn standby OFF');
       expect(a.danger, isFalse);
-      expect(a.label, 'sleep OFF');
-      expect(a.warnTitle, 'Wake not confirmed');
+      expect(a.label, 'standby OFF');
+      expect(a.warnTitle, 'Standby OFF not confirmed');
       expect(a.warnMessage!(),
-          'Command sent, but JS-A did not report waking within a few '
-          'seconds. It may still be asleep — check the connection and try '
-          'again.');
+          'Command sent, but JS-A did not confirm Bluetooth standby OFF within '
+          'a few seconds. Its standby setting may still be ON — check the '
+          'connection and try again.');
     });
   });
 
@@ -243,11 +254,12 @@ void main() {
       expect(a.busyKey, 'fleet output');
       expect(a.title, 'ALL output OFF');
       expect(a.message,
-          'Turn the discharge MOS (output) OFF on all 2 batteries in the '
-          'fleet?\n\n • JS-A\n • JS-B');
+          'Turn the output switch (discharge MOS) OFF on all 2 batteries in '
+          'the fleet?\n\n • JS-A\n • JS-B');
+      // #62: two members = a parallel bank -> the bank warning is appended.
       expect(a.sternWarning,
           'This will cut output to every fleet battery (JS-A, JS-B); '
-          'anything powered by them will lose power.');
+          'anything powered by them will lose power.\n\n$parallelBankWarning');
       expect(a.confirmLabel, 'Turn ALL output OFF');
       expect(a.label, 'fleet output OFF');
     });
@@ -257,8 +269,8 @@ void main() {
       expect(a.busyKey, 'fleet output');
       expect(a.title, 'All output ON');
       expect(a.message,
-          'Turn the discharge MOS (output) ON on all 2 batteries in the '
-          'fleet?\n\n • JS-A\n • JS-B');
+          'Turn the output switch (discharge MOS) ON on all 2 batteries in '
+          'the fleet?\n\n • JS-A\n • JS-B');
       expect(a.confirmLabel, 'Turn ALL output ON');
       expect(a.danger, isFalse);
     });
@@ -333,7 +345,8 @@ void main() {
   group('labels', () {
     test('gateWriteLabel names the gate and the direction (not for restart / '
         'factory)', () {
-      expect(gateWriteLabel(GateAction.output, on: true), 'output ON');
+      expect(gateWriteLabel(GateAction.bothMos, on: true),
+          'charge + output ON');
       expect(gateWriteLabel(GateAction.passiveBalance, on: false),
           'passive balancing OFF');
       expect(gateWriteLabel(GateAction.heatGate, on: true), 'heater ON');
@@ -341,9 +354,10 @@ void main() {
           'low-temp protection ON');
       expect(gateWriteLabel(GateAction.smokeGate, on: false),
           'smoke sensor OFF');
-      expect(gateWriteLabel(GateAction.chargeMos, on: true), 'charge MOS ON');
-      expect(gateWriteLabel(GateAction.dischargeMos, on: true),
-          'discharge MOS ON');
+      // #58: nothing says just "MOS".
+      expect(gateWriteLabel(GateAction.chargeMos, on: true), 'charge ON');
+      expect(gateWriteLabel(GateAction.dischargeMos, on: true), 'output ON');
+      expect(gateWriteLabel(GateAction.chargeMos, on: false), 'charge OFF');
       expect(gateWriteLabel(GateAction.restart, on: true), 'restart BMS');
       expect(gateWriteLabel(GateAction.factory, on: true), 'factory reset');
     });
@@ -356,6 +370,19 @@ void main() {
       expect(WriteKeys.capacity, 'capacity');
       expect(WriteKeys.restart, 'restart');
       expect(WriteKeys.factory, 'factory reset');
+      expect(WriteKeys.fleetOutput, 'fleet output');
+      // #58
+      expect(WriteKeys.charge, 'charge');
+      expect(WriteKeys.bothMos, 'charge + output');
+      expect(WriteKeys.fleetCharge, 'fleet charge');
+      expect(WriteKeys.fleetBothMos, 'fleet charge + output');
+      expect(WriteKeys.forMos(GateAction.chargeMos), 'charge');
+      expect(WriteKeys.forMos(GateAction.dischargeMos), 'output');
+      expect(WriteKeys.forMos(GateAction.bothMos), 'charge + output');
+      expect(WriteKeys.forFleetMos(GateAction.chargeMos), 'fleet charge');
+      expect(WriteKeys.forFleetMos(GateAction.dischargeMos), 'fleet output');
+      expect(WriteKeys.forFleetMos(GateAction.bothMos),
+          'fleet charge + output');
     });
   });
 }

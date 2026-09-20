@@ -71,7 +71,7 @@ void main() {
           throwsA(isA<StateError>()));
       await expectLater(c.sendGateControl(GateAction.heatGate, on: true),
           throwsA(isA<StateError>()));
-      await expectLater(c.sendGateControl(GateAction.output, on: false),
+      await expectLater(c.sendGateControl(GateAction.bothMos, on: false),
           throwsA(isA<StateError>()));
       expect(t.writes.length, before, reason: 'no gate frame was written');
       expect(t.gateWrites, isEmpty);
@@ -114,7 +114,7 @@ void main() {
       clock = clock.add(const Duration(milliseconds: 2));
       expect(c.hasFreshGateState, isFalse);
       expect(c.gateControlsDisabledReason, contains('No gate status'));
-      await expectLater(c.sendGateControl(GateAction.output, on: false),
+      await expectLater(c.sendGateControl(GateAction.bothMos, on: false),
           throwsA(isA<StateError>()));
       expect(t.gateWrites, isEmpty);
       // A fresh frame unlocks it again.
@@ -151,13 +151,13 @@ void main() {
       expect(m.fleetControlsDisabledReason, isNull,
           reason: 'connectivity-wise the fleet is fine');
       expect(m.fleetGateWriteDisabledReason, contains('JS-B'));
-      await expectLater(m.fleetSetOutput(false), throwsA(isA<StateError>()));
+      await expectLater(m.fleetSetMos(GateAction.bothMos, on: false), throwsA(isA<StateError>()));
       expect(tA.gateWrites, isEmpty, reason: 'A must not be written either');
       expect(tB.gateWrites, isEmpty);
 
       b.parser.addBytes(bal());
       expect(m.fleetGateWriteDisabledReason, isNull);
-      await m.fleetSetOutput(false);
+      await m.fleetSetMos(GateAction.bothMos, on: false);
       expect(tA.gateWrites.length, 1);
       expect(tB.gateWrites.length, 1);
       expect(payload(tA.gateWrites.single).sublist(0, 2), [0, 0]);

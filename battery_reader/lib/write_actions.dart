@@ -5,9 +5,9 @@
 /// fires on a single tap; the executor owns, in this fixed order:
 ///
 ///  1. the confirmation — a single named dialog, or for a DESTRUCTIVE action
-///     (one with a [WriteAction.sternWarning]: output OFF, sleep ON, restart,
-///     factory reset, fleet output OFF) the two-step confirm whose second page
-///     is the stern "Are you sure?";
+///     (one with a [WriteAction.sternWarning]: charge / output / both OFF,
+///     sleep ON, restart, factory reset, fleet charge / output / both OFF)
+///     the two-step confirm whose second page is the stern "Are you sure?";
 ///  2. the busy hold (M4): the action's [WriteAction.busyKey] is held in the
 ///     battery's [BusyWrites] from the tap until the read-back completes, and
 ///     every write button on that battery is disabled meanwhile;
@@ -19,10 +19,11 @@
 ///  5. the optional read-back (#24 / #38 / #42): wait for the pack to report
 ///     the change and, if it does not, the modal warning.
 ///
-/// The descriptors for each control ([outputAction], [gateToggleAction],
-/// [sleepAction], [capacityAction], [restartAction], [factoryAction],
-/// [fleetOutputAction]) are plain data built from the live connection, so the
-/// exact dialog texts and the double-confirm set are unit-tested.
+/// The descriptors for each control ([mosSwitchAction] — [chargeAction],
+/// [outputAction], [bothMosAction] — [gateToggleAction], [sleepAction],
+/// [capacityAction], [restartAction], [factoryAction], [fleetMosAction]) are
+/// plain data built from the live connection, so the exact dialog texts and
+/// the double-confirm set are unit-tested.
 library;
 
 import 'dart:async';
@@ -72,8 +73,8 @@ Future<bool> confirmWrite(
       false;
 }
 
-/// Two-step confirm for DESTRUCTIVE actions (turn output/charge MOS off,
-/// restart, factory reset): first names the battery + action, then a stern
+/// Two-step confirm for DESTRUCTIVE actions (turn the charge / output switch
+/// off, restart, factory reset): first names the battery + action, then a stern
 /// "Are you sure?" that spells out the consequence. Both steps must be accepted.
 Future<bool> confirmDangerous(
   BuildContext context, {
@@ -135,8 +136,9 @@ Future<void> warnDialog(
 // The send funnel + busy state.
 // ===========================================================================
 
-/// M3: the ONE funnel for every user-facing write (output, passive balancing,
-/// heater, sleep, capacity, restart, factory reset, fleet output). Runs [op]
+/// M3: the ONE funnel for every user-facing write (charge / output switch,
+/// passive balancing, heater, sleep, capacity, restart, factory reset, fleet
+/// switches). Runs [op]
 /// and catches ANY error — a C1 freshness-gate [StateError], the M2 "not
 /// connected" [StateError], an FBP `deviceIsDisconnected`, a WinRT GATT
 /// failure, an [ArgumentError] from a frame builder — logs it, and shows
@@ -324,7 +326,14 @@ Future<void> runWriteAction(
 
 /// Busy keys (M4), one per action.
 class WriteKeys {
+  /// #58: the Output switch (discharge MOS) — the former single "output".
   static const output = 'output';
+
+  /// #58: the Charge switch (charge MOS).
+  static const charge = 'charge';
+
+  /// #58: "Both on / off" (both MOS bytes together).
+  static const bothMos = 'charge + output';
   static const passive = 'passive balancing';
   static const heater = 'heater';
   static const sleep = 'sleep';
@@ -332,22 +341,53 @@ class WriteKeys {
   static const restart = 'restart';
   static const factory = 'factory reset';
   static const fleetOutput = 'fleet output';
+  static const fleetCharge = 'fleet charge';
+  static const fleetBothMos = 'fleet charge + output';
+
+  /// #62 recovery ladder: re-send wake / reconnect (switches-on shares the
+  /// both-MOS key).
+  static const wake = 'wake';
+  static const reconnect = 'reconnect';
+
+  /// The per-battery busy key for a MOS switch action.
+  static String forMos(GateAction action) => switch (action) {
+        GateAction.chargeMos => charge,
+        GateAction.dischargeMos => output,
+        _ => bothMos,
+      };
+
+  /// The fleet busy key for a MOS switch action.
+  static String forFleetMos(GateAction action) => switch (action) {
+        GateAction.chargeMos => fleetCharge,
+        GateAction.dischargeMos => fleetOutput,
+        _ => fleetBothMos,
+      };
 }
 
 /// The serial a dialog names (or "this battery" before one is known).
 String serialOf(BatteryConnection conn) => conn.state.serial ?? 'this battery';
 
-/// Plain name of a gate action, for the failure label.
+/// Plain name of a gate action, for the failure label. #58: the MOS switches
+/// are "charge", "output" and "charge + output" ([mosSwitchName]).
 String gateActionName(GateAction action) => switch (action) {
-      GateAction.output => 'output',
+      GateAction.chargeMos ||
+      GateAction.dischargeMos ||
+      GateAction.bothMos =>
+        mosSwitchName(action),
       GateAction.passiveBalance => 'passive balancing',
       GateAction.heatGate => 'heater',
       GateAction.tempControlGate => 'low-temp protection',
       GateAction.smokeGate => 'smoke sensor',
-      GateAction.chargeMos => 'charge MOS',
-      GateAction.dischargeMos => 'discharge MOS',
       GateAction.restart => 'restart BMS',
       GateAction.factory => 'factory reset',
+    };
+
+/// #58: the capitalised display label of a MOS switch: "Charge", "Output",
+/// "Both".
+String mosSwitchLabel(GateAction action) => switch (action) {
+      GateAction.chargeMos => 'Charge',
+      GateAction.dischargeMos => 'Output',
+      _ => 'Both',
     };
 
 /// The "Failed: <label>" label for a gate write.
@@ -357,31 +397,233 @@ String gateWriteLabel(GateAction action, {required bool on}) =>
       _ => '${gateActionName(action)} ${on ? 'ON' : 'OFF'}',
     };
 
-/// Issue #26 + #24: the single Output control. Sends the vendor setMos frame
-/// ([GateAction.output] — byte[0]=byte[1]=target), then actively READS BACK the
-/// streamed BAL_STATUS; if the pack has not reflected the change within ~4 s,
-/// warns that the command did not take effect. Turning output OFF is
-/// destructive (double-confirm, names the serial); ON is a single confirm.
-WriteAction outputAction(BatteryConnection conn, {required bool target}) {
+/// #58 (+ #24): a MOS switch control — the Charge switch
+/// ([GateAction.chargeMos], byte[0]), the Output switch
+/// ([GateAction.dischargeMos], byte[1]) or Both ([GateAction.bothMos], the
+/// vendor setMos of issue #26). Sends the frame that flips ONLY that switch
+/// (other gates from the fresh status base), then actively READS BACK the
+/// streamed BAL_STATUS for THAT switch; if the pack has not reflected the
+/// change within ~4 s, warns that the command did not take effect. Turning a
+/// switch OFF is destructive (double-confirm, names the serial and the
+/// switch); ON is a single confirm and a safe write (#59).
+WriteAction mosSwitchAction(BatteryConnection conn,
+    {required GateAction action, required bool target, int fleetSize = 1}) {
+  assert(isMosAction(action));
   final serial = serialOf(conn);
+  final name = mosSwitchName(action); // charge / output / charge + output
+  final onOff = target ? 'ON' : 'OFF';
+  final what = switch (action) {
+    GateAction.chargeMos => 'the charge switch (charge MOS)',
+    GateAction.dischargeMos => 'the output switch (discharge MOS)',
+    _ => 'both switches (charge + output)',
+  };
+  final consequence = switch (action) {
+    GateAction.chargeMos => 'This stops $serial charging — no current can '
+        'flow into the pack until charge is turned back on.',
+    GateAction.dischargeMos => 'This cuts $serial\'s output — anything '
+        'powered by it will lose power.',
+    _ => 'This cuts $serial\'s output — anything powered by it will lose '
+        'power — and it will stop charging.',
+  };
+  final short = action == GateAction.bothMos ? 'both' : name;
+  // #62: a switch-off turns Bluetooth standby OFF first when it is ON or
+  // unknown; the stern page says so — and, in a parallel bank (more than one
+  // pack in the fleet), why the sibling makes standby unwakeable.
+  final standby = target
+      ? ''
+      : '${standbyOffNote(conn, action)}${parallelBankNote(fleetSize)}';
+  String reported() => switch (action) {
+        GateAction.chargeMos => 'charge ${conn.isChargeOn ? 'ON' : 'OFF'}',
+        GateAction.dischargeMos => 'output ${conn.isOutputOn ? 'ON' : 'OFF'}',
+        _ => 'charge ${conn.isChargeOn ? 'ON' : 'OFF'}, '
+            'output ${conn.isOutputOn ? 'ON' : 'OFF'}',
+      };
   return WriteAction(
-    busyKey: WriteKeys.output,
-    title: target ? 'Turn output on' : 'Turn output OFF',
-    message: 'Turn the output (charge + discharge MOS) ${target ? 'ON' : 'OFF'} '
-        'on $serial?${target ? noFreshBaseNote(conn) : ''}',
-    sternWarning: target
-        ? null
-        : 'This cuts $serial\'s output — anything powered by it will lose '
-            'power, and it will stop charging.',
-    confirmLabel: target ? 'Turn ON' : 'Turn output OFF',
-    label: gateWriteLabel(GateAction.output, on: target),
-    send: () => conn.sendGateControl(GateAction.output, on: target),
-    sentToast: () => 'Sent: output ${target ? 'ON' : 'OFF'} to $serial',
-    readBack: () => conn.confirmOutputState(target),
-    warnTitle: 'Output not confirmed',
-    warnMessage: () => 'Command sent, but $serial still reports output '
-        '${conn.isOutputOn ? 'ON' : 'OFF'}. The change may not have taken '
-        'effect — check the connection and try again.',
+    busyKey: WriteKeys.forMos(action),
+    title: target ? 'Turn $short on' : 'Turn $short OFF',
+    message: 'Turn $what $onOff on $serial?'
+        '${target ? noFreshBaseNote(conn, action) : ''}',
+    sternWarning: target ? null : '$consequence$standby',
+    confirmLabel: target ? 'Turn ON' : 'Turn $short OFF',
+    label: gateWriteLabel(action, on: target),
+    send: () => target
+        ? conn.sendGateControl(action, on: true)
+        : conn.turnSwitchOff(action),
+    sentToast: () => 'Sent: $name $onOff to $serial',
+    readBack: () => conn.confirmMosState(action, target),
+    warnTitle: action == GateAction.bothMos
+        ? 'Switches not confirmed'
+        : '${mosSwitchLabel(action)} not confirmed',
+    warnMessage: () => 'Command sent, but $serial still reports '
+        '${reported()}. The change may not have taken effect — check the '
+        'connection and try again.',
+  );
+}
+
+/// #62: the sentence a switch-off confirmation carries when the pack's
+/// Bluetooth standby is ON — the dormancy risk and that standby is turned
+/// OFF first. Exact wording is pinned by tests.
+const String standbyDormancyWarning =
+    'With the output off this pack cannot pass current, so if it enters '
+    'Bluetooth standby it cannot be woken by the app, a charger or a load '
+    'until it is physically isolated. Standby will be turned OFF first.';
+
+/// #62: the Charge-OFF variant — only charge current is blocked, so a load
+/// can still wake it, but a charger and the app cannot.
+const String standbyDormancyWarningCharge =
+    'With charge off this pack cannot take charge current, so if it enters '
+    'Bluetooth standby it cannot be woken by the app or a charger — only by '
+    'a load — until it is physically isolated. Standby will be turned OFF '
+    'first.';
+
+/// #62: appended to a switch-off stern warning when
+/// [BatteryConnection.needsStandbyOffFirst] — standby ON, or unknown (then
+/// standby-OFF is sent anyway and the note says the state is not known).
+String standbyOffNote(BatteryConnection conn, GateAction action) {
+  if (!conn.needsStandbyOffFirst) return '';
+  final unknown = conn.state.sleepModeOn == null;
+  final text = action == GateAction.chargeMos
+      ? standbyDormancyWarningCharge
+      : standbyDormancyWarning;
+  return '\n\n${unknown ? "This pack's Bluetooth standby state is not known. " : ''}'
+      '$text';
+}
+
+/// #62: the vendor's explanation of Bluetooth standby (power saving), shown
+/// when enabling it and on its row.
+const String standbyExplanation =
+    'When ON, the BMS stops its Bluetooth comms when it sees no '
+    'charge/discharge current; current wakes it; to turn it off you must '
+    'apply charge or a load first.';
+
+/// #62: the parallel-bank hazard (live, 2026-09-20: the two packs are
+/// permanently paralleled; the sibling took every amp, so the switched-off
+/// pack never saw wake current). Exact wording is pinned by tests.
+const String parallelBankWarning =
+    'In a parallel bank the other pack carries all current, so this pack '
+    'cannot see charge current to wake if it enters standby.';
+
+/// #62: appended to a switch-OFF stern page when the fleet has more than one
+/// member ([fleetSize] > 1); empty otherwise.
+String parallelBankNote(int fleetSize) =>
+    fleetSize > 1 ? '\n\n$parallelBankWarning' : '';
+
+/// #58: the Charge switch (charge MOS, byte[0]).
+WriteAction chargeAction(BatteryConnection conn,
+        {required bool target, int fleetSize = 1}) =>
+    mosSwitchAction(conn,
+        action: GateAction.chargeMos, target: target, fleetSize: fleetSize);
+
+/// #58: the Output switch (discharge MOS, byte[1]) — the former single
+/// "Output" control.
+WriteAction outputAction(BatteryConnection conn,
+        {required bool target, int fleetSize = 1}) =>
+    mosSwitchAction(conn,
+        action: GateAction.dischargeMos,
+        target: target,
+        fleetSize: fleetSize);
+
+/// #58: the convenience "Both on / Both off" (both MOS bytes together).
+WriteAction bothMosAction(BatteryConnection conn,
+        {required bool target, int fleetSize = 1}) =>
+    mosSwitchAction(conn,
+        action: GateAction.bothMos, target: target, fleetSize: fleetSize);
+
+// ===========================================================================
+// #62 recovery ladder for a connected pack that is not streaming. Every
+// step is user-initiated (confirmed, never silent — unlike the vendor app's
+// forced-on on every screen change) and reports whether the stream resumed.
+// ===========================================================================
+
+/// Why the stream did not resume, for the ladder's warning: the dormant
+/// message when the probe said so, else what to try next.
+String notStreamingAdvice(BatteryConnection conn, {required String tried}) {
+  final serial = serialOf(conn);
+  return switch (conn.streamClass) {
+    StreamClass.dormant => '$tried, but $serial is still silent.\n\n'
+        '${BatteryConnection.dormantMessage}',
+    StreamClass.awakeNotStreaming => '$tried, but no telemetry followed from '
+        '$serial within ${BatteryConnection.resumeTimeout.inSeconds} s. The '
+        'BMS answers AT+V, so it is awake: try "Turn switches on", then '
+        '"Reconnect".',
+    _ => '$tried, but no telemetry followed from $serial within '
+        '${BatteryConnection.resumeTimeout.inSeconds} s. Try the next step; '
+        'if nothing works: ${BatteryConnection.dormantMessage}',
+  };
+}
+
+/// Ladder step (i): re-send CMD_BEGIN (the handshake's start-streaming
+/// command; it changes nothing on the pack). Single confirm.
+WriteAction wakeResendAction(BatteryConnection conn) {
+  final serial = serialOf(conn);
+  bool? resumed;
+  return WriteAction(
+    busyKey: WriteKeys.wake,
+    title: 'Re-send wake (CMD_BEGIN)',
+    message: 'Re-send the start-streaming command (CMD_BEGIN) to $serial? '
+        'This is the normal handshake command and changes nothing on the '
+        'pack.',
+    confirmLabel: 'Re-send wake',
+    label: 'wake (CMD_BEGIN)',
+    send: () async {
+      resumed = await conn.resendWake();
+    },
+    sentToast: () => resumed == true
+        ? 'Stream resumed on $serial'
+        : 'Sent: CMD_BEGIN to $serial — no stream yet',
+    readBack: () async => resumed ?? false,
+    warnTitle: 'Still not streaming',
+    warnMessage: () => notStreamingAdvice(conn, tried: 'CMD_BEGIN was sent'),
+  );
+}
+
+/// Ladder step (ii): the both-MOS-on frame (the vendor app's de-facto wake).
+/// A SAFE write (#59: it cannot cut anything), single confirm.
+WriteAction wakeSwitchesOnAction(BatteryConnection conn) {
+  final serial = serialOf(conn);
+  bool? resumed;
+  return WriteAction(
+    busyKey: WriteKeys.forMos(GateAction.bothMos),
+    title: 'Turn switches on',
+    message: 'Send charge + output ON to $serial? This is the frame the '
+        'vendor app sends after every handshake (its de-facto wake). It turns '
+        'both switches on — ${conn.safeWriteMosText(GateAction.bothMos)} — '
+        'and can cut nothing.',
+    confirmLabel: 'Turn switches ON',
+    label: gateWriteLabel(GateAction.bothMos, on: true),
+    send: () async {
+      resumed = await conn.switchesOnToWake();
+    },
+    sentToast: () => resumed == true
+        ? 'Stream resumed on $serial'
+        : 'Sent: charge + output ON to $serial — no stream yet',
+    readBack: () async => resumed ?? false,
+    warnTitle: 'Still not streaming',
+    warnMessage: () =>
+        notStreamingAdvice(conn, tried: 'Both switches ON was sent'),
+  );
+}
+
+/// Ladder step (iii): drop the link and reconnect now. Single confirm.
+WriteAction wakeReconnectAction(BatteryConnection conn, BatteryManager manager) {
+  final serial = serialOf(conn);
+  bool? resumed;
+  return WriteAction(
+    busyKey: WriteKeys.reconnect,
+    title: 'Reconnect',
+    message: 'Drop the Bluetooth link to $serial and reconnect now (a fresh '
+        'handshake)?',
+    confirmLabel: 'Reconnect',
+    label: 'reconnect',
+    send: () async {
+      resumed = await manager.reconnect(conn);
+    },
+    sentToast: () => resumed == true
+        ? 'Reconnected — stream resumed on $serial'
+        : 'Reconnected to $serial — no stream yet',
+    readBack: () async => resumed ?? false,
+    warnTitle: 'Still not streaming',
+    warnMessage: () => notStreamingAdvice(conn, tried: 'Reconnected'),
   );
 }
 
@@ -420,33 +662,35 @@ WriteAction gateToggleAction(
   );
 }
 
-/// #42 sleep mode. Sleep-ON double-confirms and warns that it may drop the BLE
-/// link / stop telemetry; wake is a single confirm. Read-back via
-/// SLEEP_SET_SUCCESS — a timeout on sleep-ON is expected (the link may drop),
-/// so only a failed WAKE raises a warning.
+/// #42 / #62 Bluetooth standby (power saving) — the vendor's "sleep" mode.
+/// Enabling it double-confirms with the vendor's explanation and warns that
+/// the BLE link / telemetry may stop; turning it off is a single confirm.
+/// Read-back via SLEEP_SET_SUCCESS — a timeout on standby-ON is expected (the
+/// link may drop), so only a failed standby-OFF raises a warning.
 WriteAction sleepAction(BatteryConnection conn, {required bool target}) {
   final serial = serialOf(conn);
-  final label = 'sleep ${target ? 'ON' : 'OFF'}';
+  final onOff = target ? 'ON' : 'OFF';
+  final label = 'standby $onOff';
   return WriteAction(
     busyKey: WriteKeys.sleep,
-    title: target ? 'Put BMS to sleep' : 'Wake BMS',
-    message: target
-        ? 'Put $serial into sleep mode?'
-        : 'Wake $serial from sleep mode?',
+    title: target ? 'Turn Bluetooth standby on' : 'Turn Bluetooth standby off',
+    message: 'Turn Bluetooth standby (power saving) $onOff on $serial?'
+        '${target ? '\n\n$standbyExplanation' : ''}',
     sternWarning: target
-        ? 'Sleeping the BMS may DROP the BLE link and STOP telemetry from '
-            '$serial — you may lose the connection and live data until it '
-            'wakes.'
+        ? 'Once $serial sees no current it will STOP its Bluetooth comms — '
+            'the app loses the connection and live data until charge or a '
+            'load wakes it. A pack in standby with its output off cannot be '
+            'woken at all until it is physically isolated.'
         : null,
-    confirmLabel: target ? 'Sleep now' : 'Wake',
+    confirmLabel: target ? 'Turn standby ON' : 'Turn standby OFF',
     label: label,
     send: () => conn.setSleepMode(target),
-    sentToast: () => 'Sent: $label to $serial',
+    sentToast: () => 'Sent: Bluetooth standby $onOff to $serial',
     readBack: () => conn.confirmSleepState(target),
-    warnTitle: target ? null : 'Wake not confirmed',
-    warnMessage: () => 'Command sent, but $serial did not report waking '
-        'within a few seconds. It may still be asleep — check the connection '
-        'and try again.',
+    warnTitle: target ? null : 'Standby OFF not confirmed',
+    warnMessage: () => 'Command sent, but $serial did not confirm Bluetooth '
+        'standby OFF within a few seconds. Its standby setting may still be '
+        'ON — check the connection and try again.',
   );
 }
 
@@ -482,25 +726,27 @@ String controlsUnavailableText(String reason,
         {bool safeWritesAvailable = false}) =>
     'Controls unavailable — $reason. They become available again '
     'automatically once the battery is connected and reporting its status.'
-    '${safeWritesAvailable ? ' Output ON and Restart BMS stay available.' : ''}';
+    '${safeWritesAvailable ? ' Charge ON, Output ON and Restart BMS stay available.' : ''}';
 
 /// #55: the note under the Restart button while it is unavailable.
 String restartUnavailableText(String reason) =>
     'Restart unavailable — $reason. It becomes available automatically once '
     'the battery is connected.';
 
-/// #59: appended to the Output ON / Restart confirmation when there is no
+/// #59 / #58: appended to a switch-ON / Restart confirmation when there is no
 /// fresh gate status — the frame still goes out, built from
-/// [BatteryConnection.safeWriteBase] (both MOS forced ON, the other gates
-/// last-known or protective defaults), and the user is told so.
-String noFreshBaseNote(BatteryConnection conn) {
+/// [BatteryConnection.safeWriteBase] (its own MOS byte forced ON, the other
+/// switch at its last-known value — both ON for Restart / Both — and the
+/// other gates last-known or protective defaults), and the user is told
+/// exactly what it carries.
+String noFreshBaseNote(BatteryConnection conn, GateAction action) {
   final r = conn.gateControlsDisabledReason;
   // Only for a CONNECTED row without a fresh base: that is the one case the
   // safe write actually goes out on safeWriteBase.
   if (r == null || conn.safeWritesDisabledReason != null) return '';
   final known = conn.lastKnownGates != null;
   return '\n\nNote: no fresh gate status from ${serialOf(conn)} ($r). The '
-      'command sets output ON (both MOS bytes = 1) and carries '
+      'command sets ${conn.safeWriteMosText(action)} and carries '
       '${known ? 'the last-known values' : 'safe defaults (low-temp protection on, smoke and heater off)'} '
       'for the other gates.';
 }
@@ -519,7 +765,7 @@ WriteAction restartAction(BatteryConnection conn) {
         'The battery management system on $serial will reboot; output may '
         'drop briefly and the link will reconnect. A restart also CLEARS the '
         'latched over-temperature protection (temp-alarm byte[2]), which '
-        'inhibits charging while set.${noFreshBaseNote(conn)}',
+        'inhibits charging while set.${noFreshBaseNote(conn, GateAction.restart)}',
     confirmLabel: 'Restart',
     label: gateWriteLabel(GateAction.restart, on: true),
     send: () => conn.sendGateControl(GateAction.restart, on: true),
@@ -545,46 +791,83 @@ WriteAction factoryAction(BatteryConnection conn) {
   );
 }
 
-/// Fleet-wide output (issue #11 / #26): every member gets the same setMos
-/// frame. OFF lists every affected serial and double-confirms. M3: a member
-/// that failed after the C1 pre-check is reported by serial in a warning
-/// while the others still went through; only an all-OK write toasts.
-WriteAction fleetOutputAction(BatteryManager manager, {required bool on}) {
+/// Fleet-wide MOS switch (issue #11 / #26 / #58): every member gets the same
+/// frame for the Charge switch, the Output switch or Both. OFF lists every
+/// affected serial and double-confirms. M3: a member that failed after the C1
+/// pre-check is reported by serial in a warning while the others still went
+/// through; only an all-OK write toasts.
+WriteAction fleetMosAction(BatteryManager manager,
+    {required GateAction action, required bool on}) {
+  assert(isMosAction(action));
   final serials = [for (final b in manager.fleetMembers) b.state.serial ?? '—'];
   final serialList = serials.join('\n • ');
   final countText = pluralBatteries(serials.length);
   final onOff = on ? 'ON' : 'OFF';
+  final name = mosSwitchName(action);
+  final short = action == GateAction.bothMos ? 'switches' : name;
+  final what = switch (action) {
+    GateAction.chargeMos => 'the charge switch (charge MOS)',
+    GateAction.dischargeMos => 'the output switch (discharge MOS)',
+    _ => 'both switches (charge + output)',
+  };
+  final list = serials.join(', ');
+  final consequence = switch (action) {
+    GateAction.chargeMos => 'This will stop charging on every fleet battery '
+        '($list); no current can flow into them until charge is turned back on.',
+    GateAction.dischargeMos => 'This will cut output to every fleet battery '
+        '($list); anything powered by them will lose power.',
+    _ => 'This will cut output to every fleet battery ($list) — anything '
+        'powered by them will lose power — and stop them charging.',
+  };
+  // #62: members whose Bluetooth standby is ON / unknown get standby-OFF
+  // first; the stern page names them — and, with more than one pack in the
+  // fleet (a parallel bank), carries the sibling-takes-all-current warning.
+  final standby = manager.fleetNeedingStandbyOff;
+  final standbyNote = on
+      ? ''
+      : '${standby.isEmpty ? '' : '\n\n${action == GateAction.chargeMos ? standbyDormancyWarningCharge : standbyDormancyWarning}'
+          ' (${standby.map((b) => b.state.serial ?? '—').join(', ')})'}'
+          '${parallelBankNote(serials.length)}';
   FleetWriteResult? result;
   return WriteAction(
-    busyKey: WriteKeys.fleetOutput,
-    title: on ? 'All output ON' : 'ALL output OFF',
-    message: 'Turn the discharge MOS (output) $onOff on all $countText in the '
+    busyKey: WriteKeys.forFleetMos(action),
+    title: on ? 'All $short ON' : 'ALL $short OFF',
+    message: 'Turn $what $onOff on all $countText in the '
         'fleet?\n\n • $serialList',
-    sternWarning: on
-        ? null
-        : 'This will cut output to every fleet battery '
-            '(${serials.join(', ')}); anything powered by them will lose power.',
-    confirmLabel: 'Turn ALL output $onOff',
-    label: 'fleet output $onOff',
+    sternWarning: on ? null : '$consequence$standbyNote',
+    confirmLabel: 'Turn ALL $short $onOff',
+    label: 'fleet $name $onOff',
     send: () async {
-      result = await manager.fleetSetOutput(on);
+      result = await manager.fleetSetMos(action, on: on);
     },
     sentToast: () {
       final r = result;
       if (r == null || !r.allOk) return null;
-      return 'Sent: output $onOff to ${pluralBatteries(r.succeeded.length)}';
+      return 'Sent: $name $onOff to ${pluralBatteries(r.succeeded.length)}';
     },
     readBack: () async => result?.allOk ?? true,
     warnTitle: 'Fleet write partly failed',
     warnMessage: () {
       final r = result!;
-      return 'Sent output $onOff to ${pluralBatteries(r.succeeded.length)}'
+      return 'Sent $name $onOff to ${pluralBatteries(r.succeeded.length)}'
           '${r.succeeded.isEmpty ? '' : ' (${r.succeeded.join(', ')})'}.\n\n'
           'Failed on ${pluralBatteries(r.failed.length)}:\n'
           '${r.failed.entries.map((e) => ' • ${e.key}: ${writeFailureReason(e.value)}').join('\n')}';
     },
   );
 }
+
+/// #58: fleet-wide Charge switch.
+WriteAction fleetChargeAction(BatteryManager manager, {required bool on}) =>
+    fleetMosAction(manager, action: GateAction.chargeMos, on: on);
+
+/// #58: fleet-wide Output switch (the former "All output").
+WriteAction fleetOutputAction(BatteryManager manager, {required bool on}) =>
+    fleetMosAction(manager, action: GateAction.dischargeMos, on: on);
+
+/// #58: fleet-wide Both switches.
+WriteAction fleetBothMosAction(BatteryManager manager, {required bool on}) =>
+    fleetMosAction(manager, action: GateAction.bothMos, on: on);
 
 /// Ask for a capacity (validated 1–1000 Ah) or null on cancel.
 ///

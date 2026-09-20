@@ -61,11 +61,20 @@ and [6] of the same frame remain unexplained status bits: captured as
 
 Every `CMD_GATE_CONTROL` write re-sends all eight gate bytes, so it must be built
 from the pack's *current* gates. `BatteryConnection.sendGateControl` (and the
-fleet output write) **throws** unless `hasFreshGateState`: connected, all six
-gates reported, and a `BAL_STATUS` decoded within the last 5 s. It never falls
-back to zeros — a zero-filled base would write chargeMos = dischargeMos = 0
-(cutting output) or tempControlGate = 0 (disabling low-temp protection). The UI
-disables every gate button and shows the reason until a fresh status arrives.
+fleet switch writes) **throws** for any write that can turn something OFF
+unless `hasFreshGateState`: connected, all six gates reported, and a
+`BAL_STATUS` decoded within the last 15 s. It never falls back to zeros — a
+zero-filled base would write chargeMos = dischargeMos = 0 (cutting output /
+stopping charge) or tempControlGate = 0 (disabling low-temp protection). The UI
+disables those buttons and shows the reason until a fresh status arrives.
+
+The BMS has two independent MOSFET switches (#58): **Charge** (charge MOS, gate
+byte[0]) and **Output** (discharge MOS, gate byte[1]). The app shows and
+controls them separately, plus a convenience "Both". Turning a switch ON is a
+*safe write* (#59): it goes out on any connected link, forcing ONLY its own
+byte to 1 and leaving the other switch at its last-known value (Both ON and
+Restart force both to 1). Turning a switch OFF keeps the fresh-status gate and
+double-confirms.
 
 ## Read-only by design
 

@@ -37,6 +37,17 @@ class PrefsStore {
       'write $key', () async => (await _prefs()).setBool(key, value),
       source: source);
 
+  Future<int> readInt(String key, {required int fallback}) async =>
+      await guard<int>('read $key', () async {
+        final p = await _prefs();
+        return p.getInt(key) ?? fallback;
+      }, fallback: fallback, source: source) ??
+      fallback;
+
+  Future<void> writeInt(String key, int value) => guard<void>(
+      'write $key', () async => (await _prefs()).setInt(key, value),
+      source: source);
+
   Future<String?> readString(String key) => guard<String?>(
       'read $key', () async => (await _prefs()).getString(key),
       source: source);

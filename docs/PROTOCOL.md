@@ -106,7 +106,7 @@ The parser (BM `ProcessWatchRunnable`, L281 on) dispatches on the begin pair. No
 | `CMD_GATE_CONTROL` | `C3 1E` + 8 bytes + `D4 3B` | see below |
 | `CMD_BATTERY` (capacity) | `C5 60` + 3 bytes + `D6 2A` | Ah × 1000, **little-endian** u24 (BM `setBattery`, L168). **[deep pass]** `longToBytes` emits LSB first: `"100"` → `C5 60 A0 86 01 D6 2A`. Not BE. |
 | `CMD_SET_TIME` | `C8 18` + `yLo yHi MM dd HH mm ss` + `D9 74` | year 16-bit **little-endian** (`intToBytes`, LSB first). **[deep pass]** 2026 → `EA 07`. Note: `getCurTime` uses the invalid zone `"GNT+8"` (typo for GMT+8) so the timestamp is effectively UTC. No UI caller. |
-| `CMD_OPEN_SLEEP_CONTROL` | `AA CC 00 01 DD EE` | sleep mode on |
+| `CMD_OPEN_SLEEP_CONTROL` | `AA CC 00 01 DD EE` | **Bluetooth standby** mode ON (a persistent BMS setting — see "Sleep mode is Bluetooth Standby" below) |
 | `CMD_CLOSE_SLEEP_CONTROL` | `AA CC 01 01 DD EE` | sleep mode off |
 | `CMD_SEND_MTU` | `C3 F2` + mtu + `ED CE` | |
 | `CMD_GET_HISTORY` | `C6 7C CF 00 D7 52` | |
@@ -115,6 +115,27 @@ The parser (BM `ProcessWatchRunnable`, L281 on) dispatches on the begin pair. No
 | `CMD_BEGIN_UPDATE` | `EB 90 00 07 BB 03 40` | OTA start (BM `update`, L173) |
 | `CMD_UPDATE_FINISH` | `01 01 EC 00 00 12` | |
 | `CMD_UPDATE_END` | `AA BB 01 02 03 04 CC DD` | |
+
+#### "Sleep mode" is Bluetooth Standby (vendor help text, RV build)
+
+The RV build's guide screen (`strings.xml` `guide_standby_mode`) is the only place
+the vendor explains `CMD_OPEN/CLOSE_SLEEP_CONTROL`: *"When the BT standby is set to
+ON this means if the BMS doesn't detect any charging or discharging taking place
+the BT will go into standby mode to save energy. As soon as a load or charging is
+detected the BT will automatically turn back on until no activity is detected. To
+turn BT standby back to OFF you will need to apply charging or a load and then open
+the app and Select OFF. Once the BT standby is turned to OFF the BT will always be
+transmitting even when there is no charging or loads applied."* Default OFF.
+
+Live-confirmed 2026-09-20: with standby ON a pack that is connected and idle keeps
+streaming (it is a policy, not a "go to sleep now" command; the `AC CA` ack only
+mirrors the stored flag). A pack whose OUTPUT was switched off (both MOS = 0)
+cannot see a load, idled into standby and became a *bridge-alive, BMS-dormant*
+pack: the BLE module still connects and answers `AT+V` with its `'0'` status byte,
+but no framed command (CMD_BEGIN, gate frames, sleep-off) reaches the BMS. Only
+charge/load current wakes it. Output-off + standby-on is therefore the combination
+to warn about; the vendor app never handles a silent pack at all (it just forces
+both MOS on 2.5 s after every handshake).
 
 #### AT+V stray byte (`0x30`) — live-confirmed 2026-09-20
 

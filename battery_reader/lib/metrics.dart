@@ -120,6 +120,19 @@ class Metric {
 
   /// Display-only: stray bytes dropped on resync (#20). Never logged.
   static const displayUnrecognised = 'unrecognisedBytes';
+
+  /// #53: ADDITIVE sample-mode markers written by the logger with every
+  /// reading (not table rows — the logger writes them directly, like `flags`):
+  /// [sampleMode] is 0 for a continuous (foreground / held-link) reading and
+  /// 1 for a background sample; [sampleIntervalS] is the background sample
+  /// interval in seconds in effect (0 = continuous). The charts derive the
+  /// gap threshold and the lighter/dotted style from [sampleIntervalS].
+  static const sampleMode = 'sampleMode';
+  static const sampleIntervalS = 'sampleIntervalS';
+
+  /// #61: display-only frame counter / last-frame age (Gates & status).
+  static const displayFrames = 'frames';
+  static const displayLastFrame = 'lastFrame';
 }
 
 // ---------------------------------------------------------------------------
@@ -480,9 +493,13 @@ final List<MetricDef> metricTable = <MetricDef>[
     detailSection: DetailSection.temperature,
   ),
   // --- Gates & status ------------------------------------------------------
+  // #58: the two MOSFET switches are shown separately as "Charge switch"
+  // (charge MOS) and "Output switch" (discharge MOS); "Both switches" is the
+  // MOS_STATUS frame's combined flag. Metric keys unchanged (mos / chgMos /
+  // disMos).
   MetricDef(
     key: Metric.displayMos,
-    label: 'MOS',
+    label: 'Both switches',
     unit: '',
     format: (c) => fBool(c.state.mosOn),
     color: HealthPalette.idle,
@@ -490,7 +507,7 @@ final List<MetricDef> metricTable = <MetricDef>[
   ),
   MetricDef(
     key: Metric.displayChgMos,
-    label: 'Charge MOS',
+    label: 'Charge switch',
     unit: '',
     format: (c) => fBool(c.state.chargeMos),
     color: HealthPalette.idle,
@@ -498,7 +515,7 @@ final List<MetricDef> metricTable = <MetricDef>[
   ),
   MetricDef(
     key: Metric.displayDisMos,
-    label: 'Discharge MOS',
+    label: 'Output switch',
     unit: '',
     format: (c) => fBool(c.state.dischargeMos),
     color: HealthPalette.idle,
@@ -586,6 +603,34 @@ final List<MetricDef> metricTable = <MetricDef>[
     color: HealthPalette.idle,
     detailSection: DetailSection.gates,
   ),
+  // #61: is data flowing? Frames decoded on this link and the age of the
+  // last one (an em dash while not connected).
+  MetricDef(
+    key: Metric.displayFrames,
+    label: 'Frames (this link)',
+    unit: '',
+    format: (c) => c.connState == ConnState.connected
+        ? '${c.frameCount}'
+            '${c.totalFrameCount > c.frameCount ? ' (${c.totalFrameCount} total)' : ''}'
+        : '—',
+    color: HealthPalette.idle,
+    detailSection: DetailSection.gates,
+  ),
+  MetricDef(
+    key: Metric.displayLastFrame,
+    label: 'Last frame',
+    unit: '',
+    format: (c) {
+      final age = c.silenceMs;
+      if (age == null) return '—';
+      if (c.lastTelemetryMs == null) {
+        return 'none yet (${fmtAgeShort(age)} linked)';
+      }
+      return '${fmtAgeShort(age)} ago';
+    },
+    color: HealthPalette.idle,
+    detailSection: DetailSection.gates,
+  ),
 ];
 
 /// Lookup by key (null for `cellN`, `flags` and unknown-byte metrics, which
@@ -626,4 +671,5 @@ List<String> chartMetrics(List<String> cells) => [
       for (final m in metricTable)
         if (m.chartGroup != null) m.key,
       Metric.flags,
+      Metric.sampleIntervalS, // #53: which gaps are expected sampling gaps
     ];

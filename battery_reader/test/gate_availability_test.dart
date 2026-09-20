@@ -76,7 +76,7 @@ void main() {
       clock = clock.add(const Duration(seconds: 20));
       final stale = c.gateStatusSummary();
       expect(stale, contains('controls unavailable'));
-      expect(stale, contains('Output ON / Restart still available'));
+      expect(stale, contains('Charge ON / Output ON / Restart still available'));
     });
   });
 
@@ -126,9 +126,9 @@ void main() {
       expect(c.gateControlsDisabledReason,
           BatteryConnection.reasonNoGateStatus);
       expect(c.safeWritesDisabledReason, isNull);
-      expect(c.disabledReasonFor(GateAction.output, on: true), isNull);
-      expect(c.disabledReasonFor(GateAction.output, on: false), isNotNull);
-      await c.sendGateControl(GateAction.output, on: true);
+      expect(c.disabledReasonFor(GateAction.bothMos, on: true), isNull);
+      expect(c.disabledReasonFor(GateAction.bothMos, on: false), isNotNull);
+      await c.sendGateControl(GateAction.bothMos, on: true);
       // chg=1 dis=1 temp=1 (protection ON) smoke=0 heat=0 restart=0 bal=0 f=0
       expect(payload(t.gateWrites.single), [1, 1, 1, 0, 0, 0, 0, 0]);
     });
@@ -143,7 +143,7 @@ void main() {
       c.parser.addBytes(bal(chgMos: 0, disMos: 0, heat: 1, passive: 1));
       clock = clock.add(const Duration(minutes: 2));
       expect(c.gateControlsDisabledReason, isNotNull);
-      await c.sendGateControl(GateAction.output, on: true);
+      await c.sendGateControl(GateAction.bothMos, on: true);
       expect(payload(t.gateWrites.single), [1, 1, 1, 0, 1, 0, 1, 0]);
     });
 
@@ -154,7 +154,7 @@ void main() {
       final c = BatteryConnection(transport: t, now: () => clock);
       await c.connectTo('dev-aa', name: 'JS-2C14AA');
       for (final f in [
-        () => c.sendGateControl(GateAction.output, on: false),
+        () => c.sendGateControl(GateAction.bothMos, on: false),
         () => c.sendGateControl(GateAction.passiveBalance, on: false),
         () => c.sendGateControl(GateAction.heatGate, on: false),
         () => c.sendGateControl(GateAction.factory),
@@ -167,12 +167,12 @@ void main() {
       // Same with a stale base.
       c.parser.addBytes(bal());
       clock = clock.add(const Duration(seconds: 20));
-      await expectLater(c.sendGateControl(GateAction.output, on: false),
+      await expectLater(c.sendGateControl(GateAction.bothMos, on: false),
           throwsA(isA<StateError>()));
       expect(t.gateWrites, isEmpty);
       // And allowed once fresh.
       c.parser.addBytes(bal());
-      await c.sendGateControl(GateAction.output, on: false);
+      await c.sendGateControl(GateAction.bothMos, on: false);
       expect(payload(t.gateWrites.single).sublist(0, 2), [0, 0]);
     });
 
@@ -191,7 +191,9 @@ void main() {
       expect(c.gateControlsDisabledReason,
           BatteryConnection.reasonNotStreaming(10000));
       expect(c.gateControlsDisabledReason, contains('not streaming'));
-      expect(c.gateControlsDisabledReason, contains('asleep'));
+      // #62: never "asleep" — standby is a stored setting, not a state.
+      expect(c.gateControlsDisabledReason, isNot(contains('asleep')));
+      expect(c.gateControlsDisabledReason, contains('standby'));
       expect(c.gateStatusSummary(), contains('NOT streaming'));
       expect(c.safeWritesDisabledReason, isNull);
       await c.sendGateControl(GateAction.restart);
@@ -224,7 +226,7 @@ void main() {
       clock = clock.add(const Duration(minutes: 3)); // way past the window
       expect(c.gateControlsDisabledReason, isNotNull);
       expect(c.safeWritesDisabledReason, isNull);
-      expect(c.disabledReasonFor(GateAction.output, on: false), isNotNull);
+      expect(c.disabledReasonFor(GateAction.bothMos, on: false), isNotNull);
       expect(c.disabledReasonFor(GateAction.restart), isNull);
       expect(c.disabledReasonFor(GateAction.factory), isNotNull,
           reason: 'factory erases configuration: fresh gate kept');
@@ -245,7 +247,7 @@ void main() {
       await c.connectTo('dev-1', name: 'JS-2C14B8');
       c.parser.addBytes(bal());
       clock = clock.add(const Duration(seconds: 30));
-      await expectLater(c.sendGateControl(GateAction.output, on: false),
+      await expectLater(c.sendGateControl(GateAction.bothMos, on: false),
           throwsA(isA<StateError>()));
       expect(t.gateWrites, isEmpty);
     });
@@ -284,8 +286,18 @@ void main() {
       clock = clock.add(const Duration(seconds: 42));
       expect(restartAction(c).sternWarning, contains('42 s'));
       expect(restartAction(c).sternWarning, contains('last-known values'));
-      expect(outputAction(c, target: true).message, contains('MOS bytes = 1'));
+      // #58: Output ON forces ONLY its own byte; the charge switch keeps its
+      // last-known value (ON from the BAL_STATUS above).
+      expect(outputAction(c, target: true).message,
+          contains('output ON (discharge MOS byte = 1)'));
+      expect(outputAction(c, target: true).message,
+          contains('the charge switch keeps its last-known value (ON)'));
+      expect(chargeAction(c, target: true).message,
+          contains('charge ON (charge MOS byte = 1)'));
+      expect(bothMosAction(c, target: true).message,
+          contains('both MOS bytes = 1'));
       expect(outputAction(c, target: false).message, isNot(contains('Note:')));
+      expect(chargeAction(c, target: false).message, isNot(contains('Note:')));
       expect(restartAction(c).dangerous, isTrue,
           reason: 'still double-confirmed');
     });
@@ -321,7 +333,8 @@ void main() {
       expect(text, startsWith('Controls unavailable — '));
       expect(text, contains('20 s'));
       expect(text, contains('automatically'));
-      expect(text, contains('Output ON and Restart BMS stay available'));
+      expect(text,
+          contains('Charge ON, Output ON and Restart BMS stay available'));
       expect(controlsUnavailableText(r),
           isNot(contains('stay available')));
       expect(restartUnavailableText(BatteryConnection.reasonNotConnected),

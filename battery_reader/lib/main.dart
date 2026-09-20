@@ -27,7 +27,8 @@ import 'diagnostics_page.dart';
 import 'fleet_store.dart';
 import 'fmt.dart';
 import 'health_palette.dart';
-import 'intervals.dart' show LookbackWindow, computeRange;
+import 'intervals.dart' show GapPolicy, LookbackWindow, computeRange;
+import 'live_indicator.dart';
 import 'metrics.dart';
 import 'monitoring_policy.dart';
 import 'notification_service.dart';
@@ -199,10 +200,11 @@ List<Object?> listPageSignature(
     m.scanErrorText,
     m.batteries.length,
     m.detectedOthers.length,
+    m.isSampling, // #53
   ];
   for (final b in m.batteries) {
     final s = b.state;
-    final offline = b.isOffline;
+    final offline = b.isOffline && !m.isSampling;
     sig.addAll([
       identityHashCode(b),
       b.profile.name,
@@ -213,12 +215,18 @@ List<Object?> listPageSignature(
       b.alarmReasons.isEmpty ? null : b.alarmReasons.last,
       offline,
       offline ? relativeTime(b.lastSeenMs, nowMs: nowMs) : s.overTempLatched,
+      // #61: only the LEVEL (live / stale / silent / …) — the indicator's
+      // ticking age text repaints itself, not the page.
+      liveStatusOf(b, sampling: m.isSampling, nowMs: nowMs).level,
+      b.streamClass, // #62
       s.rssi,
       s.socPercent,
       b.signedCurrent,
       s.remainingAh,
       s.packVoltage,
       effState(s),
+      s.chargeMos, // #58 Charge switch badge
+      s.dischargeMos, // #58 Output switch badge
     ]);
   }
   for (final d in m.detectedOthers) {
@@ -239,7 +247,9 @@ List<Object?> listPageSignature(
     agg.dischargeAh,
     agg.efc,
     m.fleetGateWriteDisabledReason,
-    m.fleetOutputWriteDisabledReason(on: true),
+    m.fleetMosWriteDisabledReason(GateAction.dischargeMos, on: true),
+    m.fleetChargeOnCount, // #58
+    m.fleetOutputOnCount, // #58
     for (final b in m.fleetMembers) b.state.serial,
   ]);
   return sig;
@@ -310,6 +320,8 @@ class _BatteryListPageState extends State<BatteryListPage>
     _alertNotifications = await _settings.loadAlertNotifications(); // #45
     _policy.backgroundMonitoring =
         await _settings.loadBackgroundMonitoring(); // #52
+    _policy.sampleInterval = BackgroundSampleInterval.fromSeconds(
+        await _settings.loadSampleIntervalS()); // #53
     await _aliases.load(); // #44 per-battery custom names
     await _manager.loadFleetMembership();
     // #45: bring the notification subsystem up and, if alerts are enabled, ask
@@ -340,6 +352,9 @@ class _BatteryListPageState extends State<BatteryListPage>
     var beep = false;
     for (final b in _manager.batteries) {
       if (b.consumeBeep()) beep = true;
+      // #62: the not-streaming watchdog — a connected link silent for 10 s
+      // gets the AT+V classification probe (cheap when nothing is due).
+      b.watchdogTick();
     }
     if (beep) alertBeep();
     // #45: raise/clear Android system notifications for the current conditions,
@@ -395,8 +410,15 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// fleet member. The foreground service runs only while this is > 0.
   int _monitoredCount() {
     if (_demoMode) return 0; // demo has no real BLE to keep alive
+    // #53: while sampling, every pack with a known address is monitored
+    // (released between samples, so not "connected").
+    final sampling = _manager.isSampling;
     return _manager.batteries
-        .where((b) => b.connState == ConnState.connected || b.inFleet)
+        .where((b) =>
+            b.connState == ConnState.connected ||
+            b.inFleet ||
+            (sampling &&
+                (_manager.deviceIdOf(b) ?? b.rememberedRemoteId) != null))
         .length;
   }
 
@@ -464,7 +486,21 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// Demo mode has no BLE to release. Idempotent.
   void _reconcileBle() {
     if (_demoMode) return;
+    // #53: backgrounded with a sample interval -> periodic sampling instead
+    // of held links. Foreground (or Continuous) -> the continuous loop,
+    // immediately.
+    if (_policy.shouldSample) {
+      _bleLive = false;
+      _manager.enterSampling(Duration(seconds: _policy.sampleInterval.seconds));
+      return;
+    }
     final want = _policy.bleShouldRun;
+    if (_manager.isSampling) {
+      _bleLive = want;
+      _manager.exitSampling(resume: want);
+      if (!want) _manager.pauseLive();
+      return;
+    }
     if (want == _bleLive) return;
     _bleLive = want;
     if (want) {
@@ -472,6 +508,15 @@ class _BatteryListPageState extends State<BatteryListPage>
     } else {
       _manager.pauseLive();
     }
+  }
+
+  /// #53: Settings "Background sample interval" (persisted). Takes effect on
+  /// the next background transition (in the foreground the app is always
+  /// continuous), or right away if already sampling.
+  void _setSampleInterval(BackgroundSampleInterval v) {
+    setState(() => _policy.sampleInterval = v);
+    _settings.saveSampleIntervalS(v.seconds);
+    _reconcileBle();
   }
 
   /// #52: Settings toggle "Background monitoring" (persisted). OFF stops the
@@ -628,6 +673,8 @@ class _BatteryListPageState extends State<BatteryListPage>
           onAlertNotificationsChanged: _setAlertNotifications,
           backgroundMonitoring: _policy.backgroundMonitoring,
           onBackgroundMonitoringChanged: _setBackgroundMonitoring,
+          sampleInterval: _policy.sampleInterval, // #53
+          onSampleIntervalChanged: _setSampleInterval,
           monitoringPaused: _policy.userStopped,
           onMonitoringPausedChanged: _setMonitoringPaused,
           onExit: _exitApp,
@@ -792,6 +839,7 @@ class _BatteryListPageState extends State<BatteryListPage>
                         for (final b in batteries)
                           _SummaryCard(
                             conn: b,
+                            manager: _manager,
                             alias: _aliases.aliasFor(b.state.serial),
                             onTap: () => _openDetail(b),
                             onToggleFleet: () => setState(
@@ -825,6 +873,8 @@ class _BatteryListPageState extends State<BatteryListPage>
 /// (add/remove) star, tappable to open the detail page.
 class _SummaryCard extends StatelessWidget {
   final BatteryConnection conn;
+  /// #53 / #61: sampling state for the live indicator.
+  final BatteryManager manager;
   final VoidCallback onTap;
   final VoidCallback onToggleFleet;
   /// #44: local custom name (null = show the bare serial).
@@ -833,6 +883,7 @@ class _SummaryCard extends StatelessWidget {
   final VoidCallback? onEditAlias;
   const _SummaryCard({
     required this.conn,
+    required this.manager,
     required this.onTap,
     required this.onToggleFleet,
     this.alias,
@@ -848,7 +899,8 @@ class _SummaryCard extends StatelessWidget {
     final alarm = conn.alarmActive;
     // #34: an offline favourite placeholder — show its last-known values dimmed
     // and labelled "offline · last seen …", never as a live/alarm card.
-    final offline = conn.isOffline;
+    // #53: a pack released between background samples is NOT offline.
+    final offline = conn.isOffline && !manager.isSampling;
     final track = HealthPalette.track(Theme.of(context).brightness);
     // Issue #13: SOC-graded fill / identity accent; a fault overrides to red.
     final health = HealthPalette.socOrFault((soc ?? 0).toDouble(), fault: alarm);
@@ -926,6 +978,18 @@ class _SummaryCard extends StatelessWidget {
                           ),
                         ],
                       ),
+                      // #61: is data flowing right now? Pulsing dot + age,
+                      // amber when stale, red "not streaming" when silent;
+                      // "sampled … · next in …" in background sampling mode.
+                      if (!offline)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 1, bottom: 2),
+                          child: LiveIndicator(
+                            conn: conn,
+                            sampling: () => manager.isSampling,
+                            nextDueMs: () => manager.nextSampleDueMs,
+                          ),
+                        ),
                       if (alarm && conn.alarmReasons.isNotEmpty)
                         Padding(
                           padding: const EdgeInsets.only(top: 2, bottom: 2),
@@ -1055,6 +1119,15 @@ class _SummaryCard extends StatelessWidget {
                                   color: dir.color,
                                   fontSize: 14,
                                   fontWeight: FontWeight.w600)),
+                        ],
+                      ),
+                      const SizedBox(height: 3),
+                      // #58: the two MOSFET switches, each on its own.
+                      Row(
+                        children: [
+                          SwitchBadge('Charge', s.chargeMos),
+                          const SizedBox(width: 10),
+                          SwitchBadge('Output', s.dischargeMos),
                         ],
                       ),
                         ],
@@ -1223,14 +1296,15 @@ class _DetectedInfoSheet extends StatelessWidget {
 /// #44: rename dialog for a pack's local custom name. Pre-fills the current
 /// alias; Save writes through the shared [AliasStore] (an empty field clears the
 /// alias back to the bare serial). Purely local — nothing sent to the BMS.
-Future<void> editBatteryAlias(
+Future<AliasEditOutcome> editBatteryAlias(
     BuildContext context, AliasStore aliases, String serial) async {
   final result = await showDialog<String>(
     context: context,
     builder: (_) => _RenameDialog(
         serial: serial, initial: aliases.aliasFor(serial) ?? ''),
   );
-  if (result != null) await aliases.setAlias(serial, result);
+  if (result == null) return AliasEditOutcome.dismissed;
+  return aliases.setAlias(serial, result);
 }
 
 /// #57 (the red `'_dependents.isEmpty': is not true` screen): the dialog OWNS
@@ -1316,6 +1390,9 @@ class SettingsPage extends StatefulWidget {
   /// #52: background monitoring toggle (persisted, default ON).
   final bool backgroundMonitoring;
   final ValueChanged<bool> onBackgroundMonitoringChanged;
+  /// #53: background sample interval (persisted, default 5 min).
+  final BackgroundSampleInterval sampleInterval;
+  final ValueChanged<BackgroundSampleInterval> onSampleIntervalChanged;
   /// #52: monitoring paused by the user (batteries released) + pause/resume.
   final bool monitoringPaused;
   final ValueChanged<bool> onMonitoringPausedChanged;
@@ -1337,6 +1414,8 @@ class SettingsPage extends StatefulWidget {
     required this.onAlertNotificationsChanged,
     required this.backgroundMonitoring,
     required this.onBackgroundMonitoringChanged,
+    required this.sampleInterval,
+    required this.onSampleIntervalChanged,
     required this.monitoringPaused,
     required this.onMonitoringPausedChanged,
     required this.onExit,
@@ -1353,6 +1432,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late bool _fahrenheit = widget.useFahrenheit;
   late bool _alerts = widget.alertNotifications; // #45
   late bool _background = widget.backgroundMonitoring; // #52
+  late BackgroundSampleInterval _interval = widget.sampleInterval; // #53
   late bool _paused = widget.monitoringPaused; // #52
   bool _sharing = false;
 
@@ -1546,6 +1626,51 @@ class _SettingsPageState extends State<SettingsPage> {
                 widget.onBackgroundMonitoringChanged(v);
               },
             ),
+            // #53: background sample interval — periodic connect / one
+            // cycle / disconnect instead of held links, with the
+            // alert-latency trade-off spelled out.
+            ListTile(
+              leading: const Icon(Icons.timer_outlined),
+              title: const Text('Background sample interval'),
+              enabled: _background,
+              subtitle: Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: SegmentedButton<BackgroundSampleInterval>(
+                        style: const ButtonStyle(
+                          visualDensity: VisualDensity.compact,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                        segments: [
+                          for (final v in BackgroundSampleInterval.values)
+                            ButtonSegment(value: v, label: Text(v.label)),
+                        ],
+                        selected: {_interval},
+                        showSelectedIcon: false,
+                        onSelectionChanged: !_background
+                            ? null
+                            : (sel) {
+                                setState(() => _interval = sel.first);
+                                widget.onSampleIntervalChanged(sel.first);
+                              },
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '${_interval.latencyNote}\n'
+                      'While the app is in the background the batteries are '
+                      'released and reconnected once per interval for one '
+                      'reading (about 2–3 s each); the foreground is always '
+                      'continuous.',
+                    ),
+                  ],
+                ),
+              ),
+            ),
             // #52: quick pause / resume (same as the app-bar menu and the
             // notification's "Stop monitoring" action).
             ListTile(
@@ -1707,6 +1832,12 @@ class _FleetTotal extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           KvRow('Status', label),
+          // #58: how many members have each MOSFET switch on.
+          if (favs.isNotEmpty)
+            KvRow(
+                'Switches',
+                'Charge ${manager.fleetChargeOnCount}/${favs.length} on  ·  '
+                'Output ${manager.fleetOutputOnCount}/${favs.length} on'),
           // #36: total battery capacity = sum of every fleet member's fullAh
           // (offline members keep contributing their last-known fullAh, so the
           // total stays stable when a pack drops off), and total remaining Ah.
@@ -1749,10 +1880,12 @@ class _FleetTotal extends StatelessWidget {
   }
 }
 
-/// Fleet-level write controls (issue #11). Enabled ONLY when every fleet member
-/// is currently connected; otherwise disabled with the reason shown. All actions
-/// go through the same confirmation + safety rules as the per-battery controls
-/// ([runWriteAction] with [fleetOutputAction]), and destructive ones list every
+/// Fleet-level write controls (issue #11 / #58). "All charge on/off", "All
+/// output on/off" and "All switches on/off". Enabled ONLY when every fleet
+/// member is currently connected (and, for an OFF, reporting a fresh gate
+/// status); otherwise disabled with the reason shown. All actions go through
+/// the same confirmation + safety rules as the per-battery controls
+/// ([runWriteAction] with [fleetMosAction]), and destructive ones list every
 /// affected serial.
 class _FleetControls extends StatefulWidget {
   final BatteryManager manager;
@@ -1774,19 +1907,68 @@ class _FleetControlsState extends State<_FleetControls> {
     if (mounted) setState(() {});
   }
 
+  /// One OFF (red, outlined) + ON button pair for the switch [action].
+  Widget _pair(BuildContext context, GateAction action,
+      {required bool offEnabled, required bool onEnabled}) {
+    final short = action == GateAction.bothMos
+        ? 'switches'
+        : mosSwitchName(action);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              icon: const Icon(Icons.power_settings_new, size: 18),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: kRed,
+                side: const BorderSide(color: kRed),
+              ),
+              onPressed: !offEnabled
+                  ? null
+                  : () => runWriteAction(
+                        context,
+                        fleetMosAction(manager, action: action, on: false),
+                        busy: _busy,
+                        onChanged: _changed,
+                      ),
+              label: Text('All $short OFF'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: OutlinedButton.icon(
+              icon: const Icon(Icons.power, size: 18),
+              onPressed: !onEnabled
+                  ? null
+                  : () => runWriteAction(
+                        context,
+                        fleetMosAction(manager, action: action, on: true),
+                        busy: _busy,
+                        onChanged: _changed,
+                      ),
+              label: Text('All $short ON'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    // C1: fleet OUTPUT buttons are real gate writes — also disabled while any
-    // member lacks a fresh BAL_STATUS (the reason names the member).
+    // C1: the fleet switch-OFF buttons are real gate writes — also disabled
+    // while any member lacks a fresh BAL_STATUS (the reason names the member).
     final reason = _busy.any
         ? 'Fleet write in progress…'
         : manager.fleetGateWriteDisabledReason;
     final enabled = reason == null;
-    // #59: "All output ON" cannot turn anything off — every member merely
-    // has to be connected.
+    // #59: a switch ON cannot turn anything off — every member merely has to
+    // be connected. Charge ON, Output ON and Both ON share that rule.
     final onReason = _busy.any
         ? 'Fleet write in progress…'
-        : manager.fleetOutputWriteDisabledReason(on: true);
+        : manager.fleetMosWriteDisabledReason(GateAction.dischargeMos,
+            on: true);
     final onEnabled = onReason == null;
 
     return Column(
@@ -1816,43 +1998,13 @@ class _FleetControlsState extends State<_FleetControls> {
             ),
           ),
         const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: OutlinedButton.icon(
-                icon: const Icon(Icons.power_settings_new, size: 18),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: kRed,
-                  side: const BorderSide(color: kRed),
-                ),
-                onPressed: !enabled
-                    ? null
-                    : () => runWriteAction(
-                          context,
-                          fleetOutputAction(manager, on: false),
-                          busy: _busy,
-                          onChanged: _changed,
-                        ),
-                label: const Text('All output OFF'),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: OutlinedButton.icon(
-                icon: const Icon(Icons.power, size: 18),
-                onPressed: !onEnabled
-                    ? null
-                    : () => runWriteAction(
-                          context,
-                          fleetOutputAction(manager, on: true),
-                          busy: _busy,
-                          onChanged: _changed,
-                        ),
-                label: const Text('All output ON'),
-              ),
-            ),
-          ],
-        ),
+        // #58: one pair per switch, plus the convenience "all switches".
+        _pair(context, GateAction.chargeMos,
+            offEnabled: enabled, onEnabled: onEnabled),
+        _pair(context, GateAction.dischargeMos,
+            offEnabled: enabled, onEnabled: onEnabled),
+        _pair(context, GateAction.bothMos,
+            offEnabled: enabled, onEnabled: onEnabled),
       ],
     );
   }
@@ -1896,6 +2048,15 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
   int _sparkTo = 0;
   Timer? _sparkTimer;
 
+  /// #53: the sample-interval gap policy for the loaded window.
+  GapPolicy _sparkPolicy = GapPolicy.continuous;
+
+  /// #61 / #62: a silent link produces no events, so a 1 s watch repaints
+  /// the page when the streaming state (silent / probe verdict / connection)
+  /// changes — that is what shows or hides the recovery ladder.
+  Timer? _watch;
+  (bool, StreamClass, ConnState)? _watched;
+
   /// M6: why the last sparkline load failed (DB error), or null. Shown as a
   /// small note in the Trends card instead of a silently blank set of rows.
   String? _sparkError;
@@ -1918,6 +2079,13 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
     // Keep the sparkline tails moving without a heavy DB re-scan every event.
     _sparkTimer =
         Timer.periodic(const Duration(seconds: 3), (_) => _loadSpark());
+    _watch = Timer.periodic(const Duration(seconds: 1), (_) {
+      final c = widget.conn;
+      final now = (c.notStreaming, c.streamClass, c.connState);
+      if (now == _watched) return;
+      _watched = now;
+      if (mounted) setState(() {});
+    });
   }
 
   /// L16: coalesce per-event repaints into one every [rebuildEvery].
@@ -1941,12 +2109,16 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
       final now = DateTime.now().millisecondsSinceEpoch;
       final span = _sparkWindow.spanMs;
       final since = span == null ? 0 : now - span;
-      final series = await BatteryLogger.instance
-          .multiSeries(serial, sparkMetricKeys, sinceMs: since);
+      final log = BatteryLogger.instance;
+      final series =
+          await log.multiSeries(serial, sparkMetricKeys, sinceMs: since);
+      // #53: the sample-interval rows decide which gaps are expected.
+      final modeRows = await log.sampleIntervalRows(serial, sinceMs: since);
       if (!mounted) return;
       final range = computeRange(series.values, span, now);
       setState(() {
         _spark = series;
+        _sparkPolicy = GapPolicy(modeRows);
         _sparkFrom = range.fromMs;
         _sparkTo = range.toMs;
         _sparkError = null;
@@ -1969,6 +2141,7 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
   void dispose() {
     _sub?.cancel(); // note: does not dispose the connection (owned by manager)
     _sparkTimer?.cancel();
+    _watch?.cancel();
     _rebuild?.cancel();
     super.dispose();
   }
@@ -2054,11 +2227,23 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
               ),
             _BatteryGauge(
               conn: widget.conn,
+              manager: widget.manager,
               alias: alias,
               socSeries: _spark[Metric.soc] ?? const [],
               fromMs: _sparkFrom,
               toMs: _sparkTo,
+              policy: _sparkPolicy,
             ),
+            // #62: connected but silent — the classification and the
+            // user-initiated recovery ladder.
+            if (widget.conn.connState == ConnState.connected &&
+                widget.conn.notStreaming)
+              _RecoveryLadderCard(
+                conn: widget.conn,
+                manager: widget.manager,
+                busy: _busy,
+                onChanged: _changed,
+              ),
             const SizedBox(height: 12),
             _TrendsSection(
               window: _sparkWindow,
@@ -2068,6 +2253,7 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
               toMs: _sparkTo,
               conn: widget.conn,
               error: _sparkError,
+              policy: _sparkPolicy,
             ),
             _Section('Pack', _rows(DetailSection.pack)),
             _Section('Capacity', _rows(DetailSection.capacity)),
@@ -2099,6 +2285,7 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
               conn: widget.conn,
               busy: _busy,
               onChanged: _changed,
+              fleetSize: widget.manager.fleetMembers.length, // #62 bank note
             ),
             const SizedBox(height: 40),
           ],
@@ -2117,16 +2304,20 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
 /// secondary details underneath.
 class _BatteryGauge extends StatelessWidget {
   final BatteryConnection conn;
+  final BatteryManager manager; // #53 / #61 sampling state
   final String? alias; // #44 local custom name
   final List<ReadingInterval> socSeries;
   final int fromMs;
   final int toMs;
+  final GapPolicy? policy; // #53
   const _BatteryGauge({
     required this.conn,
+    required this.manager,
     required this.socSeries,
     required this.fromMs,
     required this.toMs,
     this.alias,
+    this.policy,
   });
 
   @override
@@ -2162,7 +2353,15 @@ class _BatteryGauge extends StatelessWidget {
                     style: const TextStyle(color: Colors.white70)),
               ],
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 4),
+            // #61: the live-update indicator, unmistakable on the header.
+            LiveIndicator(
+              conn: conn,
+              sampling: () => manager.isSampling,
+              nextDueMs: () => manager.nextSampleDueMs,
+              fontSize: 13,
+            ),
+            const SizedBox(height: 12),
             // The three prominent values, side by side: big SOC % (health
             // colour) + Current + remaining Ah.
             Row(
@@ -2244,6 +2443,7 @@ class _BatteryGauge extends StatelessWidget {
               toMs: toMs,
               color: health,
               height: 44,
+              policy: policy,
             ),
             const SizedBox(height: 12),
             // Secondary details (demoted): voltage, power and status.
@@ -2255,6 +2455,15 @@ class _BatteryGauge extends StatelessWidget {
               trailing: [
                 Text('${fV(state.packVoltage)}  ·  ${fW(state.power)}',
                     style: const TextStyle(color: Colors.white54, fontSize: 13)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            // #58: the two MOSFET switches, each on its own.
+            Row(
+              children: [
+                SwitchBadge('Charge', state.chargeMos, fontSize: 13),
+                const SizedBox(width: 12),
+                SwitchBadge('Output', state.dischargeMos, fontSize: 13),
               ],
             ),
           ],
@@ -2279,6 +2488,9 @@ class _TrendsSection extends StatelessWidget {
   /// M6: the last history-load error, or null.
   final String? error;
 
+  /// #53: the sample-interval gap policy for this window.
+  final GapPolicy? policy;
+
   const _TrendsSection({
     required this.window,
     required this.onWindow,
@@ -2287,6 +2499,7 @@ class _TrendsSection extends StatelessWidget {
     required this.toMs,
     required this.conn,
     this.error,
+    this.policy,
   });
 
   @override
@@ -2340,6 +2553,15 @@ class _TrendsSection extends StatelessWidget {
                   ],
                 ),
               ),
+            if (policy?.hasBackground ?? false)
+              const Padding(
+                padding: EdgeInsets.only(top: 6),
+                child: Text(
+                  'Dotted = background samples (one reading per interval); '
+                  'dashed = offline.',
+                  style: TextStyle(color: Colors.white38, fontSize: 11),
+                ),
+              ),
             const Divider(height: 20),
             for (final m in sparkMetrics)
               _SparkRow(
@@ -2350,6 +2572,7 @@ class _TrendsSection extends StatelessWidget {
                 toMs: toMs,
                 color: m.sparkColorFor(conn),
                 centreZero: m.centreZero,
+                policy: policy,
               ),
           ],
         ),
@@ -2368,6 +2591,7 @@ class _SparkRow extends StatelessWidget {
   final int toMs;
   final Color color;
   final bool centreZero;
+  final GapPolicy? policy; // #53
 
   const _SparkRow({
     required this.label,
@@ -2377,6 +2601,7 @@ class _SparkRow extends StatelessWidget {
     required this.toMs,
     required this.color,
     this.centreZero = false,
+    this.policy,
   });
 
   @override
@@ -2397,6 +2622,7 @@ class _SparkRow extends StatelessWidget {
               toMs: toMs,
               color: color,
               centreZero: centreZero,
+              policy: policy,
             ),
           ),
           const SizedBox(width: 10),
@@ -2445,18 +2671,24 @@ class _Section extends StatelessWidget {
 /// "Are you sure?". Individual controls stay available regardless of fleet
 /// state. Includes the heat-up (heater) gate, sleep mode (#42) and the rated-
 /// capacity write (#38, CMD_BATTERY); each write is confirmed and read back.
-/// Sleep-ON, output-off and factory reset double-confirm and name the serial.
-/// Every control is a [WriteAction] descriptor run by [runWriteAction].
+/// Sleep-ON, any switch-off, restart and factory reset double-confirm and
+/// name the serial. Every control is a [WriteAction] descriptor run by
+/// [runWriteAction].
 class _ControlsSection extends StatelessWidget {
   final BatteryConnection conn;
   final VoidCallback onChanged;
 
   /// M4: in-flight write flags (shared with the latched over-temp card).
   final BusyWrites busy;
+
+  /// #62: fleet size — more than one member = a parallel bank, and every
+  /// switch-OFF stern page carries the sibling-takes-all-current warning.
+  final int fleetSize;
   const _ControlsSection({
     required this.conn,
     required this.onChanged,
     required this.busy,
+    this.fleetSize = 1,
   });
 
   String get _serial => serialOf(conn);
@@ -2464,18 +2696,30 @@ class _ControlsSection extends StatelessWidget {
   Future<void> _run(BuildContext context, WriteAction action) =>
       runWriteAction(context, action, busy: busy, onChanged: onChanged);
 
-  /// Issue #26: the single Output control that mirrors the vendor setMos (both
-  /// FETs move together). Turning output OFF is destructive (double-confirm,
-  /// names the serial); turning it ON is a single confirm. Read-back + warning
-  /// (issue #24) are part of [outputAction].
-  Widget _outputRow(BuildContext context, {required bool enabled}) {
-    final isOn = conn.isOutputOn;
+  /// #58: one MOSFET switch — Charge (charge MOS, byte[0]) or Output
+  /// (discharge MOS, byte[1]) — with its own on/off state and a button that
+  /// flips ONLY that switch. Turning it OFF is destructive (double-confirm,
+  /// names the serial and the switch; needs a fresh status: [gateOk]);
+  /// turning it ON is a single confirm and a safe write ([safeOk], #59).
+  /// Read-back + warning (issue #24) are part of [mosSwitchAction].
+  Widget _switchRow(
+    BuildContext context, {
+    required GateAction action,
+    required bool gateOk,
+    required bool safeOk,
+  }) {
+    final name = mosSwitchName(action); // 'charge' / 'output'
+    final label = action == GateAction.chargeMos
+        ? 'Charge (charge MOS)'
+        : 'Output (discharge MOS)';
+    final isOn = conn.mosState(action) ?? false;
     final target = !isOn;
+    final enabled = isOn ? gateOk : safeOk;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
-          const Expanded(child: Text('Output (both FETs)')),
+          Expanded(child: Text(label)),
           Text(isOn ? 'On' : 'Off',
               style: TextStyle(
                   color: isOn ? kGreen : kIdle, fontWeight: FontWeight.w600)),
@@ -2486,8 +2730,40 @@ class _ControlsSection extends StatelessWidget {
                 : null,
             onPressed: !enabled
                 ? null
-                : () => _run(context, outputAction(conn, target: target)),
-            child: Text(target ? 'Turn output ON' : 'Turn output OFF'),
+                : () => _run(
+                    context,
+                    mosSwitchAction(conn,
+                        action: action, target: target, fleetSize: fleetSize)),
+            child: Text(target ? 'Turn $name ON' : 'Turn $name OFF'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// #58: the convenience "Both on" / "Both off" (both MOS bytes together —
+  /// the vendor setMos of issue #26). OFF needs a fresh status; ON is safe.
+  Widget _bothRow(BuildContext context,
+      {required bool gateOk, required bool safeOk}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          const Expanded(child: Text('Both switches')),
+          FilledButton.tonal(
+            style: FilledButton.styleFrom(foregroundColor: kRed),
+            onPressed: !gateOk
+                ? null
+                : () => _run(context,
+                    bothMosAction(conn, target: false, fleetSize: fleetSize)),
+            child: const Text('Both OFF'),
+          ),
+          const SizedBox(width: 8),
+          FilledButton.tonal(
+            onPressed: !safeOk
+                ? null
+                : () => _run(context, bothMosAction(conn, target: true)),
+            child: const Text('Both ON'),
           ),
         ],
       ),
@@ -2528,25 +2804,43 @@ class _ControlsSection extends StatelessWidget {
 
   /// #42 sleep mode. Sleep-ON double-confirms and warns that it may drop the BLE
   /// link / stop telemetry; wake is a single confirm (see [sleepAction]).
+  /// #42 / #62: Bluetooth standby (power saving) — the vendor's "sleep"
+  /// mode. Enabling it double-confirms ([sleepAction]). The row carries the
+  /// vendor's explanation; an unknown state reads "—".
   Widget _sleepRow(BuildContext context, {required bool enabled}) {
-    final isOn = conn.isSleepModeOn;
+    final known = conn.state.sleepModeOn;
+    final isOn = known ?? false;
     final target = !isOn;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Expanded(child: Text('Sleep mode')),
-          Text(isOn ? 'Asleep' : 'Awake',
-              style: TextStyle(
-                  color: isOn ? kRed : kGreen, fontWeight: FontWeight.w600)),
-          const SizedBox(width: 12),
-          FilledButton.tonal(
-            style:
-                target ? FilledButton.styleFrom(foregroundColor: kRed) : null,
-            onPressed: !enabled
-                ? null
-                : () => _run(context, sleepAction(conn, target: target)),
-            child: Text(target ? 'Sleep' : 'Wake'),
+          Row(
+            children: [
+              const Expanded(child: Text('Bluetooth standby (power saving)')),
+              Text(known == null ? '—' : (isOn ? 'On' : 'Off'),
+                  style: TextStyle(
+                      color: known == null
+                          ? kIdle
+                          : (isOn ? kRed : kGreen),
+                      fontWeight: FontWeight.w600)),
+              const SizedBox(width: 12),
+              FilledButton.tonal(
+                style: target
+                    ? FilledButton.styleFrom(foregroundColor: kRed)
+                    : null,
+                onPressed: !enabled
+                    ? null
+                    : () => _run(context, sleepAction(conn, target: target)),
+                child: Text(target ? 'Turn on' : 'Turn off'),
+              ),
+            ],
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child: Text(standbyExplanation,
+                style: TextStyle(color: Colors.white38, fontSize: 11)),
           ),
         ],
       ),
@@ -2608,12 +2902,14 @@ class _ControlsSection extends StatelessWidget {
     // void followed by a "not confirmed" warning that could never be met.
     final writeReason = conn.writesDisabledReason;
     final connected = writeReason == null;
-    // C1: the persistent gate toggles (output, passive balancing, heater) are
-    // disabled unless the gate base is fresh — connected, all six gates
-    // reported, BAL_STATUS younger than gateFreshnessMs. The reason is shown.
+    // C1: the persistent gate toggles (charge / output switch, passive
+    // balancing, heater) are disabled unless the gate base is fresh —
+    // connected, all six gates reported, BAL_STATUS younger than
+    // gateFreshnessMs. The reason is shown.
     final gateReason = conn.gateControlsDisabledReason;
-    // #59: the SAFE writes (Output ON, Restart — they cannot turn anything
-    // off) only need a connected link; see BatteryConnection.safeWriteBase.
+    // #59: the SAFE writes (Charge ON, Output ON, Both ON, Restart — they
+    // cannot turn anything off) only need a connected link; see
+    // BatteryConnection.safeWriteBase.
     final safeReason = conn.safeWritesDisabledReason;
     // M4: while any write on this battery is in flight (tap -> confirm ->
     // read-back), every write button is disabled.
@@ -2686,13 +2982,18 @@ class _ControlsSection extends StatelessWidget {
                   ],
                 ),
               ),
-            // Issue #26: ONE Output control that writes both FET bytes together,
-            // exactly like the vendor setMos. (Per-FET toggles are gone — flipping
-            // a single FET did not take effect on hardware.)
-            // #59: turning output ON is a safe write (connected is enough);
-            // turning it OFF keeps the fresh-status gate.
-            _outputRow(context,
-                enabled: conn.isOutputOn ? gateOk : safeOk),
+            // #58: the two independent MOSFET switches — Charge (byte[0]) and
+            // Output (byte[1]) — each flipping ONLY its own byte, plus the
+            // convenience "Both" (the vendor setMos of issue #26).
+            // #59: turning a switch ON is a safe write (connected is enough);
+            // turning one OFF keeps the fresh-status gate.
+            _switchRow(context,
+                action: GateAction.chargeMos, gateOk: gateOk, safeOk: safeOk),
+            _switchRow(context,
+                action: GateAction.dischargeMos,
+                gateOk: gateOk,
+                safeOk: safeOk),
+            _bothRow(context, gateOk: gateOk, safeOk: safeOk),
             _toggleRow(
               context,
               label: 'Passive balancing',
@@ -2717,7 +3018,8 @@ class _ControlsSection extends StatelessWidget {
                   'and warms the cells.',
             ),
             const Divider(height: 24),
-            // #42 sleep mode. Sleep-ON may drop the BLE link (double-confirmed).
+            // #42 / #62 Bluetooth standby (power saving). Enabling it may
+            // stop the BLE link (double-confirmed).
             _sleepRow(context, enabled: writeOk),
             const Divider(height: 24),
             // #38 rated-capacity write (CMD_BATTERY). Changes the SOC / estimator
@@ -2752,6 +3054,151 @@ class _ControlsSection extends StatelessWidget {
                   ? null
                   : () => _run(context, factoryAction(conn)),
               label: const Text('Factory reset'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// #62: shown while the pack is connected but NOT streaming. States the
+/// classification (the AT+V probe's verdict) and offers the user-initiated
+/// recovery ladder — re-send CMD_BEGIN, both switches ON (the vendor's
+/// de-facto wake), reconnect — each reporting whether the stream resumed. A
+/// dormant pack gets the plain physical-recovery message.
+class _RecoveryLadderCard extends StatelessWidget {
+  final BatteryConnection conn;
+  final BatteryManager manager;
+  final BusyWrites busy;
+  final VoidCallback onChanged;
+  const _RecoveryLadderCard({
+    required this.conn,
+    required this.manager,
+    required this.busy,
+    required this.onChanged,
+  });
+
+  Future<void> _run(BuildContext context, WriteAction action) =>
+      runWriteAction(context, action, busy: busy, onChanged: onChanged);
+
+  @override
+  Widget build(BuildContext context) {
+    final cls = conn.streamClass;
+    final dormant = cls == StreamClass.dormant;
+    final silent = conn.silenceMs ?? 0;
+    final headline = switch (cls) {
+      StreamClass.dormant =>
+        'Connected, not streaming — ${BatteryConnection.dormantState}',
+      StreamClass.awakeNotStreaming =>
+        'Connected, not streaming — ${BatteryConnection.awakeNotStreamingState}',
+      StreamClass.noResponse =>
+        'Connected, not streaming — ${BatteryConnection.noResponseState}',
+      _ => conn.probeInFlight
+          ? 'Connected, not streaming — probing the BMS (AT+V)…'
+          : 'Connected, not streaming — no telemetry for '
+              '${(silent / 1000).round()} s',
+    };
+    final probeAge = conn.lastProbeMs == null
+        ? null
+        : conn.now().millisecondsSinceEpoch - conn.lastProbeMs!;
+    final busyAny = busy.any;
+    return Card(
+      color: dormant ? const Color(0xFF3A1414) : const Color(0xFF3A2E10),
+      margin: const EdgeInsets.only(top: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(dormant ? Icons.power_off : Icons.hourglass_empty,
+                    size: 18, color: dormant ? kRed : Colors.amber),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(headline,
+                      style: TextStyle(
+                          color: dormant ? kRed : Colors.amber,
+                          fontWeight: FontWeight.w700)),
+                ),
+              ],
+            ),
+            if (dormant)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(BatteryConnection.dormantMessage,
+                    style: TextStyle(fontSize: 13)),
+              )
+            else
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  switch (cls) {
+                    StreamClass.awakeNotStreaming =>
+                      'The BMS answers AT+V, so it is running; CMD_BEGIN was '
+                          're-sent. If the stream does not resume, try the '
+                          'steps below.',
+                    StreamClass.noResponse =>
+                      'Nothing came back from the pack — not even the '
+                          "bridge's status byte. Try the steps below; "
+                          'a reconnect usually helps at weak signal.',
+                    _ => 'The pack is linked but has sent no telemetry. The '
+                        'app probes it with AT+V after 10 s of silence to '
+                        'tell a dormant BMS from one that merely stopped '
+                        'streaming.',
+                  },
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'Frames on this link: ${conn.frameCount}'
+                '${probeAge == null ? '' : ' · last probe ${fmtAgeShort(probeAge)} ago (${cls.name})'}',
+                style: const TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: [
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.play_arrow, size: 16),
+                  onPressed: busyAny
+                      ? null
+                      : () => _run(context, wakeResendAction(conn)),
+                  label: const Text('Re-send wake (CMD_BEGIN)'),
+                ),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.toggle_on, size: 16),
+                  onPressed: busyAny || conn.safeWritesDisabledReason != null
+                      ? null
+                      : () => _run(context, wakeSwitchesOnAction(conn)),
+                  label: const Text('Turn switches on'),
+                ),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.bluetooth_searching, size: 16),
+                  onPressed: busyAny
+                      ? null
+                      : () => _run(context, wakeReconnectAction(conn, manager)),
+                  label: const Text('Reconnect'),
+                ),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.search, size: 16),
+                  onPressed: busyAny || conn.probeInFlight
+                      ? null
+                      : () async {
+                          final r = await conn.probeStreaming();
+                          onChanged();
+                          if (context.mounted) {
+                            showToast(context, 'AT+V probe: ${r.name}');
+                          }
+                        },
+                  label: const Text('Probe again (AT+V)'),
+                ),
+              ],
             ),
           ],
         ),

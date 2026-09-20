@@ -139,6 +139,7 @@ void main() {
         Metric.soc, Metric.packVoltage, Metric.packCurrent,
         Metric.temp1, Metric.temp2, Metric.temp0, Metric.temp3, Metric.chipTemp,
         Metric.flags,
+        Metric.sampleIntervalS, // #53
       ]);
       expect(chartMetrics(['cell1', 'cell2']).take(2), ['cell1', 'cell2']);
     });
@@ -249,12 +250,14 @@ void main() {
         ..unrecognisedBytes = 3;
       final rows = detailMetrics(DetailSection.gates);
       expect(rows.map((m) => m.labelOnDetail), [
-        'MOS', 'Charge MOS', 'Discharge MOS', 'Passive balancing',
+        'Both switches', 'Charge switch', 'Output switch', 'Passive balancing',
         'Low-temp protection', 'Smoke sensor', 'Heater', 'Over-temp latched',
         'Firmware', 'Signal (RSSI)', 'Unrecognised bytes',
+        'Frames (this link)', 'Last frame', // #61
       ]);
       expect(rows.map((m) => m.detailValue(c)), [
         'On', 'On', 'Off', 'Off', '1', '0', '0', 'No', '1.0.1', '-60 dBm', '3',
+        '—', '—', // #61: not connected
       ]);
       c.state.overTempLatched = true;
       expect(metricDef(Metric.overTempLatched)!.detailValue(c),

@@ -34,6 +34,12 @@ class DemoBattery {
   // updates them so the next BAL_STATUS reflects the change.
   bool _chargeMos = true;
   late bool _dischargeMos = mode != DemoMode.charging;
+
+  /// #58: the virtual Charge switch (gate byte[0]) as last written.
+  bool get chargeMos => _chargeMos;
+
+  /// #58: the virtual Output switch (gate byte[1]) as last written.
+  bool get dischargeMos => _dischargeMos;
   bool _passiveBal = false;
   int _heatGate = 0;
   int _tempGate = 1;
@@ -72,7 +78,10 @@ class DemoBattery {
     final b0 = bytes[0] & 0xff, b1 = bytes[1] & 0xff;
     List<int>? ack;
     if (b0 == 0xC3 && b1 == 0x1E && bytes.length == 12) {
-      // CMD_GATE_CONTROL: 8 payload bytes, see battery_protocol.dart.
+      // CMD_GATE_CONTROL: 8 payload bytes, see battery_protocol.dart. #58:
+      // the two MOSFET switches are honoured SEPARATELY — byte[0] sets the
+      // Charge switch, byte[1] the Output switch — so a per-switch write is
+      // acked and reflected per switch in the next MOS/BAL status.
       final p = bytes.sublist(2, 10);
       _chargeMos = p[0] == 1;
       _dischargeMos = p[1] == 1;

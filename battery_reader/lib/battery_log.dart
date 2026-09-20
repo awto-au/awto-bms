@@ -469,6 +469,7 @@ CurrentIntegral integrateCurrentRows(
   List<ReadingInterval> rows, {
   int watermarkMs = 0,
   int gapMs = BatteryLogger.gapMs,
+  GapPolicy? policy,
 }) {
   var charge = 0.0, discharge = 0.0;
   var newest = watermarkMs;
@@ -478,12 +479,14 @@ CurrentIntegral integrateCurrentRows(
     final i = iv.valueNum;
     if (i == null) continue;
     final effStart = iv.startMs > watermarkMs ? iv.startMs : watermarkMs;
-    // Hold until the next row starts, but never further than gapMs past our
-    // own end (offline gap) and — for the last row — never past our own end.
+    // Hold until the next row starts, but never further than the gap
+    // threshold past our own end (offline gap; #53: the threshold in effect
+    // for THAT gap when a sample-interval [policy] is given) and — for the
+    // last row — never past our own end.
     int holdEnd;
     if (k + 1 < rows.length) {
       final next = rows[k + 1].startMs;
-      final bound = iv.endMs + gapMs;
+      final bound = iv.endMs + (policy?.gapFor(iv.endMs, next) ?? gapMs);
       holdEnd = next < bound ? next : bound;
     } else {
       holdEnd = iv.endMs;
@@ -519,10 +522,11 @@ LifetimeTotals foldLifetime({
   required List<ReadingInterval> newRows,
   required double? ratedFullAh,
   int gapMs = BatteryLogger.gapMs,
+  GapPolicy? policy,
 }) {
   final wm = prior.aggregatedUpToMs;
-  final integral =
-      integrateCurrentRows(newRows, watermarkMs: wm, gapMs: gapMs);
+  final integral = integrateCurrentRows(newRows,
+      watermarkMs: wm, gapMs: gapMs, policy: policy);
   final deltaCharge = integral.chargeAh, deltaDischarge = integral.dischargeAh;
   final deltaEfc = (ratedFullAh != null && ratedFullAh > 0)
       ? (deltaCharge + deltaDischarge) / ratedFullAh
@@ -628,7 +632,18 @@ class BatteryLogger {
   static const int hourMs = 60 * 60 * 1000;
   static const int _bufferCapPerMetric = 8000;
 
-  final IntervalRule _rule = const IntervalRule(gapMs: gapMs);
+  /// #53: the background sample interval in effect (ms; 0 = continuous),
+  /// set by the manager when it enters / leaves sampling mode. It widens the
+  /// gap rule to [currentGapMs] — so a same-value reading one interval later
+  /// EXTENDS the open interval rather than opening a new row — and tags every
+  /// reading with the additive [Metric.sampleMode] / [Metric.sampleIntervalS]
+  /// metrics the charts use to style and to bridge the expected gaps.
+  int sampleIntervalMs = 0;
+
+  /// The gap threshold in effect: 10 s continuous, interval + margin sampling.
+  int get currentGapMs => sampleGapMs(sampleIntervalMs, baseGapMs: gapMs);
+
+  IntervalRule get _rule => IntervalRule(gapMs: currentGapMs);
 
   Database? _db;
   bool _disposed = false;
@@ -1052,6 +1067,12 @@ class BatteryLogger {
     // bit always means "off", never "not yet known".
     final flags = packFlags(s);
     if (flags != null) _num(serial, Metric.flags, now, flags.toDouble());
+
+    // #53: additive sample-mode markers — 0/1 and the interval in seconds —
+    // so the charts can tell a background sample from continuous data and
+    // bridge the expected gap between samples.
+    _num(serial, Metric.sampleMode, now, sampleIntervalMs > 0 ? 1 : 0);
+    _num(serial, Metric.sampleIntervalS, now, (sampleIntervalMs ~/ 1000).toDouble());
   }
 
   // --- typed observe helpers ------------------------------------------------
@@ -1243,6 +1264,30 @@ class BatteryLogger {
     return spliceTail(db, hourSegments(serial, metric), sinceMs: sinceMs);
   }
 
+  /// #53: the `sampleIntervalS` rows that decide the gap threshold from
+  /// [sinceMs] on — every row overlapping the window PLUS the latest row that
+  /// started before it (its value holds until the next row starts), in start
+  /// order. Feed to [GapPolicy].
+  Future<List<ReadingInterval>> sampleIntervalRows(String serial,
+      {int sinceMs = 0}) async {
+    final db = _db;
+    if (db == null) return hourSegments(serial, Metric.sampleIntervalS);
+    final rows = await intervals(serial, Metric.sampleIntervalS, sinceMs: sinceMs);
+    final before = await db.query(
+      _kReadings,
+      where: 'serial = ? AND metric = ? AND start_ms < ?',
+      whereArgs: [serial, Metric.sampleIntervalS, sinceMs],
+      orderBy: 'start_ms DESC, id DESC',
+      limit: 1,
+    );
+    final body = [
+      for (final r in before) _rowToInterval(r),
+      ...rows,
+    ];
+    return spliceTail(body, hourSegments(serial, Metric.sampleIntervalS),
+        sinceMs: sinceMs);
+  }
+
   /// Durable DB rows only (no live tail) for several metrics at once, keyed by
   /// metric. The charts page keeps this body and re-splices the in-memory tail
   /// onto it every tick with [spliceTail].
@@ -1344,8 +1389,13 @@ class BatteryLogger {
         _rowToInterval(r, serial: serial, metric: Metric.packCurrent)
     ];
     final full = await _latestFullAh(serial);
-    final updated =
-        foldLifetime(prior: prior, newRows: newRows, ratedFullAh: full);
+    // #53: hold each row to the next one across an EXPECTED sampling gap —
+    // the threshold in effect at that time, from the sampleIntervalS rows.
+    final modeRows =
+        await sampleIntervalRows(serial, sinceMs: newRows.first.startMs);
+    final policy = GapPolicy(modeRows, baseGapMs: gapMs);
+    final updated = foldLifetime(
+        prior: prior, newRows: newRows, ratedFullAh: full, policy: policy);
     // Nothing new (only the watermark row itself came back): no write needed.
     if (updated.aggregatedUpToMs == prior.aggregatedUpToMs &&
         updated.chargeAh == prior.chargeAh &&

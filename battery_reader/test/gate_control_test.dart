@@ -67,7 +67,7 @@ void main() {
     expect(payload(f), [0, 1, 1, 0, 1, 0, 1, 0]);
   });
 
-  test('OUTPUT action sets BOTH FET bytes together to ON (vendor setMos, #26)',
+  test('BOTH action sets BOTH switch bytes together to ON (vendor setMos, #26)',
       () {
     // Start from a base with both FETs off; output ON must raise [0] AND [1].
     const bothOff = GateSnapshot(
@@ -79,7 +79,7 @@ void main() {
       passiveBalancing: true,
     );
     final f = buildGateControlFrame(
-        base: bothOff, action: GateAction.output, on: true);
+        base: bothOff, action: GateAction.bothMos, on: true);
     final p = payload(f);
     expect(p[GateControl.iChargeMos], 1);
     expect(p[GateControl.iDischargeMos], 1);
@@ -87,11 +87,11 @@ void main() {
     expect(p, [1, 1, 1, 0, 1, 0, 1, 0]);
   });
 
-  test('OUTPUT action sets BOTH FET bytes together to OFF (vendor setMos, #26)',
+  test('BOTH action sets BOTH switch bytes together to OFF (vendor setMos, #26)',
       () {
     // base has both FETs on; output OFF must clear [0] AND [1] in one frame.
     final f = buildGateControlFrame(
-        base: base, action: GateAction.output, on: false);
+        base: base, action: GateAction.bothMos, on: false);
     final p = payload(f);
     expect(p[GateControl.iChargeMos], 0);
     expect(p[GateControl.iDischargeMos], 0);

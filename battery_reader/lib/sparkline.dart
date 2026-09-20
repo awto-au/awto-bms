@@ -21,32 +21,40 @@ import 'package:flutter/material.dart';
 import 'battery_log.dart';
 import 'intervals.dart';
 
-/// One point of a sparkline run (epoch-ms x, metric-value y).
+/// One point of a sparkline run (epoch-ms x, metric-value y). [bg] marks a
+/// point taken in background sampling mode (#53): the segment on either side
+/// of it is drawn lighter/dotted in the same colour.
 class SparkPoint {
   final double ms;
   final double v;
-  const SparkPoint(this.ms, this.v);
+  final bool bg;
+  const SparkPoint(this.ms, this.v, {this.bg = false});
 }
 
 /// Group held intervals into runs of consecutive rows that ABUT (gap ≤
-/// [gapMs]); a wider gap starts a new run so the offline window is left
-/// unbridged. Each run is emitted as step points (start,v)(end,v) and then
-/// DOWNSAMPLED to at most [maxPointsPerRun] points for drawing — the stored
-/// data is never touched. Null-valued rows are skipped.
+/// [gapMs], or per the sample-interval [policy] — #53: an expected sampling
+/// gap is bridged, only a gap wider than interval + margin is offline); a
+/// wider gap starts a new run so the offline window is left unbridged. Each
+/// run is emitted as step points (start,v)(end,v) and then DOWNSAMPLED to at
+/// most [maxPointsPerRun] points for drawing — the stored data is never
+/// touched. Null-valued rows are skipped.
 List<List<SparkPoint>> buildSparklineRuns(
   List<ReadingInterval> ivs, {
   int gapMs = BatteryLogger.gapMs,
   int maxPointsPerRun = 240,
+  GapPolicy? policy,
 }) {
-  final groups =
-      splitRuns(ivs, gapMs: gapMs, where: (iv) => iv.valueNum != null);
+  final groups = splitRuns(ivs,
+      gapMs: gapMs, policy: policy, where: (iv) => iv.valueNum != null);
   final runs = <List<SparkPoint>>[];
   for (final g in groups) {
     final pts = <SparkPoint>[];
     for (final iv in g) {
       final v = iv.valueNum!;
-      pts.add(SparkPoint(iv.startMs.toDouble(), v));
-      pts.add(SparkPoint(iv.endMs.toDouble(), v));
+      pts.add(SparkPoint(iv.startMs.toDouble(), v,
+          bg: policy?.isBackgroundAt(iv.startMs) ?? false));
+      pts.add(SparkPoint(iv.endMs.toDouble(), v,
+          bg: policy?.isBackgroundAt(iv.endMs) ?? false));
     }
     runs.add(_downsample(pts, maxPointsPerRun));
   }
@@ -102,6 +110,9 @@ class Sparkline extends StatelessWidget {
   /// Force the y-range to include zero (e.g. signed current) so the sign reads.
   final bool centreZero;
 
+  /// #53: the sample-interval policy for this window (null = continuous).
+  final GapPolicy? policy;
+
   const Sparkline({
     super.key,
     required this.intervals,
@@ -110,13 +121,15 @@ class Sparkline extends StatelessWidget {
     required this.color,
     this.height = 30,
     this.centreZero = false,
+    this.policy,
   });
 
   @override
   Widget build(BuildContext context) {
     final runs = intervals.isEmpty
         ? const <List<SparkPoint>>[]
-        : (_runsFor[intervals] ??= buildSparklineRuns(intervals));
+        : (_runsFor[intervals] ??=
+            buildSparklineRuns(intervals, policy: policy));
     return SizedBox(
       height: height,
       width: double.infinity,
@@ -189,6 +202,14 @@ class _SparkPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2
       ..color = color.withValues(alpha: 0.85);
+    // #53: background-sampled segments — same colour, lighter and DOTTED
+    // (short dots, distinct from the offline dash) — the line stays
+    // continuous across the expected sampling gaps.
+    final dotted = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6
+      ..strokeCap = StrokeCap.round
+      ..color = color.withValues(alpha: 0.55);
 
     Offset? prevLast;
     for (final run in runs) {
@@ -200,16 +221,28 @@ class _SparkPainter extends CustomPainter {
       }
       final path = Path();
       final area = Path();
+      var solidOpen = false;
       for (var i = 0; i < run.length; i++) {
         final px = x(run[i].ms);
         final py = y(run[i].v);
         if (i == 0) {
-          path.moveTo(px, py);
           area.moveTo(px, size.height);
           area.lineTo(px, py);
+          continue;
+        }
+        area.lineTo(px, py);
+        final prev = run[i - 1];
+        final a = Offset(x(prev.ms), y(prev.v));
+        final b = Offset(px, py);
+        if (prev.bg || run[i].bg) {
+          _drawDashedLine(canvas, a, b, dotted, dashLen: 1.2, gapLen: 3);
+          solidOpen = false;
         } else {
-          path.lineTo(px, py);
-          area.lineTo(px, py);
+          if (!solidOpen) {
+            path.moveTo(a.dx, a.dy);
+            solidOpen = true;
+          }
+          path.lineTo(b.dx, b.dy);
         }
       }
       // Close the area down to the baseline under the last point.

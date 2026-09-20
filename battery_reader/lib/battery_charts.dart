@@ -93,6 +93,10 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
   /// Displayed series = [_dbBody] with the live in-memory tail spliced on.
   Map<String, List<ReadingInterval>> _series = const {};
 
+  /// #53: the sample-interval policy, from the `sampleIntervalS` series.
+  GapPolicy get _policy =>
+      GapPolicy(_series[Metric.sampleIntervalS] ?? const []);
+
   /// H4: the durable DB rows for the window, loaded once per [_load] and kept
   /// INTACT — the live tick only re-splices the in-memory hour onto them, so
   /// history from a previous session (which the in-memory buffer never held)
@@ -323,6 +327,7 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
           ? celsiusToFahrenheit
           : null,
       series: series,
+      policy: _policy,
     );
   }
 
@@ -332,12 +337,14 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
           fromMs: _fromMs,
           toMs: _toMs,
           flags: _series[Metric.flags] ?? const [],
+          policy: _policy,
         ),
         _FaultTimelineCard(
           fromMs: _fromMs,
           toMs: _toMs,
           flags: _series[Metric.flags] ?? const [],
           faults: _faults,
+          policy: _policy,
         ),
       ];
 }
@@ -357,6 +364,7 @@ class _BuiltSeries {
   final List<ReadingInterval> intervals;
   final Color color;
   final double Function(double)? transform;
+  final GapPolicy policy;
   final List<LineChartBarData> bars;
   final List<LineChartBarData> dashed;
   final double lo;
@@ -365,34 +373,43 @@ class _BuiltSeries {
     required this.intervals,
     required this.color,
     required this.transform,
+    required this.policy,
     required this.bars,
     required this.dashed,
     required this.lo,
     required this.hi,
   });
 
-  bool matches(Series s, double Function(double)? transform) =>
+  bool matches(Series s, double Function(double)? transform, GapPolicy p) =>
       identical(intervals, s.intervals) &&
       color == s.color &&
-      identical(this.transform, transform);
+      identical(this.transform, transform) &&
+      identical(policy.rows, p.rows);
 
-  /// Split the series into runs of abutting intervals; each run is one bar of
-  /// held (step) points. Each offline gap between runs is BRIDGED by a straight
-  /// DASHED line in the same colour (#33) — solid = real logged data, dashed =
-  /// missing/offline.
-  static _BuiltSeries build(Series s, double Function(double)? transform) {
+  /// Split the series into runs of abutting intervals (per the sample-
+  /// interval [policy], #53); each run is drawn as held (step) points. Each
+  /// offline gap between runs is BRIDGED by a straight DASHED line in the
+  /// same colour (#33) — solid = real logged data, dashed = missing/offline.
+  /// #53: within a run, the segments taken in background sampling mode are
+  /// a separate DOTTED, lighter bar in the same colour, sharing their end
+  /// points with the solid bars so the line stays continuous.
+  static _BuiltSeries build(
+      Series s, double Function(double)? transform, GapPolicy policy) {
     final bars = <LineChartBarData>[];
     final dashed = <LineChartBarData>[];
     var lo = double.infinity, hi = -double.infinity;
     FlSpot? prevEnd;
-    for (final run in splitRuns(s.intervals, gapMs: _gapMs)) {
-      final spots = <FlSpot>[];
+    for (final run in splitRuns(s.intervals, gapMs: _gapMs, policy: policy)) {
+      // Step points with their sample-mode flag.
+      final spots = <(FlSpot, bool)>[];
       for (final iv in run) {
         final raw = iv.valueNum;
         if (raw == null) continue;
         final v = transform == null ? raw : transform(raw);
-        spots.add(FlSpot(iv.startMs.toDouble(), v));
-        spots.add(FlSpot(iv.endMs.toDouble(), v));
+        spots.add((FlSpot(iv.startMs.toDouble(), v),
+            policy.isBackgroundAt(iv.startMs)));
+        spots.add((FlSpot(iv.endMs.toDouble(), v),
+            policy.isBackgroundAt(iv.endMs)));
         if (v < lo) lo = v;
         if (v > hi) hi = v;
       }
@@ -400,7 +417,7 @@ class _BuiltSeries {
       // Dashed straight bridge across the missing period to this run.
       if (prevEnd != null) {
         dashed.add(LineChartBarData(
-          spots: [prevEnd, spots.first],
+          spots: [prevEnd, spots.first.$1],
           isCurved: false,
           color: s.color.withValues(alpha: 0.85),
           barWidth: 1.5,
@@ -408,19 +425,48 @@ class _BuiltSeries {
           dotData: const FlDotData(show: false),
         ));
       }
-      bars.add(LineChartBarData(
-        spots: spots,
-        isCurved: false,
-        color: s.color,
-        barWidth: 2,
-        dotData: const FlDotData(show: false),
-      ));
-      prevEnd = spots.last;
+      // Group consecutive segments by style (a segment is background-
+      // sampled when either end is); each group is one bar that shares its
+      // boundary point with the next, so the drawn line never breaks.
+      var cur = <FlSpot>[spots.first.$1];
+      bool? curBg;
+      void flush() {
+        if (cur.length < 2) return;
+        bars.add(curBg == true
+            ? LineChartBarData(
+                spots: cur,
+                isCurved: false,
+                color: s.color.withValues(alpha: 0.6),
+                barWidth: 2,
+                dashArray: const [2, 4],
+                dotData: const FlDotData(show: false),
+              )
+            : LineChartBarData(
+                spots: cur,
+                isCurved: false,
+                color: s.color,
+                barWidth: 2,
+                dotData: const FlDotData(show: false),
+              ));
+      }
+
+      for (var i = 1; i < spots.length; i++) {
+        final bg = spots[i - 1].$2 || spots[i].$2;
+        if (curBg != null && bg != curBg) {
+          flush();
+          cur = <FlSpot>[spots[i - 1].$1];
+        }
+        curBg = bg;
+        cur.add(spots[i].$1);
+      }
+      flush();
+      prevEnd = spots.last.$1;
     }
     return _BuiltSeries(
       intervals: s.intervals,
       color: s.color,
       transform: transform,
+      policy: policy,
       bars: bars,
       dashed: dashed,
       lo: lo,
@@ -443,6 +489,9 @@ class _ChartCard extends StatefulWidget {
   /// axis). Used to render temperatures in °F while the logged samples stay °C.
   final double Function(double)? valueTransform;
 
+  /// #53: the sample-interval gap policy for this window.
+  final GapPolicy policy;
+
   const _ChartCard({
     required this.title,
     required this.unit,
@@ -453,6 +502,7 @@ class _ChartCard extends StatefulWidget {
     this.minY,
     this.maxY,
     this.centreZero = false,
+    this.policy = GapPolicy.continuous,
   });
 
   @override
@@ -469,9 +519,10 @@ class _ChartCardState extends State<_ChartCard> {
     for (var i = 0; i < widget.series.length; i++) {
       final s = widget.series[i];
       final cached = _built[i];
-      final b = cached != null && cached.matches(s, widget.valueTransform)
+      final b = cached != null &&
+              cached.matches(s, widget.valueTransform, widget.policy)
           ? cached
-          : _BuiltSeries.build(s, widget.valueTransform);
+          : _BuiltSeries.build(s, widget.valueTransform, widget.policy);
       _built[i] = b;
       out.add(b);
     }
@@ -509,6 +560,13 @@ class _ChartCardState extends State<_ChartCard> {
                       LegendSwatch(s.color, s.label),
                   ],
                 ),
+              ),
+            if (widget.policy.hasBackground)
+              const Padding(
+                padding: EdgeInsets.only(top: 4),
+                child: Text(
+                    'Dotted = background samples · dashed = offline',
+                    style: TextStyle(color: Colors.white38, fontSize: 11)),
               ),
             const SizedBox(height: 10),
             SizedBox(
@@ -600,9 +658,11 @@ class _ChartCardState extends State<_ChartCard> {
 }
 
 /// Offline windows: stretches of [from,to] not covered by ANY of [ivs], i.e.
-/// the battery was disconnected. Returned as (start,end) pairs to shade.
-List<(int, int)> _offlineGaps(List<ReadingInterval> ivs, int from, int to) =>
-    uncoveredGaps(ivs, from, to, gapMs: _gapMs);
+/// the battery was disconnected (#53: an expected sampling gap is not one).
+/// Returned as (start,end) pairs to shade.
+List<(int, int)> _offlineGaps(List<ReadingInterval> ivs, int from, int to,
+        [GapPolicy policy = GapPolicy.continuous]) =>
+    uncoveredGaps(ivs, from, to, gapMs: _gapMs, policy: policy);
 
 // ---------------------------------------------------------------------------
 // Charge-state / load band (issue #22). A LINEAR horizontal band along the
@@ -674,6 +734,7 @@ ChargeState chargeStateOf(int flags) => switch (Flags.chargeState(flags)) {
 List<ChargeSegment> buildChargeSegments(
   List<ReadingInterval> flags, {
   int gapMs = _gapMs,
+  GapPolicy? policy,
 }) {
   final out = <ChargeSegment>[];
   for (final iv in flags) {
@@ -685,7 +746,9 @@ List<ChargeSegment> buildChargeSegments(
         out.last.state == st &&
         out.last.loadConnected == load &&
         out.last.chargerConnected == charger &&
-        abuts(out.last.endMs, iv.startMs, gapMs);
+        (policy != null
+            ? policy.abuts(out.last.endMs, iv.startMs)
+            : abuts(out.last.endMs, iv.startMs, gapMs));
     if (canExtend) {
       out[out.length - 1] = out.last._extendedTo(iv.endMs);
     } else {
@@ -711,18 +774,20 @@ class _ChargeStateBandCard extends StatelessWidget {
   final int fromMs;
   final int toMs;
   final List<ReadingInterval> flags;
+  final GapPolicy policy; // #53
 
   const _ChargeStateBandCard({
     required this.fromMs,
     required this.toMs,
     required this.flags,
+    this.policy = GapPolicy.continuous,
   });
 
   @override
   Widget build(BuildContext context) {
-    final segments = buildChargeSegments(flags);
+    final segments = buildChargeSegments(flags, policy: policy);
     // Offline = window not covered by any flags row; leave it as a gap (grey).
-    final offline = _offlineGaps(flags, fromMs, toMs);
+    final offline = _offlineGaps(flags, fromMs, toMs, policy);
     final anyLoad = segments.any((s) => s.loadConnected || s.chargerConnected);
 
     return Card(
@@ -869,12 +934,14 @@ class _FaultTimelineCard extends StatelessWidget {
   final int toMs;
   final List<ReadingInterval> flags;
   final List<({String label, int startMs, int endMs})> faults;
+  final GapPolicy policy; // #53
 
   const _FaultTimelineCard({
     required this.fromMs,
     required this.toMs,
     required this.flags,
     required this.faults,
+    this.policy = GapPolicy.continuous,
   });
 
   @override
@@ -886,7 +953,7 @@ class _FaultTimelineCard extends StatelessWidget {
           (iv.startMs, iv.endMs),
     ];
     // Offline bands = complement of coverage within the window.
-    final offline = _offlineGaps(flags, fromMs, toMs);
+    final offline = _offlineGaps(flags, fromMs, toMs, policy);
     final everActive = active.isNotEmpty;
 
     return Card(

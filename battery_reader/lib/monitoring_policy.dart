@@ -27,11 +27,61 @@
 /// Pure Dart (no Flutter / plugin imports) so it is unit-testable.
 library;
 
+/// #53: the Settings choice "Background sample interval". Continuous keeps
+/// every BLE link held while backgrounded (instant alerts, the highest drain);
+/// the others release every pack when the app is backgrounded and reconnect
+/// once per interval for ONE full telemetry cycle, radio idle in between.
+enum BackgroundSampleInterval {
+  continuous(0, 'Continuous'),
+  m1(60, '1 min'),
+  m5(300, '5 min'),
+  m15(900, '15 min');
+
+  const BackgroundSampleInterval(this.seconds, this.label);
+
+  /// Seconds between samples; 0 = continuous.
+  final int seconds;
+
+  /// Segment label.
+  final String label;
+
+  static const BackgroundSampleInterval defaultValue = m5;
+
+  int get ms => seconds * 1000;
+  bool get isContinuous => seconds == 0;
+
+  /// The persisted seconds value back to a choice (unknown -> the default).
+  static BackgroundSampleInterval fromSeconds(int? s) =>
+      values.firstWhere((v) => v.seconds == s, orElse: () => defaultValue);
+
+  /// The alert-latency trade-off, shown under the selector.
+  String get latencyNote => isContinuous
+      ? 'Continuous: alerts are instant, but the phone holds every '
+          'Bluetooth link the whole time (the highest battery drain).'
+      : 'In the background a fault is noticed up to $label late; the radio '
+          'is idle between samples.';
+}
+
 class MonitoringPolicy {
   MonitoringPolicy({this.backgroundMonitoring = true});
 
   /// Settings toggle "Background monitoring" (persisted, default ON).
   bool backgroundMonitoring;
+
+  /// #53: the background sample interval (persisted, default 5 min).
+  BackgroundSampleInterval sampleInterval =
+      BackgroundSampleInterval.defaultValue;
+
+  /// #53: true when the app should be SAMPLING (periodic connect / capture /
+  /// disconnect) rather than holding the links: BLE may run, the app is in
+  /// the background and the interval is not Continuous. In the foreground
+  /// this is always false — foreground is continuous, immediately.
+  bool get shouldSample =>
+      bleShouldRun && !inForeground && !sampleInterval.isContinuous;
+
+  /// #53: whether the CONTINUOUS scan/reconnect loop should be running (BLE
+  /// allowed and not in sampling mode).
+  bool get continuousShouldRun => bleShouldRun && !shouldSample;
 
   /// Set by an explicit user stop (notification action / pause). Cleared only
   /// by a fresh launch, [resume], or turning [backgroundMonitoring] ON.

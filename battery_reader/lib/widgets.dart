@@ -6,6 +6,8 @@ library;
 
 import 'package:flutter/material.dart';
 
+import 'health_palette.dart';
+
 /// The page body shell every screen used to spell out by hand:
 /// `SafeArea > Center > ConstrainedBox(maxWidth)`. Issue #30(a): SafeArea keeps
 /// the body clear of the Android system navigation bar.
@@ -110,6 +112,36 @@ class StatusLine extends StatelessWidget {
           ...trailing,
         ],
       );
+}
+
+/// #58: one MOSFET switch's state as a compact "Charge on" / "Output off"
+/// badge — green when on, muted when off, an em dash while not yet reported.
+class SwitchBadge extends StatelessWidget {
+  final String label;
+  final bool? on;
+  final double fontSize;
+  const SwitchBadge(this.label, this.on, {super.key, this.fontSize = 12});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = on == null
+        ? Colors.white38
+        : on!
+            ? HealthPalette.healthy
+            : HealthPalette.idle;
+    final word = on == null ? '—' : (on! ? 'on' : 'off');
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(on == true ? Icons.toggle_on : Icons.toggle_off,
+            size: fontSize + 6, color: color),
+        const SizedBox(width: 4),
+        Text('$label $word',
+            style: TextStyle(
+                color: color, fontSize: fontSize, fontWeight: FontWeight.w600)),
+      ],
+    );
+  }
 }
 
 /// A legend entry: a 10 px swatch (a circle for a line series, a rounded

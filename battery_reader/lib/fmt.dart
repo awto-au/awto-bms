@@ -67,6 +67,21 @@ String fSignedA(double? v) {
 /// L9: "1 battery" / "3 batteries".
 String pluralBatteries(int n) => n == 1 ? '1 battery' : '$n batteries';
 
+/// #61: a short age / countdown for the live indicator: "0.4 s" under 10 s,
+/// "12 s" under a minute, then "2 min", "1 h 05 min", "3 d". Negative reads
+/// as 0.
+String fmtAgeShort(int ms) {
+  if (ms < 0) ms = 0;
+  if (ms < 10000) return '${(ms / 1000).toStringAsFixed(1)} s';
+  final sec = ms ~/ 1000;
+  if (sec < 60) return '$sec s';
+  final min = sec ~/ 60;
+  if (min < 60) return '$min min';
+  final hr = min ~/ 60;
+  if (hr < 24) return '$hr h ${pad(min % 60)} min';
+  return '${hr ~/ 24} d';
+}
+
 /// Compact relative-time label ("just now", "5 min ago", "2 h ago", "3 d ago")
 /// for an offline favourite's last-seen timestamp (#34). Null / unknown reads
 /// "unknown".

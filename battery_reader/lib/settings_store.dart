@@ -65,4 +65,14 @@ class SettingsStore extends PrefsStore {
   Future<bool> loadBackgroundMonitoring() => load(backgroundMonitoring);
   Future<void> saveBackgroundMonitoring(bool v) =>
       save(backgroundMonitoring, v);
+
+  /// #53: background sample interval, persisted as SECONDS (0 = continuous).
+  /// Additive key; the default (5 min) applies when absent or unreadable.
+  static const sampleIntervalKey = 'background_sample_interval_v1';
+  static const int defaultSampleIntervalS = 300;
+
+  Future<int> loadSampleIntervalS() =>
+      readInt(sampleIntervalKey, fallback: defaultSampleIntervalS);
+  Future<void> saveSampleIntervalS(int seconds) =>
+      writeInt(sampleIntervalKey, seconds);
 }

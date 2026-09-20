@@ -36,7 +36,7 @@ void main() {
       expect(c.writesDisabledReason, 'Not connected');
       await expectLater(c.setSleepMode(true), throwsA(isA<StateError>()));
       await expectLater(c.writeCapacity(100), throwsA(isA<StateError>()));
-      await expectLater(c.sendGateControl(GateAction.output, on: false),
+      await expectLater(c.sendGateControl(GateAction.bothMos, on: false),
           throwsA(isA<StateError>()));
       expect(t.writes, isEmpty);
     });
@@ -74,8 +74,8 @@ void main() {
       await c.startDemo(startSoc: 50, mode: DemoMode.idle, serial: 'JS-DEMO');
       expect(c.hasFreshGateState, isTrue, reason: 'demo streams BAL_STATUS');
       expect(c.isOutputOn, isTrue);
-      await c.sendGateControl(GateAction.output, on: false);
-      final ok = await c.confirmOutputState(false,
+      await c.sendGateControl(GateAction.bothMos, on: false);
+      final ok = await c.confirmMosState(GateAction.bothMos, false,
           timeout: const Duration(seconds: 2));
       expect(ok, isTrue);
       expect(c.isOutputOn, isFalse);
@@ -146,7 +146,7 @@ void main() {
       }
       expect(m.fleetGateWriteDisabledReason, isNull);
 
-      final r = await m.fleetSetOutput(false);
+      final r = await m.fleetSetMos(GateAction.bothMos, on: false);
       expect(r.allOk, isFalse);
       expect(r.succeeded, ['JS-A', 'JS-C']);
       expect(r.failed.keys, ['JS-B']);
@@ -165,7 +165,7 @@ void main() {
       final m = BatteryManager();
       m.batteries.add(a);
       m.setInFleet(a, true);
-      final r = await m.fleetSetOutput(true);
+      final r = await m.fleetSetMos(GateAction.bothMos, on: true);
       expect(r.allOk, isTrue);
       expect(r.succeeded, ['JS-A']);
       expect(r.failed, isEmpty);
@@ -180,10 +180,10 @@ void main() {
       m.batteries.add(a);
       m.setInFleet(a, true);
       // Output OFF can cut something: refused without a fresh base.
-      await expectLater(m.fleetSetOutput(false), throwsA(isA<StateError>()));
+      await expectLater(m.fleetSetMos(GateAction.bothMos, on: false), throwsA(isA<StateError>()));
       expect(tA.gateWrites, isEmpty);
       // #59: output ON cannot — it goes out on the safe base (both MOS = 1).
-      final r = await m.fleetSetOutput(true);
+      final r = await m.fleetSetMos(GateAction.bothMos, on: true);
       expect(r.allOk, isTrue);
       expect(tA.gateWrites.single.sublist(2, 4), [1, 1]);
     });

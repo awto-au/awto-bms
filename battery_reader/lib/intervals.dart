@@ -73,32 +73,117 @@ class ReadingInterval implements TimeSpan {
 bool abuts(int prevEndMs, int nextStartMs, int gapMs) =>
     nextStartMs - prevEndMs <= gapMs;
 
+/// #53: the margin added to a background sample interval before a gap counts
+/// as offline — a sample takes a few seconds, a reconnect at weak signal (and
+/// its backoff) considerably longer.
+const int sampleGapMarginMs = 60 * 1000;
+
+/// #53: the gap threshold for readings taken [intervalMs] apart in background
+/// sampling mode: the interval plus [marginMs]. Continuous (`intervalMs <= 0`)
+/// keeps the base rule ([baseGapMs], the logger's 10 s).
+int sampleGapMs(int intervalMs,
+        {int baseGapMs = 10000, int marginMs = sampleGapMarginMs}) =>
+    intervalMs <= 0 ? baseGapMs : intervalMs + marginMs;
+
+/// #53: the gap rule that knows the sample interval IN EFFECT at each instant.
+///
+/// Built from the logged `sampleIntervalS` series (seconds between background
+/// samples, 0 = continuous; start-ordered). A row's value holds from its start
+/// until the NEXT row starts (rows are sparse in sampling mode). Two spans abut
+/// iff their gap is at most the LARGER of the thresholds at the previous end
+/// and at the next start, so both transitions — continuous -> sampling (the
+/// gap before the first sparse sample) and sampling -> continuous (the gap
+/// after the last one) — are expected gaps, not offline. Only a gap wider than
+/// (interval + margin) is offline. With no rows it is exactly [abuts].
+class GapPolicy {
+  /// `sampleIntervalS` intervals in start order (value = seconds, 0 = continuous).
+  final List<ReadingInterval> rows;
+  final int baseGapMs;
+  final int marginMs;
+
+  const GapPolicy(this.rows,
+      {this.baseGapMs = 10000, this.marginMs = sampleGapMarginMs});
+
+  /// The plain continuous rule (no sampling rows).
+  static const GapPolicy continuous = GapPolicy([]);
+
+  /// The sample interval (ms) in effect at [ms]: the latest row starting at or
+  /// before it; 0 (continuous) when none.
+  int intervalAt(int ms) {
+    if (rows.isEmpty) return 0;
+    // Binary search for the last row with startMs <= ms.
+    var lo = 0, hi = rows.length - 1, found = -1;
+    while (lo <= hi) {
+      final mid = (lo + hi) >> 1;
+      if (rows[mid].startMs <= ms) {
+        found = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (found < 0) return 0;
+    final s = rows[found].valueNum ?? 0;
+    return s <= 0 ? 0 : (s * 1000).round();
+  }
+
+  /// True iff readings at [ms] were background samples.
+  bool isBackgroundAt(int ms) => intervalAt(ms) > 0;
+
+  /// True iff any row records background sampling.
+  bool get hasBackground => rows.any((r) => (r.valueNum ?? 0) > 0);
+
+  /// The gap threshold in effect at [ms].
+  int gapAt(int ms) =>
+      sampleGapMs(intervalAt(ms), baseGapMs: baseGapMs, marginMs: marginMs);
+
+  /// The threshold for the gap between a span ending at [prevEndMs] and one
+  /// starting at [nextStartMs]: the larger of the two instants' thresholds.
+  int gapFor(int prevEndMs, int nextStartMs) {
+    final a = gapAt(prevEndMs), b = gapAt(nextStartMs);
+    return a > b ? a : b;
+  }
+
+  /// The policy-aware [abuts].
+  bool abuts(int prevEndMs, int nextStartMs) =>
+      nextStartMs - prevEndMs <= gapFor(prevEndMs, nextStartMs);
+}
+
 /// Group time-ordered intervals into runs of consecutive rows that abut
-/// (gap <= [gapMs]); a wider gap starts a new run so the offline window is left
-/// unbridged. [where] optionally drops rows (e.g. null-valued ones) BEFORE
-/// grouping, so a dropped row neither starts nor extends a run.
+/// (gap <= [gapMs], or per [policy] when given — #53); a wider gap starts a
+/// new run so the offline window is left unbridged. [where] optionally drops
+/// rows (e.g. null-valued ones) BEFORE grouping, so a dropped row neither
+/// starts nor extends a run.
 List<List<T>> splitRuns<T extends TimeSpan>(
   Iterable<T> ivs, {
   required int gapMs,
   bool Function(T iv)? where,
+  GapPolicy? policy,
 }) {
   final runs = <List<T>>[];
   List<T>? cur;
   for (final iv in ivs) {
     if (where != null && !where(iv)) continue;
-    if (cur == null || !abuts(cur.last.endMs, iv.startMs, gapMs)) {
+    final prev = cur;
+    final joined = prev != null &&
+        (policy != null
+            ? policy.abuts(prev.last.endMs, iv.startMs)
+            : abuts(prev.last.endMs, iv.startMs, gapMs));
+    if (!joined) {
       cur = <T>[iv];
       runs.add(cur);
     } else {
-      cur.add(iv);
+      prev.add(iv);
     }
   }
   return runs;
 }
 
 /// The union of covered time across [ivs] (any order): sorted, with spans that
-/// overlap or abut (within [gapMs]) merged into one `(start, end)`.
-List<(int, int)> mergeCoverage(Iterable<TimeSpan> ivs, {required int gapMs}) {
+/// overlap or abut (within [gapMs], or per [policy] — #53) merged into one
+/// `(start, end)`.
+List<(int, int)> mergeCoverage(Iterable<TimeSpan> ivs,
+    {required int gapMs, GapPolicy? policy}) {
   final covered = <(int, int)>[for (final iv in ivs) (iv.startMs, iv.endMs)];
   if (covered.isEmpty) return const [];
   covered.sort((a, b) => a.$1.compareTo(b.$1));
@@ -106,7 +191,9 @@ List<(int, int)> mergeCoverage(Iterable<TimeSpan> ivs, {required int gapMs}) {
   var (cs, ce) = covered.first;
   for (var i = 1; i < covered.length; i++) {
     final (s, e) = covered[i];
-    if (abuts(ce, s, gapMs)) {
+    final joined =
+        policy != null ? policy.abuts(ce, s) : abuts(ce, s, gapMs);
+    if (joined) {
       if (e > ce) ce = e;
     } else {
       merged.add((cs, ce));
@@ -119,15 +206,17 @@ List<(int, int)> mergeCoverage(Iterable<TimeSpan> ivs, {required int gapMs}) {
 }
 
 /// Offline windows: the stretches of `[from, to]` not covered by ANY of [ivs]
-/// (the complement of [mergeCoverage]), keeping only gaps wider than [gapMs].
-/// Empty when nothing is covered at all (nothing to contrast against).
+/// (the complement of [mergeCoverage]), keeping only gaps wider than [gapMs]
+/// (or than the [policy]'s threshold for that gap — #53). Empty when nothing
+/// is covered at all (nothing to contrast against).
 List<(int, int)> uncoveredGaps(
   Iterable<TimeSpan> ivs,
   int from,
   int to, {
   required int gapMs,
+  GapPolicy? policy,
 }) {
-  final merged = mergeCoverage(ivs, gapMs: gapMs);
+  final merged = mergeCoverage(ivs, gapMs: gapMs, policy: policy);
   if (merged.isEmpty) return const [];
   final gaps = <(int, int)>[];
   var cursor = from;
@@ -136,7 +225,10 @@ List<(int, int)> uncoveredGaps(
     if (e > cursor) cursor = e;
   }
   if (cursor < to) gaps.add((cursor, to));
-  return [for (final g in gaps) if (g.$2 - g.$1 > gapMs) g];
+  return [
+    for (final g in gaps)
+      if (g.$2 - g.$1 > (policy?.gapFor(g.$1, g.$2) ?? gapMs)) g
+  ];
 }
 
 /// Splice the live in-memory tail onto the durable DB body for one metric
