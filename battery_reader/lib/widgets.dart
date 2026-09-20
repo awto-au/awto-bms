@@ -76,44 +76,6 @@ class SocBar extends StatelessWidget {
   }
 }
 
-/// The "● Charging … values" status line: a coloured dot, the direction word
-/// in the same colour, a Spacer and the trailing figures.
-class StatusLine extends StatelessWidget {
-  final Color color;
-  final String label;
-  final double dotSize;
-  final double gap;
-  final double? fontSize;
-  final List<Widget> trailing;
-
-  const StatusLine({
-    super.key,
-    required this.color,
-    required this.label,
-    required this.dotSize,
-    required this.gap,
-    required this.trailing,
-    this.fontSize,
-  });
-
-  @override
-  Widget build(BuildContext context) => Row(
-        children: [
-          Container(
-            width: dotSize,
-            height: dotSize,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          SizedBox(width: gap),
-          Text(label,
-              style: TextStyle(
-                  color: color, fontSize: fontSize, fontWeight: FontWeight.w600)),
-          const Spacer(),
-          ...trailing,
-        ],
-      );
-}
-
 /// #58: one MOSFET switch's state as a compact "Charge on" / "Output off"
 /// badge — green when on, muted when off, an em dash while not yet reported.
 class SwitchBadge extends StatelessWidget {

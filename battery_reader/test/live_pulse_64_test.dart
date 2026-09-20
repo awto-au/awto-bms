@@ -8,6 +8,7 @@ library;
 
 import 'package:battery_reader/battery_connection.dart';
 import 'package:battery_reader/battery_protocol.dart';
+import 'package:battery_reader/health_palette.dart';
 import 'package:battery_reader/live_indicator.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -100,11 +101,18 @@ void main() {
       return c;
     }
 
+    // #65: the dot lives on the ONE status line now (LiveStatusLine); the
+    // pulse wiring is unchanged.
     Future<void> pumpIndicator(WidgetTester tester, BatteryConnection c,
             {bool sampling = false}) =>
         tester.pumpWidget(MaterialApp(
           home: Scaffold(
-            body: LiveIndicator(conn: c, sampling: () => sampling),
+            body: LiveStatusLine(
+              conn: c,
+              dir: ChargeStateStyle.idle,
+              sampling: () => sampling,
+              trailing: (_) => const [],
+            ),
           ),
         ));
 

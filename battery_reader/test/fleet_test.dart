@@ -26,6 +26,11 @@ void main() {
     c.state.fullAh = fullAh;
     c.state.remainingAh = remainingAh;
     c.connState = conn;
+    // #65: a "connected" test pack is a STREAMING one (a frame just landed);
+    // net current / power and the fleet status count streaming members only.
+    if (conn == ConnState.connected) {
+      c.lastTelemetryMs = DateTime.now().millisecondsSinceEpoch;
+    }
     return c;
   }
 

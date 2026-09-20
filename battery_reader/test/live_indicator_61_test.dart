@@ -1,7 +1,9 @@
-/// GitHub #61: the per-battery live-update indicator — live / stale / silent
+/// GitHub #61: the per-battery liveness decision — live / stale / silent
 /// at a glance, ticking with each decoded cycle, tied to the not-streaming
 /// watchdog + the #62 verdict, and "sampled … · next in …" in background
 /// sampling mode (#53). Plus the frame counter / last-frame age rows.
+/// (#65: the decision now feeds the ONE status line — its text is the
+/// trailing age while there is data and the "No data · …" reason while not.)
 library;
 
 import 'package:battery_reader/battery_connection.dart';
@@ -36,11 +38,17 @@ void main() {
             streamClass: cls);
 
     test('live under 3 s, amber to 10 s, red "not streaming" from 10 s', () {
-      expect(at(400), const LiveStatus(LiveLevel.live, 'live · updated 0.4 s ago'));
+      expect(at(400),
+          const LiveStatus(LiveLevel.live, 'updated 0.4 s ago', hasData: true));
       expect(at(2999).level, LiveLevel.live);
-      expect(at(3000), const LiveStatus(LiveLevel.stale, 'updated 3.0 s ago'));
+      expect(at(3000),
+          const LiveStatus(LiveLevel.stale, 'updated 3.0 s ago', hasData: true));
       expect(at(9999).level, LiveLevel.stale);
-      expect(at(10000), const LiveStatus(LiveLevel.silent, 'not streaming · 10 s silent'));
+      expect(at(9999).hasData, isTrue);
+      expect(
+          at(10000),
+          const LiveStatus(LiveLevel.silent, 'not streaming — 10 s silent',
+              hasData: false));
       expect(at(10000).level, LiveLevel.silent);
       expect(staleMs, 3000);
       expect(BatteryConnection.notStreamingMs, 10000);
@@ -50,31 +58,40 @@ void main() {
         'dormant (same text, level and colour)', () {
       final dormant = at(15000, cls: StreamClass.dormant);
       final noReply = at(15000, cls: StreamClass.noResponse);
-      expect(dormant.text, 'not streaming · BMS not running');
+      expect(dormant.text, 'not streaming — BMS not running');
       expect(noReply, dormant);
       expect(dormant.level, LiveLevel.silent);
+      expect(dormant.hasData, isFalse);
       expect(noReply.color, dormant.color);
       expect(at(15000, cls: StreamClass.awakeNotStreaming).text,
-          'not streaming · ${BatteryConnection.awakeNotStreamingState}');
+          BatteryConnection.awakeNotStreamingState);
       expect(at(15000, cls: StreamClass.awakeNotStreaming).level,
           LiveLevel.silent);
     });
 
-    test('a fresh link with no frame yet is stale ("waiting"), not live', () {
+    test('a fresh link with no frame yet is "waiting" (amber, no data), '
+        'not live', () {
       final s = liveStatusFor(
           conn: ConnState.connected,
           silenceMs: 1000,
           nowMs: 0,
           hasFrameOnLink: false);
-      expect(s.level, LiveLevel.stale);
-      expect(s.text, contains('waiting for the first frame'));
+      expect(s.level, LiveLevel.waiting);
+      expect(s.hasData, isFalse);
+      expect(s.text, 'waiting for the first frame');
+      expect(s.color, at(5000).color, reason: 'amber, like stale');
     });
 
     test('connecting / not connected', () {
-      expect(liveStatusFor(conn: ConnState.connecting, silenceMs: null, nowMs: 0),
-          const LiveStatus(LiveLevel.connecting, 'connecting…'));
-      expect(liveStatusFor(conn: ConnState.disconnected, silenceMs: null, nowMs: 0),
-          const LiveStatus(LiveLevel.offline, 'not connected'));
+      expect(
+          liveStatusFor(conn: ConnState.connecting, silenceMs: null, nowMs: 0),
+          const LiveStatus(LiveLevel.connecting, 'connecting…',
+              hasData: false));
+      expect(
+          liveStatusFor(
+              conn: ConnState.disconnected, silenceMs: null, nowMs: 0),
+          const LiveStatus(LiveLevel.offline, 'not connected',
+              hasData: false));
     });
 
     test('background sampling: "sampled 2 min ago · next in 3 min"', () {
@@ -87,17 +104,21 @@ void main() {
         lastFrameEverMs: now - 120000,
         nextDueMs: now + 180000,
       );
-      expect(s, const LiveStatus(LiveLevel.sampled, 'sampled 2 min ago · next in 3 min'));
       expect(
-          liveStatusFor(
-            conn: ConnState.disconnected,
-            silenceMs: null,
-            nowMs: now,
-            sampling: true,
-            lastFrameEverMs: null,
-            nextDueMs: now - 1,
-          ).text,
-          'not sampled yet · sampling now');
+          s,
+          const LiveStatus(
+              LiveLevel.sampled, 'sampled 2 min ago · next in 3 min',
+              hasData: true));
+      final never = liveStatusFor(
+        conn: ConnState.disconnected,
+        silenceMs: null,
+        nowMs: now,
+        sampling: true,
+        lastFrameEverMs: null,
+        nextDueMs: now - 1,
+      );
+      expect(never.text, 'not sampled yet · sampling now');
+      expect(never.hasData, isFalse, reason: 'nothing captured yet');
       // Mid-sample (connected) the normal live rules apply.
       expect(
           liveStatusFor(
@@ -129,30 +150,35 @@ void main() {
       expect(last.detailValue(c), '—');
       await c.connectTo('dev-1', name: 'JS-A');
       clock = clock.add(const Duration(seconds: 1));
-      expect(liveStatusOf(c).level, LiveLevel.stale, reason: 'no frame yet');
+      expect(liveStatusOf(c).level, LiveLevel.waiting, reason: 'no frame yet');
+      expect(c.isStreaming, isFalse);
       expect(last.detailValue(c), contains('none yet'));
       c.parser.addBytes(bal);
       expect(c.frameCount, 1);
-      expect(liveStatusOf(c), const LiveStatus(LiveLevel.live, 'live · updated 0.0 s ago'));
+      expect(liveStatusOf(c),
+          const LiveStatus(LiveLevel.live, 'updated 0.0 s ago', hasData: true));
+      expect(c.isStreaming, isTrue);
       expect(frames.detailValue(c), '1');
       expect(last.detailValue(c), '0.0 s ago');
       clock = clock.add(const Duration(milliseconds: 400));
-      expect(liveStatusOf(c).text, 'live · updated 0.4 s ago');
+      expect(liveStatusOf(c).text, 'updated 0.4 s ago');
       clock = clock.add(const Duration(seconds: 5));
       expect(liveStatusOf(c).level, LiveLevel.stale);
+      expect(c.isStreaming, isTrue, reason: 'stale still counts as flowing');
       clock = clock.add(const Duration(seconds: 5));
       expect(liveStatusOf(c).level, LiveLevel.silent);
-      expect(liveStatusOf(c).text, 'not streaming · 10 s silent');
+      expect(liveStatusOf(c).text, 'not streaming — 10 s silent');
+      expect(c.isStreaming, isFalse);
       c.streamClass = StreamClass.dormant;
       expect(liveStatusOf(c).text,
-          'not streaming · ${BatteryConnection.bmsNotRunningState}');
+          'not streaming — ${BatteryConnection.bmsNotRunningState}');
       expect(c.gateStatusSummary(), contains('frames 1'));
       expect(c.gateStatusSummary(), contains('last frame 10 s ago'));
       expect(c.gateStatusSummary(), contains('stream dormant'));
       // #63: the same indicator text without the 0x30; Diagnostics differs.
       c.streamClass = StreamClass.noResponse;
       expect(liveStatusOf(c).text,
-          'not streaming · ${BatteryConnection.bmsNotRunningState}');
+          'not streaming — ${BatteryConnection.bmsNotRunningState}');
       expect(c.gateStatusSummary(), contains('stream noResponse'));
       // Sampling mode (released): the sample ages instead.
       await c.disconnect();

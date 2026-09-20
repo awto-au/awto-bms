@@ -326,6 +326,15 @@ class BatteryConnection {
   /// True while connected but silent for at least [notStreamingMs] (#59).
   bool get notStreaming => (silenceMs ?? 0) >= notStreamingMs;
 
+  /// #65: true while telemetry is actually flowing on this link — connected,
+  /// at least one telemetry frame decoded and not yet [notStreaming]. Only
+  /// streaming packs contribute to the fleet's live net current / power and
+  /// its "Status"; a silent pack's last state is stale, not data.
+  bool get isStreaming =>
+      connState == ConnState.connected &&
+      lastTelemetryMs != null &&
+      !notStreaming;
+
   /// Why gate writes that CAN TURN SOMETHING OFF (charge / output / both OFF,
   /// passive balancing / heater OFF, factory reset — anything built from the live gate
   /// base) are refused right now, or null when they are allowed. The text

@@ -957,12 +957,19 @@ class BatteryManager {
     return ((totalRemainingAh / full) * 100).round().clamp(0, 100);
   }
 
-  // Net current/power sum ONLY connected members (#34): an offline member
-  // contributes no live current/power.
+  /// #65: fleet members whose telemetry is actually flowing right now
+  /// ([BatteryConnection.isStreaming]). A connected-but-silent pack (dormant
+  /// BMS, no reply, awake-not-streaming, no frame yet on this link) holds a
+  /// STALE last state and is excluded, like an offline member.
+  List<BatteryConnection> get streamingFleetMembers =>
+      fleetMembers.where((b) => b.isStreaming).toList();
+
+  // Net current/power sum ONLY streaming members (#34 / #65): an offline or
+  // silent member contributes no live current/power.
   double get netCurrentA =>
-      connectedFleetMembers.fold(0.0, (a, b) => a + b.signedCurrent);
+      streamingFleetMembers.fold(0.0, (a, b) => a + b.signedCurrent);
   double get netPowerW =>
-      connectedFleetMembers.fold(0.0, (a, b) => a + b.signedPower);
+      streamingFleetMembers.fold(0.0, (a, b) => a + b.signedPower);
 
   // -------------------------------------------------------------------------
   // Fleet-control gating (issue #11). Fleet-level write actions are ENABLED
@@ -1146,13 +1153,19 @@ class BatteryManager {
   /// bar uses [BatteryConnection.alarmActive] with [HealthPalette.socOrFault].
   bool get fleetAlarmActive => fleetMembers.any((b) => b.alarmActive);
 
-  /// Net direction of the fleet.
+  /// Net direction of the fleet (over the streaming members).
   ChargeState get fleetState {
     final p = netPowerW;
     if (p > 0.5) return ChargeState.charging;
     if (p < -0.5) return ChargeState.discharging;
     return ChargeState.idle;
   }
+
+  /// #65: the fleet panel's "Status" — [fleetState] while at least one member
+  /// is streaming, null ("No data") when none is: a fleet of silent /
+  /// offline packs has no charge state to show.
+  ChargeState? get fleetStreamingState =>
+      streamingFleetMembers.isEmpty ? null : fleetState;
 
   void disposeAll() {
     _aggTimer?.cancel();

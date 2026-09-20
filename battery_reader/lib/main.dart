@@ -207,6 +207,9 @@ List<Object?> listPageSignature(
   for (final b in m.batteries) {
     final s = b.state;
     final offline = b.isOffline && !m.isSampling;
+    // #61 / #65: only the LEVEL and whether there is data — the status line's
+    // ticking age text repaints itself, not the page.
+    final live = liveStatusOf(b, sampling: m.isSampling, nowMs: nowMs);
     sig.addAll([
       identityHashCode(b),
       b.profile.name,
@@ -217,9 +220,8 @@ List<Object?> listPageSignature(
       b.alarmReasons.isEmpty ? null : b.alarmReasons.last,
       offline,
       offline ? relativeTime(b.lastSeenMs, nowMs: nowMs) : s.overTempLatched,
-      // #61: only the LEVEL (live / stale / silent / …) — the indicator's
-      // ticking age text repaints itself, not the page.
-      liveStatusOf(b, sampling: m.isSampling, nowMs: nowMs).level,
+      live.level,
+      live.hasData, // #65: the card's figures flip to "—" without data
       b.streamClass, // #62
       s.rssi,
       s.socPercent,
@@ -239,7 +241,7 @@ List<Object?> listPageSignature(
     m.fleetMembers.length,
     m.combinedSocPercent,
     m.fleetAlarmActive,
-    m.fleetState,
+    m.fleetStreamingState, // #65: null = "No data"
     m.netPowerW,
     m.netCurrentA,
     m.totalCapacityAh,
@@ -871,7 +873,7 @@ class _BatteryListPageState extends State<BatteryListPage>
                       padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
                       children: [
                         for (final b in batteries)
-                          _SummaryCard(
+                          SummaryCard(
                             conn: b,
                             manager: _manager,
                             alias: _aliases.aliasFor(b.state.serial),
@@ -895,7 +897,7 @@ class _BatteryListPageState extends State<BatteryListPage>
             ),
             const Divider(height: 1),
             // Bottom half: combined total across favourited batteries.
-            Expanded(child: _FleetTotal(manager: _manager)),
+            Expanded(child: FleetTotal(manager: _manager)),
           ],
         ),
       ),
@@ -904,8 +906,9 @@ class _BatteryListPageState extends State<BatteryListPage>
 }
 
 /// One row in the list: serial, a compact SOC bar with figures, a fleet
-/// (add/remove) star, tappable to open the detail page.
-class _SummaryCard extends StatelessWidget {
+/// (add/remove) star, tappable to open the detail page. Public so the #65
+/// widget tests can pump a card for a hand-built connection.
+class SummaryCard extends StatelessWidget {
   final BatteryConnection conn;
   /// #53 / #61: sampling state for the live indicator.
   final BatteryManager manager;
@@ -915,7 +918,8 @@ class _SummaryCard extends StatelessWidget {
   final String? alias;
   /// #44: opens the rename dialog; null when the pack has no serial yet.
   final VoidCallback? onEditAlias;
-  const _SummaryCard({
+  const SummaryCard({
+    super.key,
     required this.conn,
     required this.manager,
     required this.onTap,
@@ -931,10 +935,19 @@ class _SummaryCard extends StatelessWidget {
     final soc = s.socPercent;
     final frac = ((soc ?? 0) / 100).clamp(0.0, 1.0);
     final alarm = conn.alarmActive;
-    // #34: an offline favourite placeholder — show its last-known values dimmed
-    // and labelled "offline · last seen …", never as a live/alarm card.
+    // #34: an offline favourite placeholder — show its last-known SOC dimmed
+    // and labelled "Offline · last seen …", never as a live/alarm card.
     // #53: a pack released between background samples is NOT offline.
     final offline = conn.isOffline && !manager.isSampling;
+    // #65: no data behind the screen (silent / dormant / waiting / offline):
+    // the charge state, current and voltage are NOT shown anywhere on the
+    // card — the status line reads "No data · …" and the figures "—". The
+    // SOC bar keeps the last-known SOC, dimmed as offline favourites are.
+    final noData = offline ||
+        !liveStatusOf(conn,
+                sampling: manager.isSampling,
+                nextDueMs: manager.nextSampleDueMs)
+            .hasData;
     final track = HealthPalette.track(Theme.of(context).brightness);
     // Issue #13: SOC-graded fill / identity accent; a fault overrides to red.
     final health = HealthPalette.socOrFault((soc ?? 0).toDouble(), fault: alarm);
@@ -1012,18 +1025,6 @@ class _SummaryCard extends StatelessWidget {
                           ),
                         ],
                       ),
-                      // #61: is data flowing right now? Pulsing dot + age,
-                      // amber when stale, red "not streaming" when silent;
-                      // "sampled … · next in …" in background sampling mode.
-                      if (!offline)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 1, bottom: 2),
-                          child: LiveIndicator(
-                            conn: conn,
-                            sampling: () => manager.isSampling,
-                            nextDueMs: () => manager.nextSampleDueMs,
-                          ),
-                        ),
                       if (alarm && conn.alarmReasons.isNotEmpty)
                         Padding(
                           padding: const EdgeInsets.only(top: 2, bottom: 2),
@@ -1060,31 +1061,13 @@ class _SummaryCard extends StatelessWidget {
                             ],
                           ),
                         ),
-                      if (offline)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 2, bottom: 2),
-                          child: Row(
-                            children: [
-                              const Icon(Icons.cloud_off,
-                                  size: 13, color: Colors.white38),
-                              const SizedBox(width: 5),
-                              Expanded(
-                                child: Text(
-                                  'Offline · last seen ${relativeTime(conn.lastSeenMs)}',
-                                  style: const TextStyle(
-                                      color: Colors.white38, fontSize: 12),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
                       const SizedBox(height: 2),
                       // Prominent (issue #16): SOC %, signed current, remaining
-                      // Ah. Voltage is demoted to the small line below. Offline
-                      // placeholders show last-known values dimmed (#34).
+                      // Ah. Voltage is demoted to the small line below. With no
+                      // data (#34 offline, #65 silent) the last-known SOC is
+                      // dimmed and the current reads "—".
                       Opacity(
-                       opacity: offline ? 0.45 : 1.0,
+                       opacity: noData ? 0.45 : 1.0,
                        child: Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
@@ -1115,7 +1098,7 @@ class _SummaryCard extends StatelessWidget {
                                 fit: BoxFit.scaleDown,
                                 alignment: Alignment.centerRight,
                                 child: Text(
-                                  '${fSignedA(conn.signedCurrent)}  ·  ${fAh(s.remainingAh)}',
+                                  '${noData ? '—' : fSignedA(conn.signedCurrent)}  ·  ${fAh(s.remainingAh)}',
                                   maxLines: 1,
                                   style: const TextStyle(
                                     fontSize: 16,
@@ -1132,25 +1115,32 @@ class _SummaryCard extends StatelessWidget {
                       const SizedBox(height: 4),
                       // Issue #28: the real numeric values, readable at a glance
                       // with units — pack voltage and signed current sit on their
-                      // own line (SOC % is the big number in the bar above). The
-                      // status dot/word keeps the charge direction.
-                      StatusLine(
-                        color: dir.color,
-                        label: dir.label,
+                      // own line (SOC % is the big number in the bar above).
+                      // #61 / #64 / #65: the ONE status line — its dot is the
+                      // live dot (green blinking per cycle, amber stale, red
+                      // silent), its text the charge direction while data
+                      // flows and "No data · <why>" / "Offline · last seen …"
+                      // when it does not; the figures then read "—".
+                      LiveStatusLine(
+                        conn: conn,
+                        dir: dir,
+                        offline: offline,
+                        sampling: () => manager.isSampling,
+                        nextDueMs: () => manager.nextSampleDueMs,
                         dotSize: 8,
                         gap: 6,
                         fontSize: 12,
-                        trailing: [
-                          Text(fV(s.packVoltage),
+                        trailing: (hasData) => [
+                          Text(hasData ? fV(s.packVoltage) : '—',
                               style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 14,
                                   fontWeight: FontWeight.w600)),
                           const Text('  ·  ',
                               style: TextStyle(color: Colors.white38)),
-                          Text(fSignedA(conn.signedCurrent),
+                          Text(hasData ? fSignedA(conn.signedCurrent) : '—',
                               style: TextStyle(
-                                  color: dir.color,
+                                  color: hasData ? dir.color : Colors.white38,
                                   fontSize: 14,
                                   fontWeight: FontWeight.w600)),
                         ],
@@ -1780,9 +1770,10 @@ class _SettingsPageState extends State<SettingsPage> {
 }
 
 /// Bottom panel: one combined gauge + totals across favourited batteries.
-class _FleetTotal extends StatelessWidget {
+/// Public so the #65 widget tests can pump it for a hand-built fleet.
+class FleetTotal extends StatelessWidget {
   final BatteryManager manager;
-  const _FleetTotal({required this.manager});
+  const FleetTotal({super.key, required this.manager});
 
   @override
   Widget build(BuildContext context) {
@@ -1797,8 +1788,11 @@ class _FleetTotal extends StatelessWidget {
     final color =
         HealthPalette.socOrFault((soc ?? 0).toDouble(), fault: alarm);
     // Direction word ("Charging"/"Idle · no load"/"Discharging") still comes
-    // from the net-power state; only the COLOUR is now SOC-graded.
-    final label = ChargeStateStyle.of(manager.fleetState).label;
+    // from the net-power state; only the COLOUR is now SOC-graded. #65: the
+    // state is derived from STREAMING members only — with none, "No data".
+    final fleetState = manager.fleetStreamingState;
+    final label =
+        fleetState == null ? 'No data' : ChargeStateStyle.of(fleetState).label;
     final net = manager.netPowerW;
     final netText = net == 0
         ? '0 W'
@@ -2378,6 +2372,14 @@ class _BatteryGauge extends StatelessWidget {
     final frac = ((soc ?? 0) / 100).clamp(0.0, 1.0);
     final cap = state.fullAh;
     final alarm = conn.alarmActive;
+    // #65: same rule as the card — no charge state / current / voltage while
+    // there is no data behind them (silent, waiting, offline).
+    final offline = conn.isOffline && !manager.isSampling;
+    final noData = offline ||
+        !liveStatusOf(conn,
+                sampling: manager.isSampling,
+                nextDueMs: manager.nextSampleDueMs)
+            .hasData;
     // Issue #13: SOC colour is graded; an active fault overrides to red.
     final health = HealthPalette.socOrFault((soc ?? 0).toDouble(), fault: alarm);
     final track = HealthPalette.track(Theme.of(context).brightness);
@@ -2401,14 +2403,6 @@ class _BatteryGauge extends StatelessWidget {
                 Text(cap == null ? '— Ah' : '${cap.toStringAsFixed(0)} Ah',
                     style: const TextStyle(color: Colors.white70)),
               ],
-            ),
-            const SizedBox(height: 4),
-            // #61: the live-update indicator, unmistakable on the header.
-            LiveIndicator(
-              conn: conn,
-              sampling: () => manager.isSampling,
-              nextDueMs: () => manager.nextSampleDueMs,
-              fontSize: 13,
             ),
             const SizedBox(height: 12),
             // The three prominent values, side by side: big SOC % (health
@@ -2443,11 +2437,11 @@ class _BatteryGauge extends StatelessWidget {
                       const Text('Current',
                           style: TextStyle(fontSize: 12, color: Colors.white54)),
                       Text(
-                        fSignedA(conn.signedCurrent),
+                        noData ? '—' : fSignedA(conn.signedCurrent),
                         style: TextStyle(
                             fontSize: 26,
                             fontWeight: FontWeight.bold,
-                            color: dir.color),
+                            color: noData ? Colors.white38 : dir.color),
                       ),
                       const SizedBox(height: 10),
                       const Text('Remaining',
@@ -2495,14 +2489,23 @@ class _BatteryGauge extends StatelessWidget {
               policy: policy,
             ),
             const SizedBox(height: 12),
-            // Secondary details (demoted): voltage, power and status.
-            StatusLine(
-              color: dir.color,
-              label: dir.label,
+            // Secondary details (demoted): voltage, power and status — the
+            // ONE status line (#61 / #64 / #65): live dot, charge direction
+            // while streaming, "No data · <why>" otherwise, figures "—".
+            LiveStatusLine(
+              conn: conn,
+              dir: dir,
+              offline: offline,
+              sampling: () => manager.isSampling,
+              nextDueMs: () => manager.nextSampleDueMs,
               dotSize: 10,
               gap: 8,
-              trailing: [
-                Text('${fV(state.packVoltage)}  ·  ${fW(state.power)}',
+              fontSize: 13,
+              trailing: (hasData) => [
+                Text(
+                    hasData
+                        ? '${fV(state.packVoltage)}  ·  ${fW(state.power)}'
+                        : '—  ·  —',
                     style: const TextStyle(color: Colors.white54, fontSize: 13)),
               ],
             ),
