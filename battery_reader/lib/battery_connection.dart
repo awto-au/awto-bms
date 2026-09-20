@@ -10,6 +10,7 @@ import 'ble_transport.dart';
 import 'demo_source.dart';
 import 'diagnostics.dart';
 import 'fmt.dart' show hexOf;
+import 'ota_update.dart';
 import 'raw_log.dart';
 
 enum ConnState { idle, scanning, connecting, connected, disconnected }
@@ -764,9 +765,92 @@ class BatteryConnection {
     if (link == null || connState != ConnState.connected) {
       throw StateError('Not connected — $label was not sent');
     }
+    // #41: while a firmware update runs, ONLY the session's own frames
+    // (labelled "OTA: …") go out — any other write could corrupt the flash.
+    final ota = OtaLock.refuseReason;
+    if (ota != null && !label.startsWith('OTA:')) {
+      AppLog.instance.record(_source, 'refused "$label": $ota');
+      throw StateError('$ota ($label was not sent)');
+    }
     // Issue #19: also record every command we send to the raw log (TX line).
     RawLogger.instance.logTx(state.serial ?? '', label, bytes);
     await link.write(bytes);
+  }
+
+  // --- #41 firmware update (OTA) -------------------------------------------
+
+  /// The running firmware-update session on this row, or null.
+  OtaSession? otaSession;
+
+  /// True while a firmware update is in flight on THIS battery.
+  bool get otaInProgress => otaSession?.inProgress ?? false;
+
+  /// #41: the negotiated ATT MTU of the live link (null: unknown / demo).
+  int? get linkMtu => _link?.mtu;
+
+  /// #41: flash [image] to this battery. The caller MUST have run
+  /// [otaPreflight] and the typed confirmation first — this method only
+  /// refuses the mechanical impossibilities (not connected, another update
+  /// running, demo). For the transfer it: marks the parser OTA-active so the
+  /// three reply frames decode, takes the app-wide [OtaLock] (every other
+  /// write, Pause / Exit, background sampling and the not-streaming probe
+  /// are refused meanwhile), fails the session on a link drop, and logs
+  /// every step to Diagnostics + the raw log. The session's own frames are
+  /// the ONLY writes that pass [_send] while it runs.
+  Future<OtaResult> runFirmwareUpdate(
+    OtaImage image, {
+    Duration resendTimeout = OtaProtocol.resendTimeout,
+    Duration recallTimeout = OtaProtocol.recallTimeout,
+    Duration finishDelay = OtaProtocol.finishDelay,
+    Duration endDelay = OtaProtocol.endDelay,
+  }) async {
+    if (connState != ConnState.connected) {
+      throw StateError('Not connected — firmware update not started');
+    }
+    if (OtaLock.inProgress) {
+      throw StateError(OtaLock.refuseReason!);
+    }
+    if (_demo != null) {
+      throw StateError('Firmware update is not available on a demo battery');
+    }
+    final serial = state.serial ?? '?';
+    final mtu = OtaProtocol.effectiveMtu(linkMtu);
+    final session = OtaSession(
+      image: image,
+      mtu: mtu,
+      serial: serial,
+      send: (bytes, label) => _send(bytes, label: label),
+      replies: events,
+      resendTimeout: resendTimeout,
+      recallTimeout: recallTimeout,
+      finishDelay: finishDelay,
+      endDelay: endDelay,
+      log: (line) {
+        AppLog.instance.record('OTA $serial', line);
+        RawLogger.instance.logEvent(serial, 'OTA', line);
+      },
+    );
+    otaSession = session;
+    OtaLock.active = session;
+    parser.otaActive = true;
+    AppLog.instance.record(
+        _source,
+        '#41 firmware update starting on $serial: link mtu '
+        '${linkMtu ?? 'unknown'} -> effective $mtu');
+    final dropSub = connection.listen((s) {
+      if (s != ConnState.connected) session.linkLost('link state ${s.name}');
+    });
+    try {
+      return await session.run();
+    } finally {
+      await dropSub.cancel();
+      parser.otaActive = false;
+      if (OtaLock.active == session) OtaLock.active = null;
+      AppLog.instance.record(
+          _source,
+          '#41 firmware update on $serial ended: ${session.stage.name}'
+          '${session.progress.detail.isEmpty ? '' : ' — ${session.progress.detail}'}');
+    }
   }
 
   /// M2: why the NON-gate writes (sleep, capacity) are refused right now, or
@@ -1054,7 +1138,8 @@ class BatteryConnection {
       e is! VersionEvent &&
       e is! SleepEvent &&
       e is! SettingRespondEvent &&
-      e is! GateSetEvent;
+      e is! GateSetEvent &&
+      !isOtaEvent(e); // #41: OTA replies answer the session, not the stream
 
   /// The not-streaming watchdog, driven by the UI tick (~300 ms): a link
   /// that is connected, silent for [notStreamingMs] and not probed in the
@@ -1063,6 +1148,8 @@ class BatteryConnection {
     if (connState != ConnState.connected || !notStreaming || _probe != null) {
       return;
     }
+    // #41: the probe is a write (AT+V) — never during a firmware update.
+    if (OtaLock.inProgress) return;
     final nowMs = now().millisecondsSinceEpoch;
     final last = lastProbeMs;
     if (last != null && nowMs - last < probeRepeatMs) return;
@@ -1377,6 +1464,11 @@ class BatteryConnection {
         'ack type=$type ($typeName)',
       GateSetEvent() => '${s.gateAck}',
       OtherEvent() => 'unknown bytes=${_otherBytes()}',
+      OtaRecallEvent() => 'BMS entered update mode (FF 01 B1 02 EF)',
+      OtaAckEvent(:final chunk, :final status, :final checksum) =>
+        'chunk=$chunk status=0x${status.toRadixString(16)} '
+            'sum=0x${checksum.toRadixString(16)}',
+      OtaSuccessEvent() => 'BMS accepted the image (AA BB 01 02 EF)',
       WarningEvent(:final category) => category == 'temperature'
           ? '${_warnListFor(category)} overTempLatched=${s.overTempLatched}'
           : '${_warnListFor(category)}',

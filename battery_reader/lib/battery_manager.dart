@@ -20,6 +20,7 @@ import 'bms_families.dart';
 import 'demo_source.dart';
 import 'diagnostics.dart';
 import 'intervals.dart' show sampleGapMs;
+import 'ota_update.dart' show OtaLock;
 import 'sample_scheduler.dart';
 
 export 'sample_scheduler.dart' show SampleScheduler;
@@ -297,6 +298,12 @@ class BatteryManager {
   /// backgrounding with background monitoring OFF all drive, so another BLE
   /// client (the PC tools) can take the packs.
   Future<void> pauseLive() async {
+    // #41: never release the packs mid-flash — that drops the OTA link.
+    final ota = OtaLock.refuseReason;
+    if (ota != null) {
+      AppLog.instance.record(_source, 'pauseLive refused: $ota');
+      return;
+    }
     _released = true;
     stopLive();
     _stopSampling(); // #53: a pause also ends background sampling
@@ -541,6 +548,12 @@ class BatteryManager {
   /// disconnect — no alarm), widen the logger's gap rule and arm the first
   /// sample one interval from now.
   Future<void> enterSampling(Duration interval) async {
+    // #41: background sampling would disconnect every pack mid-flash.
+    final ota = OtaLock.refuseReason;
+    if (ota != null) {
+      AppLog.instance.record(_source, 'enterSampling refused: $ota');
+      return;
+    }
     final ms = interval.inMilliseconds;
     if (ms <= 0) return exitSampling();
     if (_sampling) {

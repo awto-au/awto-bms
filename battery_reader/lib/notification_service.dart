@@ -79,6 +79,10 @@ class AlertNotificationService {
   bool _initDone = false;
   bool _serviceRunning = false;
 
+  /// #41: true while the monitoring foreground service (with its wake lock)
+  /// is confirmed running — the OTA pre-flight "device will stay awake" gate.
+  bool get serviceRunning => _serviceRunning;
+
   /// #52: the notification text the running service was last given. The
   /// 300 ms tick calls [updateForegroundService] continuously; the service
   /// notification is re-posted ONLY when this changes (logcat showed the

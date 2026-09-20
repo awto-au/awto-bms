@@ -395,6 +395,13 @@ class _Cmd {
   static const _Begin historyBegin1 = (0xFE, 0xC9);
   static const _Begin historyBegin2 = (0xBD, 0x8A);
   static const historyEnd = [0xEA, 0x4F, 0x80, 0xDE];
+  // #41 OTA replies (BatteryCMD.java:30-31, 67-69). Only consulted while
+  // [BatteryParser.otaActive].
+  static const _Begin otaRecallBegin = (0xFF, 0x01); // CMD_UPDATE_RECALL_1
+  static const otaRecallTail = [0xB1, 0x02, 0xEF]; // CMD_UPDATE_RECALL_2
+  static const _Begin otaAckBegin = (0x01, 0x01); // CMD_ACK_HEAD
+  static const _Begin otaSuccessBegin = (0xAA, 0xBB); // CMD_UPDATE_SUCCESS_1
+  static const otaSuccessTail = [0x01, 0x02, 0xEF]; // CMD_UPDATE_SUCCESS_2
 }
 
 /// SETTING_RESPOND (AB BA) type byte -> what was set, as the vendor app and
@@ -675,6 +682,49 @@ class OtherEvent extends BatteryEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Firmware-update (OTA) replies — #41. Decoded ONLY while
+// [BatteryParser.otaActive] is set by an [OtaSession]; outside an update these
+// byte patterns stay unrecognised exactly as before, so the telemetry decoder
+// is untouched. The full derived spec is at the top of ota_update.dart.
+// ---------------------------------------------------------------------------
+
+/// CMD_UPDATE_RECALL `FF 01 B1 02 EF` (BatteryCMD.java:67-68; handled at
+/// BatteryManager.java:825-834): the BMS's "go" after CMD_BEGIN_UPDATE. Also
+/// restarts the transfer from chunk 0 if it arrives mid-transfer.
+class OtaRecallEvent extends BatteryEvent {
+  const OtaRecallEvent();
+  @override
+  String get label => 'OTA recall';
+}
+
+/// Per-chunk ACK `01 01 <numHi> <numLo> <status> <sum>` (BatteryCMD.java:69
+/// CMD_ACK_HEAD; BatteryManager.java:835-862): 2-byte head + 4 bytes. The
+/// app compares the BIG-endian chunk number ([chunk], ByteUtils:45-47
+/// byteToIntHigh) and [checksum] against getRecallSum (BM:982-984);
+/// [status] (the 3rd byte) is read but NEVER compared by the vendor.
+class OtaAckEvent extends BatteryEvent {
+  final int chunk;
+  final int status;
+  final int checksum;
+  const OtaAckEvent(this.chunk, this.status, this.checksum);
+  @override
+  String get label => 'OTA chunk ack';
+}
+
+/// CMD_UPDATE_SUCCESS `AA BB 01 02 EF` (BatteryCMD.java:30-31; handled at
+/// BatteryManager.java:864-873): the BMS accepted the whole image.
+class OtaSuccessEvent extends BatteryEvent {
+  const OtaSuccessEvent();
+  @override
+  String get label => 'OTA success';
+}
+
+/// True for the three firmware-update replies — answers to the OTA session,
+/// never part of the telemetry stream.
+bool isOtaEvent(BatteryEvent e) =>
+    e is OtaRecallEvent || e is OtaAckEvent || e is OtaSuccessEvent;
+
+// ---------------------------------------------------------------------------
 // Streaming parser with byte-level resync.
 //
 // The wire protocol has no length or checksum: each frame is a 2-byte begin
@@ -714,6 +764,13 @@ class BatteryParser {
   /// still an unrecognised byte.
   bool atVersionSent = false;
 
+  /// #41: set by an [OtaSession] for the duration of a firmware update. While
+  /// true the three OTA replies (RECALL `FF 01 B1 02 EF`, per-chunk ACK
+  /// `01 01 + 4`, SUCCESS `AA BB 01 02 EF`) are decoded; while false those
+  /// byte patterns are unrecognised exactly as before, so the telemetry
+  /// decoder is unchanged outside an update. Cleared by [reset] (a new link).
+  bool otaActive = false;
+
   BatteryParser({
     BatteryState? state,
     this.onEvent,
@@ -729,6 +786,7 @@ class BatteryParser {
   void reset() {
     _buf.clear();
     atVersionSent = false;
+    otaActive = false;
   }
 
   /// The AT bridge's status/return-code character for `AT+V` (#60).
@@ -779,6 +837,10 @@ class BatteryParser {
         _Cmd.historyBegin2,
       };
 
+  /// #41: the OTA reply begin sentinels, recognised ONLY while [otaActive].
+  Set<(int, int)> get otaBegins =>
+      {_Cmd.otaRecallBegin, _Cmd.otaAckBegin, _Cmd.otaSuccessBegin};
+
   void _drain() {
     while (_buf.length >= 2) {
       final consumed = _tryFrameAt0();
@@ -820,6 +882,17 @@ class BatteryParser {
   int _tryFrameAt0() {
     final begin = (_buf[0] & 0xff, _buf[1] & 0xff);
 
+    // #41: OTA replies, only during a firmware update (see [otaActive]).
+    if (otaActive) {
+      if (begin == _Cmd.otaRecallBegin) {
+        return _parseOtaTail(_Cmd.otaRecallTail, const OtaRecallEvent());
+      }
+      if (begin == _Cmd.otaSuccessBegin) {
+        return _parseOtaTail(_Cmd.otaSuccessTail, const OtaSuccessEvent());
+      }
+      if (begin == _Cmd.otaAckBegin) return _parseOtaAck();
+    }
+
     // Fixed-length frames: [begin(2)] + payloadLen (which already includes the
     // 2 end bytes) — one table lookup (L4).
     final fixed = _fixed[begin];
@@ -841,6 +914,32 @@ class BatteryParser {
     }
 
     return -1; // unknown begin
+  }
+
+  /// #41: RECALL / SUCCESS — a 2-byte head then a fixed 3-byte tail that the
+  /// vendor reads and byte-compares whole (BatteryManager.java:828, 867). A
+  /// mismatching tail is a resync (-1), never a decoded frame.
+  int _parseOtaTail(List<int> tail, BatteryEvent event) {
+    final total = 2 + tail.length;
+    if (_buf.length < total) return 0;
+    if (!_match(2, tail)) return -1;
+    lastFrameBytes = _buf.sublist(0, total);
+    _emit(event);
+    return total;
+  }
+
+  /// #41: per-chunk ACK — `01 01` then exactly 4 bytes
+  /// (BatteryManager.java:836-837 `mIO.read(bArr31, 0, 4)`): chunk number
+  /// (u16 BIG-endian), a status byte the vendor never checks, and the
+  /// checksum. There is no end sentinel, so nothing here can be validated;
+  /// the session does the number/checksum comparison.
+  int _parseOtaAck() {
+    const total = 6;
+    if (_buf.length < total) return 0;
+    lastFrameBytes = _buf.sublist(0, total);
+    final chunk = ((_buf[2] & 0xff) << 8) | (_buf[3] & 0xff);
+    _emit(OtaAckEvent(chunk, _buf[4] & 0xff, _buf[5] & 0xff));
+    return total;
   }
 
   /// payloadLen = bytes after the 2 begin bytes, INCLUDING the 2 end bytes.

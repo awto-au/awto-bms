@@ -74,17 +74,27 @@ class FakeLink implements BleLink {
   /// Set once [disconnect] has been called on this link.
   bool disconnected = false;
 
+  /// #41: the MTU this fake reports (null = unknown, like a link that never
+  /// negotiated one).
+  @override
+  int? mtu;
+
   @override
   Stream<BleLinkState> get state => _state.stream;
 
   /// Simulate a drop signalled by the transport.
   void dropLink() => _state.add(BleLinkState.disconnected);
 
+  /// #41: the connection's inbound-bytes callback, so a test can play BMS
+  /// replies through the REAL parser (`link.onData!(bytes)`).
+  void Function(List<int> data)? onData;
+
   @override
   Future<void> discoverAndSubscribe(void Function(List<int> data) onData) async {
     if (transport.failDiscover) {
       throw StateError('Failed to get services: Unreachable');
     }
+    this.onData = onData;
   }
 
   @override

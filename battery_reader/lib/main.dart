@@ -32,6 +32,8 @@ import 'live_indicator.dart';
 import 'metrics.dart';
 import 'monitoring_policy.dart';
 import 'notification_service.dart';
+import 'ota_update.dart' show OtaLock;
+import 'ota_update_page.dart';
 import 'raw_log.dart';
 import 'settings_store.dart';
 import 'sparkline.dart';
@@ -440,7 +442,10 @@ class _BatteryListPageState extends State<BatteryListPage>
     nav.push(
       MaterialPageRoute(
         builder: (_) => BatteryDetailPage(
-            conn: conn!, manager: _manager, aliases: _aliases),
+            conn: conn!,
+            manager: _manager,
+            aliases: _aliases,
+            keepAwake: () => _notifications.serviceRunning),
       ),
     );
   }
@@ -484,8 +489,26 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// release the packs (disconnect, stop scanning / reconnecting, stop the
   /// lifetime-totals timer) when it must not run; scan + reconnect when it may.
   /// Demo mode has no BLE to release. Idempotent.
+  /// #41: true (and records + toasts the refusal) while a firmware update is
+  /// in progress. Pause, Exit, Background-monitoring changes, the Demo
+  /// switch and the BLE reconcile (backgrounding / sampling) all go through
+  /// this so nothing can drop the OTA link.
+  bool _refuseDuringOta(String what) {
+    final why = OtaLock.refuseReason;
+    if (why == null) return false;
+    AppLog.instance.record('BatteryListPage', '$what refused: $why');
+    if (mounted) showToast(context, '$what is disabled: $why');
+    return true;
+  }
+
   void _reconcileBle() {
     if (_demoMode) return;
+    // #41: never release / re-shape the BLE loop mid-flash.
+    final ota = OtaLock.refuseReason;
+    if (ota != null) {
+      AppLog.instance.record('BatteryListPage', 'BLE reconcile skipped: $ota');
+      return;
+    }
     // #53: backgrounded with a sample interval -> periodic sampling instead
     // of held links. Foreground (or Continuous) -> the continuous loop,
     // immediately.
@@ -523,6 +546,7 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// service now and prevents any start; the app then monitors only while in
   /// the foreground. ON clears a previous user stop and lets the tick start it.
   void _setBackgroundMonitoring(bool enabled) {
+    if (_refuseDuringOta('Background monitoring change')) return;
     setState(() => _policy.setBackgroundMonitoring(enabled));
     _settings.saveBackgroundMonitoring(enabled);
     if (!enabled) _notifications.stopForegroundService();
@@ -536,6 +560,9 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// on, or relaunches the app. Alerts stay enabled for when it resumes.
   void _setMonitoringPaused(bool paused) {
     if (paused == _policy.userStopped) return;
+    if (_refuseDuringOta(paused ? 'Pause monitoring' : 'Resume monitoring')) {
+      return;
+    }
     setState(() {
       if (paused) {
         _policy.stopByUser();
@@ -580,6 +607,9 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// process back. A brief confirm only if a BMS write is in flight.
   Future<void> _exitApp({bool confirmIfWriting = true}) async {
     if (_exiting) return;
+    // #41: Exit is DISABLED (no "exit anyway") while a firmware update runs —
+    // killing the app mid-flash can brick the BMS.
+    if (_refuseDuringOta('Exit')) return;
     if (confirmIfWriting && BusyWrites.inFlight > 0 && mounted) {
       final ok = await showDialog<bool>(
         context: context,
@@ -638,6 +668,7 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// choice so it survives a restart.
   void _setDemoMode(bool demo) {
     if (demo == _demoMode) return;
+    if (_refuseDuringOta('Demo / Live switch')) return;
     setState(() {
       _demoMode = demo;
       if (demo) {
@@ -709,8 +740,11 @@ class _BatteryListPageState extends State<BatteryListPage>
   void _openDetail(BatteryConnection conn) {
     Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) =>
-            BatteryDetailPage(conn: conn, manager: _manager, aliases: _aliases),
+        builder: (_) => BatteryDetailPage(
+            conn: conn,
+            manager: _manager,
+            aliases: _aliases,
+            keepAwake: () => _notifications.serviceRunning),
       ),
     );
   }
@@ -2020,12 +2054,19 @@ class BatteryDetailPage extends StatefulWidget {
   /// #44: shared per-battery custom names, read for the app-bar title and
   /// written by the rename dialog.
   final AliasStore aliases;
+
+  /// #41: is the Android foreground service (wake lock) running? Feeds the
+  /// firmware-update "device will stay awake" gate. Defaults to false.
+  final bool Function() keepAwake;
   const BatteryDetailPage({
     super.key,
     required this.conn,
     required this.manager,
     required this.aliases,
+    this.keepAwake = _neverAwake,
   });
+
+  static bool _neverAwake() => false;
   @override
   State<BatteryDetailPage> createState() => _BatteryDetailPageState();
 }
@@ -2286,6 +2327,14 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
               busy: _busy,
               onChanged: _changed,
               fleetSize: widget.manager.fleetMembers.length, // #62 bank note
+            ),
+            // #41: Advanced — the firmware update lives here, never on the
+            // main list.
+            _AdvancedSection(
+              conn: widget.conn,
+              busy: _busy,
+              keepAwake: widget.keepAwake,
+              onChanged: _changed,
             ),
             const SizedBox(height: 40),
           ],
@@ -2636,6 +2685,86 @@ class _SparkRow extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// #41: "Advanced" — the firmware update entry. Disabled with the reason
+/// while the pack is not connected, a write is in flight or another update
+/// is running; the page itself runs the full pre-flight / warning / typed
+/// confirmation flow before anything is sent.
+class _AdvancedSection extends StatelessWidget {
+  final BatteryConnection conn;
+  final BusyWrites busy;
+  final bool Function() keepAwake;
+  final VoidCallback onChanged;
+  const _AdvancedSection({
+    required this.conn,
+    required this.busy,
+    required this.keepAwake,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final s = conn.state;
+    final String? reason;
+    if (conn.connState != ConnState.connected) {
+      reason = 'Not connected';
+    } else if (s.serial == null || s.serial!.isEmpty) {
+      reason = 'Serial unknown';
+    } else if (OtaLock.inProgress) {
+      reason = OtaLock.refuseReason;
+    } else if (busy.any) {
+      reason = 'Write in progress (${busy.current})';
+    } else {
+      reason = null;
+    }
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.warning_amber_outlined, size: 18),
+                const SizedBox(width: 8),
+                Text('Advanced',
+                    style: Theme.of(context).textTheme.titleMedium),
+              ],
+            ),
+            const Divider(),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.system_update_alt),
+              title: const Text('Firmware update'),
+              subtitle: Text(reason ??
+                  'Flash a vendor .bin to this BMS (current version: '
+                      '${s.firmwareVersion ?? 'unknown'}). A failed update '
+                      'can permanently disable the battery.'),
+              enabled: reason == null,
+              trailing: const Icon(Icons.chevron_right),
+              onTap: reason != null
+                  ? null
+                  : () async {
+                      await Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => FirmwareUpdatePage(
+                            conn: conn,
+                            busy: busy,
+                            keepAwake: () => otaKeepAwakeOk(keepAwake()),
+                            keepAwakeDetail: () =>
+                                otaKeepAwakeDetail(keepAwake()),
+                          ),
+                        ),
+                      );
+                      onChanged();
+                    },
+            ),
+          ],
+        ),
       ),
     );
   }

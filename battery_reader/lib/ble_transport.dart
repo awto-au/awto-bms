@@ -75,6 +75,11 @@ abstract class BleLink {
   /// it, matching the original flutter_blue_plus behaviour).
   Future<void> write(List<int> bytes);
 
+  /// #41: the negotiated ATT MTU as the platform reports it, or null when
+  /// unknown. The OTA chunker derives its payload size from this exactly as
+  /// the vendor does (`min(mtu, 200)`, 20 when unknown — see ota_update.dart).
+  int? get mtu;
+
   Future<void> disconnect();
 }
 
@@ -162,6 +167,10 @@ class _FbpLink implements BleLink {
 
   @override
   String get deviceId => _device.remoteId.str;
+
+  /// #41: flutter_blue_plus caches the negotiated MTU (0 = unknown).
+  @override
+  int? get mtu => _device.mtuNow > 0 ? _device.mtuNow : null;
 
   @override
   Stream<BleLinkState> get state => _device.connectionState.map((s) =>
@@ -296,18 +305,22 @@ class UniversalBleTransport implements BleTransport {
     await ub.UniversalBle.connect(deviceId, connectionTimeout: timeout);
     // Best-effort MTU bump (matches the FBP mtu: 512 request); the platform
     // may not support it — recorded, never fatal.
-    await guard<int>('request mtu $mtu on $deviceId',
+    final negotiated = await guard<int>('request mtu $mtu on $deviceId',
         () => ub.UniversalBle.requestMtu(deviceId, mtu),
         source: _source);
-    return _UniversalBleLink(deviceId);
+    return _UniversalBleLink(deviceId, negotiated);
   }
 }
 
 class _UniversalBleLink implements BleLink {
-  _UniversalBleLink(this.deviceId);
+  _UniversalBleLink(this.deviceId, this.mtu);
 
   @override
   final String deviceId;
+
+  /// #41: what requestMtu returned (null when the platform refused).
+  @override
+  final int? mtu;
 
   StreamSubscription<Uint8List>? _valueSub;
 
