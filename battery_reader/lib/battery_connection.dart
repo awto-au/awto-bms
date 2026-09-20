@@ -20,6 +20,12 @@ enum ConnState { idle, scanning, connecting, connected, disconnected }
 /// whose BMS MCU is not running still connects, answers AT+V with ONLY the
 /// bridge's single 0x30 status byte (no AC 9A version frame) and ignores
 /// every framed command — nothing over Bluetooth wakes it.
+///
+/// #63: that 0x30 is INTERMITTENT, so the same pack is often classified
+/// [noResponse] instead of [dormant]. Both mean "BMS not running" to the
+/// user ([BatteryConnection.bmsNotRunning]) and get the same guidance; the
+/// finer verdict is a detail line ([BatteryConnection.probeDetail]) and the
+/// Diagnostics `stream …` tag.
 enum StreamClass {
   /// No probe yet on this link.
   unknown,
@@ -35,7 +41,8 @@ enum StreamClass {
   /// awake and merely not streaming (CMD_BEGIN is re-sent).
   awakeNotStreaming,
 
-  /// Nothing came back within the probe window (not even the 0x30).
+  /// Nothing came back within the probe window (not even the 0x30). Treated
+  /// like [dormant] for all user-facing guidance (#63).
   noResponse,
 }
 
@@ -282,15 +289,17 @@ class BatteryConnection {
   /// the #62 probe result [cls]. Always starts with "Connected but not
   /// streaming" (Diagnostics keys on that prefix). Never says "asleep": the
   /// BMS's standby flag is a stored setting, not a state we can observe.
+  /// #63: dormant and no-response both read "BMS not running", the finer
+  /// verdict follows as the detail.
   static String reasonNotStreaming(int silenceMs,
       [StreamClass cls = StreamClass.unknown]) {
     final silent = 'no telemetry for ${(silenceMs / 1000).round()} s';
     return switch (cls) {
-      StreamClass.dormant => 'Connected but not streaming — $dormantState',
+      StreamClass.dormant || StreamClass.noResponse =>
+        'Connected but not streaming — $bmsNotRunningState: '
+            '${probeDetail(cls)}, $silent',
       StreamClass.awakeNotStreaming =>
         'Connected but not streaming — $awakeNotStreamingState ($silent)',
-      StreamClass.noResponse =>
-        'Connected but not streaming — $noResponseState ($silent)',
       _ => 'Connected but not streaming — $silent (checking whether the '
           'BMS is in Bluetooth standby)',
     };
@@ -1006,13 +1015,33 @@ class BatteryConnection {
   /// True while an AT+V probe is running.
   bool get probeInFlight => _probe != null;
 
-  // #62 texts (pinned by tests).
-  static const String dormantState =
-      'BMS dormant (bridge answers, no telemetry)';
-  static const String awakeNotStreamingState = 'BMS awake, not streaming';
+  // #62 / #63 texts (pinned by tests). The headline for a pack whose BMS is
+  // not running is the same whether or not the bridge's intermittent 0x30
+  // arrived; the finer verdict is a detail.
+  static const String bmsNotRunningState = 'BMS not running';
+  static const String dormantDetail = 'bridge answered (0x30)';
   static const String noResponseState = 'no reply to AT+V';
+  static const String awakeNotStreamingState = 'BMS awake, not streaming';
 
-  /// What to tell the user about a dormant pack. Recovery is physical.
+  /// #63: connected, silent, and the probe got neither a version frame nor
+  /// telemetry — with ([StreamClass.dormant]) or without
+  /// ([StreamClass.noResponse]) the bridge's 0x30. Every user-facing branch
+  /// that shows the dormant guidance keys on this, not on `dormant` alone.
+  bool get bmsNotRunning =>
+      streamClass == StreamClass.dormant ||
+      streamClass == StreamClass.noResponse;
+
+  /// The finer probe verdict as a short detail ("bridge answered (0x30)" vs
+  /// "no reply to AT+V"), for the secondary line under the headline.
+  static String probeDetail(StreamClass cls) => switch (cls) {
+        StreamClass.dormant => dormantDetail,
+        StreamClass.noResponse => noResponseState,
+        StreamClass.awakeNotStreaming => 'version frame received',
+        _ => cls.name,
+      };
+
+  /// What to tell the user about a pack whose BMS is not running. Recovery
+  /// is physical.
   static const String dormantMessage =
       'BMS is not running — it entered Bluetooth standby with its output off '
       'and cannot be woken over Bluetooth. Isolate this pack from the bank '

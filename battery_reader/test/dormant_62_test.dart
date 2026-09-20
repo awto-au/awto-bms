@@ -83,11 +83,14 @@ void main() {
       expect(c.state.unrecognisedBytes, 0, reason: '#60: a status byte');
       await probeWindow();
       expect(c.streamClass, StreamClass.dormant);
+      expect(c.bmsNotRunning, isTrue);
       expect(c.probeInFlight, isFalse);
       expect(c.gateControlsDisabledReason,
           BatteryConnection.reasonNotStreaming(10000, StreamClass.dormant));
       expect(c.gateControlsDisabledReason,
-          contains(BatteryConnection.dormantState));
+          contains(BatteryConnection.bmsNotRunningState));
+      expect(c.gateControlsDisabledReason,
+          contains(BatteryConnection.dormantDetail));
       expect(c.gateStatusSummary(), contains('stream dormant'));
       expect(AppLog.instance.dump(), contains('AT+V probe: dormant'));
       // Nothing else was sent: the app never forces the pack on by itself.
@@ -102,11 +105,14 @@ void main() {
       await settle();
       expect(c.state.firmwareVersion, '1.0.1');
       expect(c.streamClass, StreamClass.awakeNotStreaming);
+      expect(c.bmsNotRunning, isFalse, reason: 'awake is the milder state');
       expect(t.writes, [BatteryCommands.getVersion, BatteryCommands.begin]);
       expect(c.gateControlsDisabledReason,
           contains(BatteryConnection.awakeNotStreamingState));
       expect(c.gateControlsDisabledReason,
           contains('Connected but not streaming'));
+      expect(c.gateControlsDisabledReason,
+          isNot(contains(BatteryConnection.bmsNotRunningState)));
     });
 
     test('telemetry during the probe -> streaming (no CMD_BEGIN)', () async {
@@ -153,12 +159,40 @@ void main() {
       expect(c.streamClass, StreamClass.streaming);
     });
 
-    test('nothing at all within the window -> no response', () async {
+    test('nothing at all within the window -> no response, which reads '
+        '"BMS not running" like dormant (#63: the 0x30 is intermittent)',
+        () async {
       final (c, _, _) = await silentLink();
       final r = await c.probeStreaming();
       expect(r, StreamClass.noResponse);
+      expect(c.bmsNotRunning, isTrue);
+      expect(c.gateControlsDisabledReason,
+          BatteryConnection.reasonNotStreaming(10000, StreamClass.noResponse));
+      // Same headline as dormant; the finer verdict is the detail.
+      expect(c.gateControlsDisabledReason,
+          startsWith('Connected but not streaming — '
+              '${BatteryConnection.bmsNotRunningState}: '));
       expect(c.gateControlsDisabledReason,
           contains(BatteryConnection.noResponseState));
+      expect(c.gateControlsDisabledReason,
+          isNot(contains(BatteryConnection.dormantDetail)));
+      expect(c.gateStatusSummary(), contains('stream noResponse'),
+          reason: 'Diagnostics keeps the finer verdict');
+      expect(AppLog.instance.dump(), contains('AT+V probe: noResponse'));
+    });
+
+    test('#63: probeDetail tells the two "not running" verdicts apart', () {
+      expect(BatteryConnection.probeDetail(StreamClass.dormant),
+          BatteryConnection.dormantDetail);
+      expect(BatteryConnection.probeDetail(StreamClass.noResponse),
+          BatteryConnection.noResponseState);
+      expect(BatteryConnection.probeDetail(StreamClass.awakeNotStreaming),
+          'version frame received');
+      expect(BatteryConnection.probeDetail(StreamClass.unknown), 'unknown');
+      expect(
+          BatteryConnection.reasonNotStreaming(12000, StreamClass.dormant),
+          isNot(BatteryConnection.reasonNotStreaming(
+              12000, StreamClass.noResponse)));
     });
 
     test('a streaming link is never probed; a silent one at most every 30 s',
@@ -293,8 +327,16 @@ void main() {
       expect(notStreamingAdvice(c, tried: 'CMD_BEGIN was sent'),
           contains(BatteryConnection.dormantMessage));
       expect(b.warnMessage!(), contains(BatteryConnection.dormantMessage));
+      // #63: no reply to AT+V gets exactly the dormant advice.
+      c.streamClass = StreamClass.noResponse;
+      expect(notStreamingAdvice(c, tried: 'CMD_BEGIN was sent'),
+          'CMD_BEGIN was sent, but JS-2C14AA is still silent.\n\n'
+          '${BatteryConnection.dormantMessage}');
+      expect(b.warnMessage!(), contains('is still silent'));
       c.streamClass = StreamClass.awakeNotStreaming;
       expect(a.warnMessage!(), contains('it is awake'));
+      expect(a.warnMessage!(),
+          isNot(contains(BatteryConnection.dormantMessage)));
     });
   });
 
@@ -306,10 +348,18 @@ void main() {
           'BMS is not running — it entered Bluetooth standby with its output '
           'off and cannot be woken over Bluetooth. Isolate this pack from the '
           'bank and connect a charger to it alone, or use its reset button.');
-      expect(BatteryConnection.dormantState,
-          'BMS dormant (bridge answers, no telemetry)');
+      expect(BatteryConnection.bmsNotRunningState, 'BMS not running');
+      expect(BatteryConnection.dormantDetail, 'bridge answered (0x30)');
+      expect(BatteryConnection.noResponseState, 'no reply to AT+V');
       expect(BatteryConnection.awakeNotStreamingState,
           'BMS awake, not streaming');
+      expect(BatteryConnection.reasonNotStreaming(10000, StreamClass.dormant),
+          'Connected but not streaming — BMS not running: '
+          'bridge answered (0x30), no telemetry for 10 s');
+      expect(
+          BatteryConnection.reasonNotStreaming(10000, StreamClass.noResponse),
+          'Connected but not streaming — BMS not running: '
+          'no reply to AT+V, no telemetry for 10 s');
     });
 
     test('the parallel-bank warning is exact and appears on every switch-OFF '

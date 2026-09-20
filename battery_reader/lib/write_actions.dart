@@ -536,12 +536,15 @@ WriteAction bothMosAction(BatteryConnection conn,
 // ===========================================================================
 
 /// Why the stream did not resume, for the ladder's warning: the dormant
-/// message when the probe said so, else what to try next.
+/// message when the probe said the BMS is not running (dormant OR no reply,
+/// #63), else what to try next.
 String notStreamingAdvice(BatteryConnection conn, {required String tried}) {
   final serial = serialOf(conn);
+  if (conn.bmsNotRunning) {
+    return '$tried, but $serial is still silent.\n\n'
+        '${BatteryConnection.dormantMessage}';
+  }
   return switch (conn.streamClass) {
-    StreamClass.dormant => '$tried, but $serial is still silent.\n\n'
-        '${BatteryConnection.dormantMessage}',
     StreamClass.awakeNotStreaming => '$tried, but no telemetry followed from '
         '$serial within ${BatteryConnection.resumeTimeout.inSeconds} s. The '
         'BMS answers AT+V, so it is awake: try "Turn switches on", then '

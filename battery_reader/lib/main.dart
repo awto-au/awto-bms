@@ -3066,7 +3066,9 @@ class _ControlsSection extends StatelessWidget {
 /// classification (the AT+V probe's verdict) and offers the user-initiated
 /// recovery ladder — re-send CMD_BEGIN, both switches ON (the vendor's
 /// de-facto wake), reconnect — each reporting whether the stream resumed. A
-/// dormant pack gets the plain physical-recovery message.
+/// pack whose BMS is not running (dormant OR no reply to AT+V — the bridge's
+/// 0x30 is intermittent, #63) gets the red card and the plain
+/// physical-recovery message; the finer verdict is the detail line.
 class _RecoveryLadderCard extends StatelessWidget {
   final BatteryConnection conn;
   final BatteryManager manager;
@@ -3085,15 +3087,13 @@ class _RecoveryLadderCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cls = conn.streamClass;
-    final dormant = cls == StreamClass.dormant;
+    final dormant = conn.bmsNotRunning; // #63: dormant OR no reply
     final silent = conn.silenceMs ?? 0;
     final headline = switch (cls) {
-      StreamClass.dormant =>
-        'Connected, not streaming — ${BatteryConnection.dormantState}',
+      StreamClass.dormant || StreamClass.noResponse =>
+        'Connected, not streaming — ${BatteryConnection.bmsNotRunningState}',
       StreamClass.awakeNotStreaming =>
         'Connected, not streaming — ${BatteryConnection.awakeNotStreamingState}',
-      StreamClass.noResponse =>
-        'Connected, not streaming — ${BatteryConnection.noResponseState}',
       _ => conn.probeInFlight
           ? 'Connected, not streaming — probing the BMS (AT+V)…'
           : 'Connected, not streaming — no telemetry for '
@@ -3139,10 +3139,6 @@ class _RecoveryLadderCard extends StatelessWidget {
                       'The BMS answers AT+V, so it is running; CMD_BEGIN was '
                           're-sent. If the stream does not resume, try the '
                           'steps below.',
-                    StreamClass.noResponse =>
-                      'Nothing came back from the pack — not even the '
-                          "bridge's status byte. Try the steps below; "
-                          'a reconnect usually helps at weak signal.',
                     _ => 'The pack is linked but has sent no telemetry. The '
                         'app probes it with AT+V after 10 s of silence to '
                         'tell a dormant BMS from one that merely stopped '
@@ -3155,7 +3151,7 @@ class _RecoveryLadderCard extends StatelessWidget {
               padding: const EdgeInsets.only(top: 6),
               child: Text(
                 'Frames on this link: ${conn.frameCount}'
-                '${probeAge == null ? '' : ' · last probe ${fmtAgeShort(probeAge)} ago (${cls.name})'}',
+                '${probeAge == null ? '' : ' · last probe ${fmtAgeShort(probeAge)} ago · ${BatteryConnection.probeDetail(cls)}'}',
                 style: const TextStyle(color: Colors.white54, fontSize: 11),
               ),
             ),

@@ -98,10 +98,11 @@ LiveStatus liveStatusFor({
   final silence = silenceMs ?? 0;
   if (silence >= BatteryConnection.notStreamingMs) {
     final why = switch (streamClass) {
-      StreamClass.dormant => BatteryConnection.dormantState,
+      // #63: with or without the bridge's 0x30, the BMS is not running.
+      StreamClass.dormant || StreamClass.noResponse =>
+        BatteryConnection.bmsNotRunningState,
       StreamClass.awakeNotStreaming =>
         BatteryConnection.awakeNotStreamingState,
-      StreamClass.noResponse => BatteryConnection.noResponseState,
       _ => '${fmtAgeShort(silence)} silent',
     };
     return LiveStatus(LiveLevel.silent, 'not streaming · $why');

@@ -46,14 +46,18 @@ void main() {
       expect(BatteryConnection.notStreamingMs, 10000);
     });
 
-    test('silent text carries the #62 verdict', () {
-      expect(at(15000, cls: StreamClass.dormant).text,
-          'not streaming · ${BatteryConnection.dormantState}');
+    test('silent text carries the #62 verdict; #63: no reply reads like '
+        'dormant (same text, level and colour)', () {
+      final dormant = at(15000, cls: StreamClass.dormant);
+      final noReply = at(15000, cls: StreamClass.noResponse);
+      expect(dormant.text, 'not streaming · BMS not running');
+      expect(noReply, dormant);
+      expect(dormant.level, LiveLevel.silent);
+      expect(noReply.color, dormant.color);
       expect(at(15000, cls: StreamClass.awakeNotStreaming).text,
           'not streaming · ${BatteryConnection.awakeNotStreamingState}');
-      expect(at(15000, cls: StreamClass.noResponse).text,
-          'not streaming · ${BatteryConnection.noResponseState}');
-      expect(at(15000, cls: StreamClass.dormant).level, LiveLevel.silent);
+      expect(at(15000, cls: StreamClass.awakeNotStreaming).level,
+          LiveLevel.silent);
     });
 
     test('a fresh link with no frame yet is stale ("waiting"), not live', () {
@@ -141,10 +145,15 @@ void main() {
       expect(liveStatusOf(c).text, 'not streaming · 10 s silent');
       c.streamClass = StreamClass.dormant;
       expect(liveStatusOf(c).text,
-          'not streaming · ${BatteryConnection.dormantState}');
+          'not streaming · ${BatteryConnection.bmsNotRunningState}');
       expect(c.gateStatusSummary(), contains('frames 1'));
       expect(c.gateStatusSummary(), contains('last frame 10 s ago'));
       expect(c.gateStatusSummary(), contains('stream dormant'));
+      // #63: the same indicator text without the 0x30; Diagnostics differs.
+      c.streamClass = StreamClass.noResponse;
+      expect(liveStatusOf(c).text,
+          'not streaming · ${BatteryConnection.bmsNotRunningState}');
+      expect(c.gateStatusSummary(), contains('stream noResponse'));
       // Sampling mode (released): the sample ages instead.
       await c.disconnect();
       final now = clock.millisecondsSinceEpoch;
