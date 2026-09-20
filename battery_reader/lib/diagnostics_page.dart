@@ -30,7 +30,12 @@ String diagnosticsSummary({
 class DiagnosticsPage extends StatefulWidget {
   /// The manager's last scan error text (M13), if any.
   final String? scanError;
-  const DiagnosticsPage({super.key, this.scanError});
+
+  /// #55: one line per battery — connection state, gate-status age and
+  /// whether its controls are available (with the reason when not). Called
+  /// on every build so Refresh shows the live values.
+  final List<String> Function()? batteryStatus;
+  const DiagnosticsPage({super.key, this.scanError, this.batteryStatus});
 
   @override
   State<DiagnosticsPage> createState() => _DiagnosticsPageState();
@@ -48,6 +53,8 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
       'raw log: ${raw.path ?? '(none)'} ${RawLogger.fmtSize(raw.sizeBytes)}'
           ' (${raw.enabled ? 'on' : 'off'}, rotations ${raw.rotations})',
       if (widget.scanError != null) 'scan: ${widget.scanError}',
+      for (final line in widget.batteryStatus?.call() ?? const <String>[])
+        'battery: $line',
       '',
     ].join('\n');
     await Clipboard.setData(ClipboardData(text: header + AppLog.instance.dump()));
@@ -117,6 +124,18 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                     leading: Icon(Icons.bluetooth_disabled, color: scheme.error),
                     title: const Text('Bluetooth scan'),
                     subtitle: Text(widget.scanError!),
+                  ),
+                // #55: why a battery's controls are (un)available right now.
+                for (final line in widget.batteryStatus?.call() ?? const [])
+                  ListTile(
+                    leading: Icon(
+                      line.contains('unavailable')
+                          ? Icons.lock_clock
+                          : Icons.check_circle_outline,
+                      color: line.contains('unavailable') ? Colors.amber : null,
+                    ),
+                    title: const Text('Battery controls'),
+                    subtitle: Text(line),
                   ),
                 const Divider(),
                 Padding(

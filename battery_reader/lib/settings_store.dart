@@ -33,8 +33,21 @@ class SettingsStore extends PrefsStore {
   /// foreground service, when needed) are unaffected.
   static const alertNotifications = BoolSetting('alert_notifications_v1', true);
 
+  /// Background monitoring (#52). Default ON — the foreground service keeps
+  /// BLE + alerts alive while the app is backgrounded. Off: the service never
+  /// runs, the app monitors only while in the foreground, and backgrounding /
+  /// swiping it away releases every battery (no BLE activity).
+  static const backgroundMonitoring =
+      BoolSetting('background_monitoring_v1', true);
+
   /// Every persisted boolean setting.
-  static const all = [demoMode, verbose, useFahrenheit, alertNotifications];
+  static const all = [
+    demoMode,
+    verbose,
+    useFahrenheit,
+    alertNotifications,
+    backgroundMonitoring,
+  ];
 
   Future<bool> load(BoolSetting s) =>
       readBool(s.key, fallback: s.defaultValue);
@@ -49,4 +62,7 @@ class SettingsStore extends PrefsStore {
   Future<void> saveUseFahrenheit(bool v) => save(useFahrenheit, v);
   Future<bool> loadAlertNotifications() => load(alertNotifications);
   Future<void> saveAlertNotifications(bool v) => save(alertNotifications, v);
+  Future<bool> loadBackgroundMonitoring() => load(backgroundMonitoring);
+  Future<void> saveBackgroundMonitoring(bool v) =>
+      save(backgroundMonitoring, v);
 }

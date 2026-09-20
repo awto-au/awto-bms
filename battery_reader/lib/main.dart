@@ -1,10 +1,16 @@
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show Platform, exit;
 
 import 'package:flutter/foundation.dart' show kIsWeb, listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'
-    show Clipboard, ClipboardData, HapticFeedback, SystemSound, SystemSoundType;
+    show
+        Clipboard,
+        ClipboardData,
+        HapticFeedback,
+        SystemNavigator,
+        SystemSound,
+        SystemSoundType;
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite_common_ffi/sqflite_common_ffi.dart';
 
@@ -23,6 +29,7 @@ import 'fmt.dart';
 import 'health_palette.dart';
 import 'intervals.dart' show LookbackWindow, computeRange;
 import 'metrics.dart';
+import 'monitoring_policy.dart';
 import 'notification_service.dart';
 import 'raw_log.dart';
 import 'settings_store.dart';
@@ -232,6 +239,7 @@ List<Object?> listPageSignature(
     agg.dischargeAh,
     agg.efc,
     m.fleetGateWriteDisabledReason,
+    m.fleetOutputWriteDisabledReason(on: true),
     for (final b in m.fleetMembers) b.state.serial,
   ]);
   return sig;
@@ -254,12 +262,24 @@ class _BatteryListPageState extends State<BatteryListPage>
 
   /// #45: system notifications + monitoring foreground service.
   late final AlertNotificationService _notifications =
-      AlertNotificationService(onOpenBattery: _openBySerial);
+      AlertNotificationService(
+    onOpenBattery: _openBySerial,
+    onStopRequested: _stopMonitoringFromNotification, // #52
+    onExitRequested: _exitFromNotification, // #54
+  );
 
   /// #45: system alert notifications enabled (persisted, default ON). Disabling
   /// only silences the SYSTEM notifications — the in-app beep + red banner and
   /// the monitoring foreground service are unaffected.
   bool _alertNotifications = true;
+
+  /// #52: the background-monitoring / user-stop decisions. A fresh page (app
+  /// launch) starts with NO user stop, so reopening the app resumes monitoring.
+  final _policy = MonitoringPolicy();
+
+  /// #52: whether the live BLE loop is currently running (vs. released by
+  /// [_reconcileBle]). Demo mode has no BLE and ignores it.
+  bool _bleLive = false;
 
   /// #45: serials seen connected at least once this session, so a "disconnected"
   /// alert only fires for a genuine drop — never a launch-time offline
@@ -288,6 +308,8 @@ class _BatteryListPageState extends State<BatteryListPage>
     RawLogger.instance.enabled = await _settings.loadVerbose();
     gUseFahrenheit = await _settings.loadUseFahrenheit(); // #43 temp unit
     _alertNotifications = await _settings.loadAlertNotifications(); // #45
+    _policy.backgroundMonitoring =
+        await _settings.loadBackgroundMonitoring(); // #52
     await _aliases.load(); // #44 per-battery custom names
     await _manager.loadFleetMembership();
     // #45: bring the notification subsystem up and, if alerts are enabled, ask
@@ -299,6 +321,7 @@ class _BatteryListPageState extends State<BatteryListPage>
     if (demo) {
       _manager.startDemoFleet();
     } else {
+      _bleLive = true;
       _manager.startLive();
     }
     // #45: honour a cold-start launch-by-tap once the first frame is up.
@@ -321,8 +344,15 @@ class _BatteryListPageState extends State<BatteryListPage>
     if (beep) alertBeep();
     // #45: raise/clear Android system notifications for the current conditions,
     // keeping BLE + alerts alive in the background via the foreground service.
+    // #52: the service runs ONLY while the policy says so — an explicit user
+    // stop or the Background-monitoring toggle OFF wins over this tick, which
+    // can therefore never bring the service back.
     _notifications.apply(_buildSnapshots(), enabled: _alertNotifications);
-    _notifications.updateForegroundService(_monitoredCount());
+    final monitored = _monitoredCount();
+    _notifications.updateForegroundService(
+      shouldRun: _policy.serviceShouldRun(monitored),
+      monitoredCount: monitored,
+    );
     // #34: throttled write-back of live telemetry into the persisted favourites.
     _manager.persistFleetSnapshot();
     // L16: repaint only when something the page shows actually changed.
@@ -373,6 +403,7 @@ class _BatteryListPageState extends State<BatteryListPage>
   /// #45: deep-link from a tapped notification to the battery's detail page. Pops
   /// any open route to root first so the target is shown cleanly.
   void _openBySerial(String serial) {
+    if (!mounted) return; // a late notification tap after dispose
     BatteryConnection? conn;
     for (final b in _manager.batteries) {
       if (b.state.serial == serial) {
@@ -410,6 +441,151 @@ class _BatteryListPageState extends State<BatteryListPage>
       BatteryLogger.instance.flushAll();
       RawLogger.instance.flush();
     }
+    // #52: with background monitoring OFF, leaving the foreground (home /
+    // recents / swipe) releases every battery; coming back resumes. `inactive`
+    // (a dialog, the share sheet) is not a background transition.
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _policy.setForeground(true);
+        _reconcileBle();
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
+        _policy.setForeground(false);
+        _reconcileBle();
+      case AppLifecycleState.inactive:
+        break;
+    }
+  }
+
+  /// #52: bring the live BLE loop in line with [MonitoringPolicy.bleShouldRun]:
+  /// release the packs (disconnect, stop scanning / reconnecting, stop the
+  /// lifetime-totals timer) when it must not run; scan + reconnect when it may.
+  /// Demo mode has no BLE to release. Idempotent.
+  void _reconcileBle() {
+    if (_demoMode) return;
+    final want = _policy.bleShouldRun;
+    if (want == _bleLive) return;
+    _bleLive = want;
+    if (want) {
+      _manager.resumeLive();
+    } else {
+      _manager.pauseLive();
+    }
+  }
+
+  /// #52: Settings toggle "Background monitoring" (persisted). OFF stops the
+  /// service now and prevents any start; the app then monitors only while in
+  /// the foreground. ON clears a previous user stop and lets the tick start it.
+  void _setBackgroundMonitoring(bool enabled) {
+    setState(() => _policy.setBackgroundMonitoring(enabled));
+    _settings.saveBackgroundMonitoring(enabled);
+    if (!enabled) _notifications.stopForegroundService();
+    _reconcileBle();
+  }
+
+  /// #52: "Pause monitoring (release batteries)" / "Resume monitoring". Pause
+  /// stops the foreground service AND the BLE loop (every pack disconnected, an
+  /// expected disconnect — no alarm) so another BLE client can take them;
+  /// nothing restarts it until the user resumes, turns Background monitoring
+  /// on, or relaunches the app. Alerts stay enabled for when it resumes.
+  void _setMonitoringPaused(bool paused) {
+    if (paused == _policy.userStopped) return;
+    setState(() {
+      if (paused) {
+        _policy.stopByUser();
+      } else {
+        _policy.resume();
+      }
+    });
+    if (paused) _notifications.stopForegroundService();
+    _reconcileBle();
+    if (mounted) {
+      showToast(
+          context,
+          paused
+              ? 'Monitoring paused — batteries released'
+              : 'Monitoring resumed');
+    }
+  }
+
+  /// #52: the "Stop monitoring" action on the persistent notification (the
+  /// service has already stopped itself in the task isolate). Same user-stop
+  /// state as Pause: the tick will not bring the service back, and BLE lets go
+  /// of every pack.
+  void _stopMonitoringFromNotification() {
+    if (!mounted) return;
+    _setMonitoringPaused(true);
+  }
+
+  /// #54: the "Exit" action on the persistent notification (the service has
+  /// already stopped itself). No confirm — the user is not looking at the app.
+  void _exitFromNotification() {
+    if (!mounted) return;
+    _exitApp(confirmIfWriting: false);
+  }
+
+  bool _exiting = false;
+
+  /// #54: full shutdown, distinct from Pause (which keeps the app alive):
+  /// stop the foreground service, release every battery, cancel the alert
+  /// notifications, FLUSH the interval logger + raw log, then terminate. The
+  /// user-stopped state is set first so the tick can never restart anything
+  /// during the shutdown, and no-resurrection (#52) means nothing brings the
+  /// process back. A brief confirm only if a BMS write is in flight.
+  Future<void> _exitApp({bool confirmIfWriting = true}) async {
+    if (_exiting) return;
+    if (confirmIfWriting && BusyWrites.inFlight > 0 && mounted) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Write in progress'),
+          content: const Text(
+              'A command is still being sent to a battery. Exit anyway?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Exit'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+    if (_exiting) return;
+    _exiting = true;
+    _policy.exitApp();
+    _ticker?.cancel();
+    _bleLive = false;
+    await runExitSequence(
+      stopService: _notifications.stopForegroundService,
+      releaseBle: () async {
+        if (!_demoMode) await _manager.pauseLive();
+        _manager.disposeAll(); // rows + the lifetime-totals timer
+      },
+      cancelNotifications: _notifications.cancelAll,
+      flushLogs: () async {
+        BatteryLogger.instance.flushAll();
+        await RawLogger.instance.flush();
+      },
+      terminate: () {
+        if (!kIsWeb && Platform.isAndroid) {
+          // Finish the activity (with stopWithTask + the service already
+          // stopped nothing restarts), then end the process so no cached
+          // engine / timer lingers.
+          SystemNavigator.pop();
+          Future<void>.delayed(
+              const Duration(milliseconds: 300), () => exit(0));
+        } else {
+          exit(0); // desktop: closes the window
+        }
+      },
+      onError: (step, e) => AppLog.instance.record('Exit', '$step failed: $e'),
+    );
   }
 
   /// Switch between Demo and Live from the Settings page (#35). Drives the SAME
@@ -420,9 +596,12 @@ class _BatteryListPageState extends State<BatteryListPage>
     setState(() {
       _demoMode = demo;
       if (demo) {
+        _bleLive = false;
         _manager.startDemoFleet();
       } else {
-        _manager.startLive();
+        // #52: live only if the policy allows it right now (not paused).
+        _bleLive = _policy.bleShouldRun;
+        if (_bleLive) _manager.startLive();
       }
     });
     _settings.saveDemoMode(demo);
@@ -447,7 +626,15 @@ class _BatteryListPageState extends State<BatteryListPage>
           onTempUnitChanged: _setTempUnit,
           alertNotifications: _alertNotifications,
           onAlertNotificationsChanged: _setAlertNotifications,
+          backgroundMonitoring: _policy.backgroundMonitoring,
+          onBackgroundMonitoringChanged: _setBackgroundMonitoring,
+          monitoringPaused: _policy.userStopped,
+          onMonitoringPausedChanged: _setMonitoringPaused,
+          onExit: _exitApp,
           scanError: _demoMode ? null : _manager.scanErrorText,
+          // #55: control availability per battery, live at each refresh.
+          batteryStatus: () =>
+              [for (final b in _manager.batteries) b.gateStatusSummary()],
         ),
       ),
     );
@@ -513,10 +700,63 @@ class _BatteryListPageState extends State<BatteryListPage>
                         color: Colors.amber)),
               ),
             ),
+          // #52: monitoring paused by the user (batteries released).
+          if (_policy.userStopped && !_demoMode)
+            const Padding(
+              padding: EdgeInsets.only(right: 4),
+              child: Center(
+                child: Text('PAUSED',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.amber)),
+              ),
+            ),
           IconButton(
             tooltip: 'Settings',
             icon: const Icon(Icons.settings),
             onPressed: _openSettings,
+          ),
+          // #52: quick pause / resume without touching the alert settings.
+          PopupMenuButton<String>(
+            tooltip: 'More',
+            onSelected: (v) {
+              if (v == 'pause') _setMonitoringPaused(true);
+              if (v == 'resume') _setMonitoringPaused(false);
+              if (v == 'exit') _exitApp();
+            },
+            itemBuilder: (_) => [
+              if (_policy.userStopped)
+                const PopupMenuItem(
+                  value: 'resume',
+                  child: ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.play_arrow),
+                    title: Text('Resume monitoring'),
+                  ),
+                )
+              else
+                PopupMenuItem(
+                  value: 'pause',
+                  enabled: !_demoMode,
+                  child: const ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.pause),
+                    title: Text('Pause monitoring'),
+                    subtitle: Text('Release the batteries for another client'),
+                  ),
+                ),
+              // #54: full shutdown (release batteries, flush logs, close).
+              const PopupMenuItem(
+                value: 'exit',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.power_settings_new),
+                  title: Text('Exit'),
+                  subtitle: Text('Stop monitoring and close the app'),
+                ),
+              ),
+            ],
           ),
           const SizedBox(width: 4),
         ],
@@ -985,28 +1225,64 @@ class _DetectedInfoSheet extends StatelessWidget {
 /// alias back to the bare serial). Purely local — nothing sent to the BMS.
 Future<void> editBatteryAlias(
     BuildContext context, AliasStore aliases, String serial) async {
-  final controller =
-      TextEditingController(text: aliases.aliasFor(serial) ?? '');
   final result = await showDialog<String>(
     context: context,
-    builder: (ctx) => AlertDialog(
+    builder: (_) => _RenameDialog(
+        serial: serial, initial: aliases.aliasFor(serial) ?? ''),
+  );
+  if (result != null) await aliases.setAlias(serial, result);
+}
+
+/// #57 (the red `'_dependents.isEmpty': is not true` screen): the dialog OWNS
+/// its [TextEditingController] and disposes it in [State.dispose] — i.e. only
+/// once the dialog route has fully left the tree. The previous code disposed
+/// the controller right after `await showDialog(...)`, which resolves when the
+/// dialog is POPPED, while its TextField stays mounted for the pop transition.
+/// The route's own status change rebuilds that TextField, whose
+/// `didUpdateWidget` re-listens on the now-disposed controller and throws
+/// inside `Element.update`; that leaves part of the dialog subtree orphaned
+/// with live inherited dependencies, and the route's teardown then fails the
+/// framework's `_dependents.isEmpty` assertion — bringing the whole app down
+/// to the red screen. Regression test: test/crash_57_test.dart.
+class _RenameDialog extends StatefulWidget {
+  final String serial;
+  final String initial;
+  const _RenameDialog({required this.serial, required this.initial});
+
+  @override
+  State<_RenameDialog> createState() => _RenameDialogState();
+}
+
+class _RenameDialogState extends State<_RenameDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initial);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
       title: const Text('Rename battery'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(serial,
+          Text(widget.serial,
               style: const TextStyle(color: Colors.white54, fontSize: 12)),
           const SizedBox(height: 8),
           TextField(
-            controller: controller,
+            controller: _controller,
             autofocus: true,
             textInputAction: TextInputAction.done,
             decoration: const InputDecoration(
               labelText: 'Custom name',
               hintText: 'e.g. Left battery',
             ),
-            onSubmitted: (v) => Navigator.of(ctx).pop(v),
+            onSubmitted: (v) => Navigator.of(context).pop(v),
           ),
           const SizedBox(height: 4),
           const Text('Leave empty to clear back to the serial.',
@@ -1015,18 +1291,16 @@ Future<void> editBatteryAlias(
       ),
       actions: [
         TextButton(
-          onPressed: () => Navigator.of(ctx).pop(),
+          onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
         FilledButton(
-          onPressed: () => Navigator.of(ctx).pop(controller.text),
+          onPressed: () => Navigator.of(context).pop(_controller.text),
           child: const Text('Save'),
         ),
       ],
-    ),
-  );
-  controller.dispose();
-  if (result != null) await aliases.setAlias(serial, result);
+    );
+  }
 }
 
 class SettingsPage extends StatefulWidget {
@@ -1039,8 +1313,19 @@ class SettingsPage extends StatefulWidget {
   /// #45: system alert notifications toggle (persisted, default ON).
   final bool alertNotifications;
   final ValueChanged<bool> onAlertNotificationsChanged;
+  /// #52: background monitoring toggle (persisted, default ON).
+  final bool backgroundMonitoring;
+  final ValueChanged<bool> onBackgroundMonitoringChanged;
+  /// #52: monitoring paused by the user (batteries released) + pause/resume.
+  final bool monitoringPaused;
+  final ValueChanged<bool> onMonitoringPausedChanged;
+  /// #54: full shutdown (stop service + BLE, flush logs, close the app).
+  final VoidCallback onExit;
   /// M13: the manager's current scan error (for the Diagnostics page).
   final String? scanError;
+  /// #55: live per-battery control-availability lines for Diagnostics
+  /// ([BatteryConnection.gateStatusSummary]), evaluated on each refresh.
+  final List<String> Function()? batteryStatus;
   const SettingsPage({
     super.key,
     required this.settings,
@@ -1050,7 +1335,13 @@ class SettingsPage extends StatefulWidget {
     required this.onTempUnitChanged,
     required this.alertNotifications,
     required this.onAlertNotificationsChanged,
+    required this.backgroundMonitoring,
+    required this.onBackgroundMonitoringChanged,
+    required this.monitoringPaused,
+    required this.onMonitoringPausedChanged,
+    required this.onExit,
     this.scanError,
+    this.batteryStatus,
   });
 
   @override
@@ -1061,6 +1352,8 @@ class _SettingsPageState extends State<SettingsPage> {
   late bool _demo = widget.demoMode;
   late bool _fahrenheit = widget.useFahrenheit;
   late bool _alerts = widget.alertNotifications; // #45
+  late bool _background = widget.backgroundMonitoring; // #52
+  late bool _paused = widget.monitoringPaused; // #52
   bool _sharing = false;
 
   Future<void> _sendToDeveloper() async {
@@ -1092,7 +1385,8 @@ class _SettingsPageState extends State<SettingsPage> {
   void _openDiagnostics() {
     Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => DiagnosticsPage(scanError: widget.scanError),
+        builder: (_) => DiagnosticsPage(
+            scanError: widget.scanError, batteryStatus: widget.batteryStatus),
       ),
     );
   }
@@ -1118,11 +1412,24 @@ class _SettingsPageState extends State<SettingsPage> {
             // #46: everyday settings first; the Demo-mode section is LAST.
             _sectionHeader(context, 'Raw logging'),
             SwitchListTile(
-              secondary: const Icon(Icons.description_outlined),
+              secondary: Icon(Icons.description_outlined,
+                  color: logger.enabled ? null : Colors.amber),
               title: const Text('Verbose raw logging'),
-              subtitle: const Text(
-                  'Capture every raw BLE notification, decoded frame, sent '
-                  'command and dropped byte. Turn off if the file grows large.'),
+              // Plain status first — a log switched OFF used to stop silently
+              // for a day; now the page says so and when it last wrote.
+              subtitle: Text(
+                '${RawLogger.statusLine(
+                  enabled: logger.enabled,
+                  sizeBytes: logger.sizeBytes,
+                  maxBytes: logger.maxBytes,
+                  lastWrittenAt: logger.lastWrittenAt,
+                )}\n'
+                'Captures every raw BLE notification, decoded frame, sent '
+                'command and dropped byte. Turn off if the file grows large.',
+                style: logger.enabled
+                    ? null
+                    : const TextStyle(color: Colors.amber),
+              ),
               value: logger.enabled,
               onChanged: (v) {
                 setState(() => logger.enabled = v);
@@ -1219,6 +1526,46 @@ class _SettingsPageState extends State<SettingsPage> {
                 widget.onAlertNotificationsChanged(v);
               },
             ),
+            // #52: background monitoring (the foreground service). OFF: the
+            // app monitors only while in the foreground and releases every
+            // battery when backgrounded / swiped away.
+            SwitchListTile(
+              secondary: const Icon(Icons.bluetooth_searching),
+              title: const Text('Background monitoring'),
+              subtitle: const Text(
+                  'Keep reading the batteries (and alerting) while the app is '
+                  'in the background, with a persistent notification. Off: '
+                  'monitor only while the app is open and release the '
+                  'batteries when it is backgrounded or closed.'),
+              value: _background,
+              onChanged: (v) {
+                setState(() {
+                  _background = v;
+                  if (v) _paused = false; // ON also clears a user stop
+                });
+                widget.onBackgroundMonitoringChanged(v);
+              },
+            ),
+            // #52: quick pause / resume (same as the app-bar menu and the
+            // notification's "Stop monitoring" action).
+            ListTile(
+              leading: Icon(_paused ? Icons.play_arrow : Icons.pause),
+              title: Text(_paused ? 'Resume monitoring' : 'Pause monitoring'),
+              subtitle: Text(_paused
+                  ? 'Monitoring is paused — the batteries are released. Tap '
+                      'to scan and reconnect.'
+                  : 'Release the batteries so another BLE client (e.g. the '
+                      'PC tools) can use them. Alerts stay enabled for when '
+                      'you resume.'),
+              enabled: !widget.demoMode,
+              onTap: widget.demoMode
+                  ? null
+                  : () {
+                      final next = !_paused;
+                      setState(() => _paused = next);
+                      widget.onMonitoringPausedChanged(next);
+                    },
+            ),
             const Divider(),
             // #43: temperature display unit (°C / °F). Display-only.
             _sectionHeader(context, 'Temperature'),
@@ -1247,6 +1594,16 @@ class _SettingsPageState extends State<SettingsPage> {
                 setState(() => _demo = v);
                 widget.onDemoModeChanged(v);
               },
+            ),
+            const Divider(),
+            // #54: Exit at the very bottom — a full shutdown, unlike Pause.
+            ListTile(
+              leading: const Icon(Icons.power_settings_new),
+              title: const Text('Exit Battery Reader'),
+              subtitle: const Text(
+                  'Stop monitoring, release the batteries, save the logs and '
+                  'close the app. It will not restart on its own.'),
+              onTap: widget.onExit,
             ),
           ],
         ),
@@ -1425,6 +1782,12 @@ class _FleetControlsState extends State<_FleetControls> {
         ? 'Fleet write in progress…'
         : manager.fleetGateWriteDisabledReason;
     final enabled = reason == null;
+    // #59: "All output ON" cannot turn anything off — every member merely
+    // has to be connected.
+    final onReason = _busy.any
+        ? 'Fleet write in progress…'
+        : manager.fleetOutputWriteDisabledReason(on: true);
+    final onEnabled = onReason == null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1477,7 +1840,7 @@ class _FleetControlsState extends State<_FleetControls> {
             Expanded(
               child: OutlinedButton.icon(
                 icon: const Icon(Icons.power, size: 18),
-                onPressed: !enabled
+                onPressed: !onEnabled
                     ? null
                     : () => runWriteAction(
                           context,
@@ -2245,14 +2608,18 @@ class _ControlsSection extends StatelessWidget {
     // void followed by a "not confirmed" warning that could never be met.
     final writeReason = conn.writesDisabledReason;
     final connected = writeReason == null;
-    // C1: EVERY gate-control button (output, passive balancing, heater,
-    // restart, factory) is disabled unless the gate base is fresh — connected,
-    // all six gates reported, BAL_STATUS younger than 5 s. The reason is shown.
+    // C1: the persistent gate toggles (output, passive balancing, heater) are
+    // disabled unless the gate base is fresh — connected, all six gates
+    // reported, BAL_STATUS younger than gateFreshnessMs. The reason is shown.
     final gateReason = conn.gateControlsDisabledReason;
+    // #59: the SAFE writes (Output ON, Restart — they cannot turn anything
+    // off) only need a connected link; see BatteryConnection.safeWriteBase.
+    final safeReason = conn.safeWritesDisabledReason;
     // M4: while any write on this battery is in flight (tap -> confirm ->
     // read-back), every write button is disabled.
     final inFlight = busy.any;
     final gateOk = gateReason == null && !inFlight;
+    final safeOk = safeReason == null && !inFlight;
     final writeOk = connected && !inFlight;
     return Card(
       child: Padding(
@@ -2309,8 +2676,9 @@ class _ControlsSection extends StatelessWidget {
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
-                        'Gate controls locked — $gateReason. They unlock as '
-                        'soon as a fresh status frame arrives.',
+                        // #55: automatic, not an approval — see the note.
+                        controlsUnavailableText(gateReason,
+                            safeWritesAvailable: safeOk),
                         style: const TextStyle(
                             color: Colors.amber, fontSize: 12),
                       ),
@@ -2321,7 +2689,10 @@ class _ControlsSection extends StatelessWidget {
             // Issue #26: ONE Output control that writes both FET bytes together,
             // exactly like the vendor setMos. (Per-FET toggles are gone — flipping
             // a single FET did not take effect on hardware.)
-            _outputRow(context, enabled: gateOk),
+            // #59: turning output ON is a safe write (connected is enough);
+            // turning it OFF keeps the fresh-status gate.
+            _outputRow(context,
+                enabled: conn.isOutputOn ? gateOk : safeOk),
             _toggleRow(
               context,
               label: 'Passive balancing',
@@ -2363,7 +2734,7 @@ class _ControlsSection extends StatelessWidget {
                 foregroundColor: kRed,
                 side: const BorderSide(color: kRed),
               ),
-              onPressed: !gateOk
+              onPressed: !safeOk
                   ? null
                   : () => _run(context, restartAction(conn)),
               label: const Text('Restart BMS'),
@@ -2376,6 +2747,7 @@ class _ControlsSection extends StatelessWidget {
                 foregroundColor: kRed,
                 side: const BorderSide(color: kRed, width: 2),
               ),
+              // Factory reset erases configuration: it keeps the fresh gate.
               onPressed: !gateOk
                   ? null
                   : () => _run(context, factoryAction(conn)),
@@ -2406,9 +2778,11 @@ class _LatchedOverTempCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // #55/#59: restart is a SAFE write — any connected link — so the latched
+    // over-temp can always be cleared.
     final gateReason = busy.any
         ? 'a write is in progress (${busy.current})'
-        : conn.gateControlsDisabledReason;
+        : conn.safeWritesDisabledReason;
     return Card(
       color: const Color(0xFF3D2E0A),
       shape: RoundedRectangleBorder(
@@ -2460,7 +2834,7 @@ class _LatchedOverTempCard extends StatelessWidget {
             if (gateReason != null)
               Padding(
                 padding: const EdgeInsets.only(top: 6),
-                child: Text('Restart locked — $gateReason.',
+                child: Text(restartUnavailableText(gateReason),
                     style:
                         const TextStyle(color: Colors.amber, fontSize: 12)),
               ),

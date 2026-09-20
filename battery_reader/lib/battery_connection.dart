@@ -67,7 +67,11 @@ class BatteryConnection {
       onEvent: (e) {
         // C1: a decoded BAL_STATUS is the ONLY thing that makes the gate base
         // fresh enough to build a gate-control write from.
-        if (e is BalancerEvent) lastGateStatusMs = now().millisecondsSinceEpoch;
+        lastFrameMs = now().millisecondsSinceEpoch; // #59 streaming watchdog
+        if (e is BalancerEvent) {
+          lastGateStatusMs = lastFrameMs;
+          _noteGateAvailability();
+        }
         _integrateThroughput(DateTime.now().millisecondsSinceEpoch);
         _detectAlerts();
         // L11: a frame that lands after dispose() must not throw on the closed
@@ -82,6 +86,9 @@ class BatteryConnection {
         b,
         runningCount: state.unrecognisedBytes,
       ),
+      // #60: the known AT+V status byte — logged as such, never counted.
+      onAtStatusByte: (b) =>
+          RawLogger.instance.logAtStatus(state.serial ?? '', b),
     );
   }
 
@@ -126,11 +133,16 @@ class BatteryConnection {
   bool _rebaselineOnReconnect = false;
 
   void _setConn(ConnState s) {
-    // L11: a late link-state callback (or a disconnect() after dispose()) must
-    // not throw on the closed controller.
-    if (_conn.isClosed) return;
+    // #55: the state field is ALWAYS updated — a row must never report a
+    // connection state it is not in. (The L11 "closed controller" guard used
+    // to return before this line, so a row (re)connected after dispose()
+    // streamed telemetry while still reporting `disconnected`, i.e. controls
+    // "unavailable: Not connected" on a live pack.) Only the stream add is
+    // skipped once the controller is closed.
     final prev = connState;
     connState = s;
+    _noteGateAvailability();
+    if (_conn.isClosed) return;
     // H3: alert ONLY on a TRUE connected -> disconnected transition — a live
     // pack that dropped. A failed (re)connect attempt goes connecting ->
     // disconnected and must never alarm/beep: the manager keeps retrying at
@@ -143,6 +155,8 @@ class BatteryConnection {
         _raiseAlert('Disconnected / BLE error');
       }
     } else if (s == ConnState.connected) {
+      _connectedAtMs = now().millisecondsSinceEpoch; // #59
+      lastFrameMs = null;
       expectedDisconnect = false;
       _linkError = false;
       if (_rebaselineOnReconnect) {
@@ -157,38 +171,196 @@ class BatteryConnection {
   // --- gate-state freshness (audit C1, SAFETY-CRITICAL) ---------------------
 
   /// Epoch-ms of the last decoded BAL_STATUS (balancer) frame on this link, or
-  /// null if none has been decoded yet. Reset on every (re)connect.
+  /// null if none has been decoded yet. Reset on every (re)connect. Set from
+  /// the parser's event hook the moment the frame is DECODED — independent of
+  /// any UI rebuild timing (#55).
   int? lastGateStatusMs;
 
-  /// A gate-control write is only allowed while the gate base is fresh.
-  static const int gateFreshnessMs = 5000;
+  /// A persistent gate toggle (output, passive balancing, heater, …) is only
+  /// allowed while the gate base is younger than this. #55: was 5 s, which
+  /// re-locked the controls on every short stall of a weak link (JS-2C14B8 at
+  /// −90 dBm stalled ≥ 5 s nine times and re-handshook 82 times in one
+  /// session). BAL_STATUS streams about once a second, so 15 s still
+  /// guarantees a recent base.
+  static const int gateFreshnessMs = 15000;
 
   /// C1: true iff we are connected, EVERY one of the six persistent gates has
   /// been reported (chargeMos, dischargeMos, tempControlGate, smokeGate,
   /// heatGate, passiveBalancing), AND the last BAL_STATUS is younger than
   /// [gateFreshnessMs]. Anything else and a gate write would be built from a
   /// stale/unknown base — which could cut output or disable protection.
+  ///
+  /// The six gates all come from the ONE BAL_STATUS frame (A8 AC), so a single
+  /// decoded frame on this link reports every field the gate-control frame
+  /// writes; nothing this firmware does not report is ever waited for.
   bool get hasFreshGateState => gateControlsDisabledReason == null;
 
-  /// Why gate writes are refused right now, or null when they are allowed.
-  String? get gateControlsDisabledReason {
-    if (connState != ConnState.connected) return 'Not connected';
-    final s = state;
+  /// Milliseconds since the last decoded BAL_STATUS on this link, or null when
+  /// none has been decoded yet. Shown on the controls note and in Diagnostics
+  /// so a refused control is explainable on the phone (#55).
+  int? get gateStatusAgeMs {
     final last = lastGateStatusMs;
-    if (last == null ||
-        s.chargeMos == null ||
-        s.dischargeMos == null ||
-        s.tempControlGate == null ||
-        s.smokeGate == null ||
-        s.heatGate == null ||
-        s.passiveBalancing == null) {
-      return 'Waiting for gate status from the battery';
-    }
-    final ageMs = now().millisecondsSinceEpoch - last;
-    if (ageMs >= gateFreshnessMs) {
-      return 'Gate status is stale (no status for ${(ageMs / 1000).round()} s)';
-    }
+    return last == null ? null : now().millisecondsSinceEpoch - last;
+  }
+
+  /// The gate base known on this link (all six gates from the last decoded
+  /// BAL_STATUS), or null when none has been decoded yet.
+  GateSnapshot? get gateBase =>
+      lastGateStatusMs == null ? null : GateSnapshot.fromState(state);
+
+  /// Reason text: not connected.
+  static const reasonNotConnected = 'Not connected';
+
+  /// Reason text: connected, but no BAL_STATUS decoded on this link yet.
+  static const reasonNoGateStatus =
+      'Waiting for gate status from the battery (none received on this '
+      'connection yet)';
+
+  /// Reason text for a base older than [gateFreshnessMs].
+  static String reasonGateStatusStale(int ageMs) =>
+      'No gate status from the battery for ${(ageMs / 1000).round()} s '
+      '(needs one within ${gateFreshnessMs ~/ 1000} s)';
+
+  /// #59: a connected link with no decoded telemetry frame for this long is
+  /// reported as "not streaming" (the pack may have idled into low-power
+  /// sleep) instead of "waiting for gate status".
+  static const int notStreamingMs = 10000;
+
+  /// Reason text for a connected link that has gone silent (#59).
+  static String reasonNotStreaming(int silenceMs) =>
+      'Connected but not streaming — no telemetry for '
+      '${(silenceMs / 1000).round()} s (the battery may be asleep)';
+
+  /// Epoch-ms of the last decoded frame of ANY kind on this link, or null.
+  int? lastFrameMs;
+  int? _connectedAtMs;
+
+  /// Milliseconds since the last decoded frame on this link (or since the
+  /// link came up, if none yet); null while not connected.
+  int? get silenceMs {
+    if (connState != ConnState.connected) return null;
+    final since = lastFrameMs ?? _connectedAtMs;
+    return since == null ? null : now().millisecondsSinceEpoch - since;
+  }
+
+  /// True while connected but silent for at least [notStreamingMs] (#59).
+  bool get notStreaming => (silenceMs ?? 0) >= notStreamingMs;
+
+  /// Why gate writes that CAN TURN SOMETHING OFF (output OFF, passive
+  /// balancing / heater OFF, factory reset — anything built from the live gate
+  /// base) are refused right now, or null when they are allowed. The text
+  /// never implies a user approval step: every reason clears by itself once
+  /// the battery is connected and reporting.
+  String? get gateControlsDisabledReason {
+    if (connState != ConnState.connected) return reasonNotConnected;
+    if (notStreaming) return reasonNotStreaming(silenceMs!);
+    if (gateBase == null) return reasonNoGateStatus;
+    final ageMs = gateStatusAgeMs!;
+    if (ageMs >= gateFreshnessMs) return reasonGateStatusStale(ageMs);
     return null;
+  }
+
+  /// #59: why the SAFE writes — Output ON and Restart — are refused, or null.
+  /// A write that cannot turn anything off is never blocked on a connected
+  /// battery: JS-2C14AA had its output OFF, the fresh-status gate refused
+  /// "Output ON", and the pack idled into sleep unreachable. See
+  /// [safeWriteBase] for the frame such a write carries without a fresh base.
+  String? get safeWritesDisabledReason =>
+      connState != ConnState.connected ? reasonNotConnected : null;
+
+  /// #59: true for the writes that cannot turn anything off: Output ON (both
+  /// MOS = 1) and Restart. NOT passive / heater ON: without a fresh base their
+  /// frame would also have to force both MOS bytes to 1, silently turning the
+  /// output on as a side effect, so they keep the fresh-status gate.
+  static bool isSafeWrite(GateAction action, {required bool on}) =>
+      (action == GateAction.output && on) || action == GateAction.restart;
+
+  /// The applicable refusal reason for [action] / [on] (null = allowed).
+  String? disabledReasonFor(GateAction action, {bool on = true}) =>
+      isSafeWrite(action, on: on)
+          ? safeWritesDisabledReason
+          : gateControlsDisabledReason;
+
+  /// The last decoded gate values on this ROW, from any link and of any age
+  /// (the state object survives reconnects; only [lastGateStatusMs] resets).
+  GateSnapshot? get lastKnownGates => GateSnapshot.fromState(state);
+
+  /// #59: the base a SAFE write (Output ON / Restart) is built from when there
+  /// is no fresh status: both MOS bytes = 1 (it cannot cut output), the other
+  /// gates from [lastKnownGates] — the last decoded status on this row, any
+  /// link, any age — and, for a row that has never decoded one, protective
+  /// defaults: tempControlGate = 1 (low-temp protection ON is the safe
+  /// direction; 0 would switch it off), smokeGate = 0 and heatGate = 0,
+  /// passiveBalancing = 0 (what every observed pack reports at rest). The
+  /// momentary flags are 0 unless the action itself sets one.
+  GateSnapshot safeWriteBase() {
+    final known = lastKnownGates;
+    return GateSnapshot(
+      chargeMos: true,
+      dischargeMos: true,
+      tempControlGate: known?.tempControlGate ?? 1,
+      smokeGate: known?.smokeGate ?? 0,
+      heatGate: known?.heatGate ?? 0,
+      passiveBalancing: known?.passiveBalancing ?? false,
+    );
+  }
+
+  /// One line for Diagnostics: connection state, streaming state, gate-status
+  /// age and whether controls are available (with the reason when not).
+  String gateStatusSummary() {
+    final serial = state.serial ?? 'unknown serial';
+    final age = gateStatusAgeMs;
+    final ageText =
+        age == null ? 'no gate status yet' : 'gate status ${_fmtAge(age)} ago';
+    final silence = silenceMs;
+    final stream = connState != ConnState.connected
+        ? ''
+        : notStreaming
+            ? ' · NOT streaming (${_fmtAge(silence!)} silent)'
+            : ' · streaming';
+    final reason = gateControlsDisabledReason;
+    final avail = reason == null
+        ? 'controls available'
+        : 'controls unavailable: $reason'
+            '${safeWritesDisabledReason == null ? ' (Output ON / Restart still available)' : ''}';
+    return '$serial: ${connState.name}$stream · $ageText · $avail';
+  }
+
+  static String _fmtAge(int ms) => ms < 10000
+      ? '${(ms / 1000).toStringAsFixed(1)} s'
+      : '${(ms / 1000).round()} s';
+
+  /// #55: the availability kind last written to Diagnostics (null = never).
+  String? _loggedGateKind;
+
+  /// #55: record EVERY change of control availability in Diagnostics with the
+  /// raw inputs — connection state, gate-status age, and the six gate fields —
+  /// so an "unavailable" seen on the phone is explainable after the fact.
+  /// Called on every decoded BAL_STATUS and every connection-state change;
+  /// only a change of kind (available / not connected / no status / stale)
+  /// writes a line, so a healthy stream logs once.
+  void _noteGateAvailability() {
+    final r = gateControlsDisabledReason;
+    final kind = r == null
+        ? 'available'
+        : r == reasonNotConnected
+            ? 'not connected'
+            : r == reasonNoGateStatus
+                ? 'no status'
+                : r.startsWith('Connected but not streaming')
+                    ? 'not streaming'
+                    : 'stale';
+    if (kind == _loggedGateKind) return;
+    _loggedGateKind = kind;
+    final s = state;
+    final age = gateStatusAgeMs;
+    AppLog.instance.record(
+        _source,
+        '${s.serial ?? '?'} controls ${r == null ? 'available' : 'unavailable: $r'}'
+        ' · conn=${connState.name}'
+        ' · gate status ${age == null ? 'none' : '$age ms ago'}'
+        ' · chg=${s.chargeMos} dis=${s.dischargeMos} temp=${s.tempControlGate}'
+        ' smoke=${s.smokeGate} heat=${s.heatGate} bal=${s.passiveBalancing}');
   }
 
   // --- alerting (task 3 + task 8) ------------------------------------------
@@ -321,6 +493,11 @@ class BatteryConnection {
   /// sequence is bounded by [connectTimeout] (L15); a timeout is just another
   /// failed connect. Throws on any failure after marking the row disconnected.
   Future<String> connectTo(String deviceId, {String? name}) async {
+    // #55: a disposed row (replaced by startLive / startDemoFleet / un-star)
+    // must never be re-linked — it would hold the pack's GATT link invisibly.
+    if (_disposed) {
+      throw StateError('connection for ${state.serial ?? deviceId} is disposed');
+    }
     _setConn(ConnState.connecting);
     // Reconnect-safe: drop any stale subscriptions/buffer from a prior link.
     // Re-running connectTo rebinds THIS same BatteryConnection/row to the new
@@ -343,6 +520,12 @@ class BatteryConnection {
     // connect handler can log/back off. Applies to BOTH transports.
     final gen = ++_connectGen;
     try {
+      // #55: a dispose() that landed during the awaits above must not open a
+      // link on this dead row (the catch below marks it disconnected).
+      if (_disposed) {
+        throw StateError('connection for ${state.serial ?? deviceId} was '
+            'disposed while connecting');
+      }
       return await _connectSequence(deviceId, name, gen).timeout(
         connectTimeout,
         onTimeout: () => throw TimeoutException(
@@ -381,7 +564,7 @@ class BatteryConnection {
   /// [connectTo] wraps it in the timeout and the teardown-on-failure.
   Future<String> _connectSequence(String deviceId, String? name, int gen) async {
     final link = await transport.connect(deviceId);
-    if (gen != _connectGen) {
+    if (gen != _connectGen || _disposed) {
       // Timed out / superseded while the transport was connecting: drop the
       // late link rather than adopting it.
       await _dropLink(link, 'drop superseded late link');
@@ -427,6 +610,9 @@ class BatteryConnection {
     await Future<void>.delayed(const Duration(milliseconds: 300));
     await _send(BatteryCommands.getEst, label: 'request time estimate');
     await Future<void>.delayed(const Duration(milliseconds: 300));
+    // #60: from here on a stray 0x30 on this link is AT+V's status byte '0'.
+    // Flagged before the write so a fast reply cannot race the flag.
+    parser.atVersionSent = true;
     await _send(BatteryCommands.getVersion, label: 'request firmware version');
     if (sendLowTempGate) {
       await Future<void>.delayed(const Duration(milliseconds: 2500));
@@ -530,17 +716,35 @@ class BatteryConnection {
   /// Only the [action] byte changes; every other gate keeps its current value
   /// (read from the last BAL_STATUS frame). Restart/factory ignore [on].
   ///
-  /// SAFETY (audit C1): REFUSES with a [StateError] unless [hasFreshGateState]
-  /// — connected, all six gates known, and a BAL_STATUS decoded within the last
-  /// [gateFreshnessMs]. It never falls back to a zero-filled base: a frame
-  /// built from unknown gates writes chargeMos = dischargeMos = 0 (cutting the
-  /// pack's output) or tempControlGate = 0 (disabling low-temp protection).
+  /// SAFETY (audit C1 / #59): with a FRESH base ([gateControlsDisabledReason]
+  /// null — connected, streaming, all six gates from a BAL_STATUS within
+  /// [gateFreshnessMs]) every action is built from the live gates. Without
+  /// one, only a SAFE write ([isSafeWrite]: Output ON, Restart) goes out, on
+  /// any connected link, built from [safeWriteBase] (both MOS = 1, so it can
+  /// cut nothing). Everything else is REFUSED with a [StateError] — a frame
+  /// built from a stale or unknown base could write chargeMos = dischargeMos
+  /// = 0 (cutting output) or tempControlGate = 0 (disabling protection). A
+  /// refusal, and a safe write sent without a fresh base, are recorded in
+  /// Diagnostics.
   Future<void> sendGateControl(GateAction action, {bool on = true}) async {
-    final reason = gateControlsDisabledReason;
-    final base = GateSnapshot.fromState(state);
-    if (reason != null || base == null) {
+    final GateSnapshot base;
+    final freshReason = gateControlsDisabledReason;
+    if (freshReason == null && gateBase != null) {
+      base = gateBase!;
+    } else if (isSafeWrite(action, on: on) &&
+        safeWritesDisabledReason == null) {
+      base = safeWriteBase();
+      AppLog.instance.record(
+          _source,
+          'safe write ${action.name} on ${state.serial ?? '?'} sent without a '
+          'fresh gate status ($freshReason): MOS forced ON, other gates '
+          '${lastKnownGates == null ? 'defaults' : 'last known'}');
+    } else {
+      final why = disabledReasonFor(action, on: on) ?? 'gate state unknown';
+      AppLog.instance.record(_source,
+          'refused gate write ${action.name} on ${state.serial ?? '?'}: $why');
       throw StateError('Refusing gate write ${action.name}: '
-          '${reason ?? 'gate state unknown'} — a write built from a stale or '
+          '$why — a write built from a stale or '
           'unknown gate base could cut output or disable protection.');
     }
     final frame = buildGateControlFrame(base: base, action: action, on: on);
@@ -677,7 +881,14 @@ class BatteryConnection {
     _setConn(ConnState.disconnected);
   }
 
+  /// Set by [dispose]; a disposed row refuses [connectTo].
+  bool _disposed = false;
+
   Future<void> dispose() async {
+    _disposed = true;
+    // #55: abandon a connect sequence still in flight — it sees a different
+    // generation and drops its late link instead of binding it to this row.
+    _connectGen++;
     await disconnect();
     // M11: release the logger's subscriptions for this row.
     final att = loggerAttachment;

@@ -39,6 +39,9 @@ class FakeTransport implements BleTransport {
   @override
   Stream<List<BleScanHit>> get scanResults => _scan.stream;
 
+  /// #52: push scan hits to whoever is listening (the manager's scan window).
+  void emitScan(List<BleScanHit> hits) => _scan.add(hits);
+
   @override
   Future<void> startScan({Duration timeout = const Duration(seconds: 15)}) async {}
 

@@ -54,3 +54,8 @@ dependencies {
     // #45: required by flutter_local_notifications for core library desugaring.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
+
+// flutter_blue_plus_android registers a "license ping" task that POSTs to a Google
+// Apps Script on EVERY build (2-4 s online, ~6 s offline) and is never up to date.
+// It is telemetry, not a build input — disable it.
+tasks.matching { it.name.startsWith("flutterBluePlusLicensePing") }.configureEach { enabled = false }

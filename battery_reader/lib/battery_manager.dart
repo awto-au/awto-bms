@@ -171,6 +171,18 @@ class BatteryManager {
   bool get isLive => _live;
   bool _live = false;
 
+  /// #52: [startLive] has run (the rows are live rows, not demo rows), so
+  /// [resumeLive] can restart scanning WITHOUT disposing them.
+  bool _liveStarted = false;
+
+  /// #52: true between [pauseLive] and [resumeLive]/[startLive]. A connect that
+  /// was already in flight when the pause landed drops its link the moment it
+  /// completes, so a pause never leaves a pack grabbed.
+  bool _released = false;
+
+  /// #52: true while [pauseLive] has released the packs.
+  bool get isPaused => _released;
+
   // Live-scan bookkeeping.
   final Duration scanWindow;
   final Duration rescanInterval;
@@ -219,6 +231,8 @@ class BatteryManager {
     stopLive();
     disposeAll();
     _live = false;
+    _liveStarted = false; // #52: rows are demo rows; resumeLive -> startLive
+    _released = false;
     final seeds = <(DeviceProfile, String, int, DemoMode, int)>[
       (DeviceProfile.sphere, 'JS-2C14AA', 64, DemoMode.discharging, -54),
       (DeviceProfile.sphere, 'JS-9F031B', 9, DemoMode.charging, -67),
@@ -248,15 +262,54 @@ class BatteryManager {
     stopLive();
     disposeAll();
     _live = true;
+    _liveStarted = true;
+    _released = false;
     await BatteryLogger.instance.init();
     // #34: show remembered favourites immediately as offline placeholders —
     // before any scan — so they are always visible with their last-known values.
     // A discovered pack later BINDS to the same entry (see [resolveDiscovered]).
     materialiseRememberedFleet();
     await _scanOnce();
-    _rescanTimer =
-        Timer.periodic(rescanInterval, (_) => _scanOnce());
+    _armRescan();
+  }
+
+  /// #52: after the first scan window, arm the periodic rescan — unless a
+  /// [stopLive]/[pauseLive] landed DURING that window, in which case scanning
+  /// must stay off (re-arming it would grab the packs the user just released).
+  void _armRescan() {
+    if (!_live) return;
+    _rescanTimer?.cancel();
+    _rescanTimer = Timer.periodic(rescanInterval, (_) => _scanOnce());
     startLifetimeTotals(); // #37: keep lifetime totals current, cheaply
+  }
+
+  /// #52: release every battery — stop scanning / reconnecting, disconnect each
+  /// pack (an EXPECTED disconnect: no alarm/beep/notification), and stop the
+  /// lifetime-totals timer — but KEEP the rows (they show as offline with their
+  /// last values) so [resumeLive] picks up where it left off. This is what
+  /// "Pause monitoring", the notification's "Stop monitoring" action, and
+  /// backgrounding with background monitoring OFF all drive, so another BLE
+  /// client (the PC tools) can take the packs.
+  Future<void> pauseLive() async {
+    _released = true;
+    stopLive();
+    _aggTimer?.cancel();
+    _aggTimer = null;
+    for (final b in List.of(batteries)) {
+      await b.disconnect();
+    }
+  }
+
+  /// #52: undo [pauseLive]: scan again and reconnect the (kept) rows. Falls
+  /// back to a full [startLive] if live mode was never started (e.g. coming
+  /// from demo). No-op while already live.
+  Future<void> resumeLive() async {
+    if (_live) return;
+    if (!_liveStarted) return startLive();
+    _released = false;
+    _live = true;
+    await _scanOnce();
+    _armRescan();
   }
 
   /// Stop live scanning (leaves any created connections in place unless a
@@ -393,6 +446,9 @@ class BatteryManager {
       // Connected: clear any backoff so the next drop retries immediately.
       _backoffMs.remove(deviceId);
       _nextAttemptMs.remove(deviceId);
+      // #52: a pause landed while this connect was in flight — let go again
+      // so the user's "release the batteries" actually holds.
+      if (_released) await conn.disconnect();
     } catch (e) {
       // Failed/aborted connect: the row is already marked disconnected by
       // connectTo, so the next rescan is eligible to retry — but not before the
@@ -738,11 +794,17 @@ class BatteryManager {
   /// [fleetControlsDisabledReason]: a connected member whose BAL_STATUS has not
   /// arrived yet (or is stale) blocks the whole fleet write, because a frame
   /// built from its unknown gates could cut that pack's output.
-  String? get fleetGateWriteDisabledReason {
+  String? get fleetGateWriteDisabledReason =>
+      fleetOutputWriteDisabledReason(on: false);
+
+  /// Why a fleet-wide output write to [on] is refused, or null. #59: output
+  /// ON is a SAFE write (it cannot cut anything) and only needs every member
+  /// connected; output OFF additionally needs every member's fresh gate base.
+  String? fleetOutputWriteDisabledReason({required bool on}) {
     final conn = fleetControlsDisabledReason;
     if (conn != null) return conn;
     for (final b in fleetMembers) {
-      final r = b.gateControlsDisabledReason;
+      final r = b.disabledReasonFor(GateAction.output, on: on);
       if (r != null) return '${b.state.serial ?? 'a fleet battery'}: $r';
     }
     return null;
@@ -763,7 +825,7 @@ class BatteryManager {
   /// went stale in between); the per-member outcome is returned rather than
   /// aborting on the first failure.
   Future<FleetWriteResult> fleetSetOutput(bool on) async {
-    final reason = fleetGateWriteDisabledReason;
+    final reason = fleetOutputWriteDisabledReason(on: on);
     if (reason != null) {
       throw StateError('Refusing fleet output write: $reason');
     }

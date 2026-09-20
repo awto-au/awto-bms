@@ -106,6 +106,44 @@ class RawLogger {
   /// [init], then advanced by every flushed chunk).
   int get sizeBytes => _sizeBytes;
 
+  /// When the live file was last written (its modification time), or null if
+  /// there is no file yet. Shown in Settings so a log that was switched OFF
+  /// (and silently stopped) is obvious: "Logging is OFF — last wrote <when>".
+  /// Best effort: a stat failure reads as "never".
+  DateTime? get lastWrittenAt {
+    final file = _file;
+    if (file == null) return null;
+    try {
+      if (!file.existsSync()) return null;
+      return file.lastModifiedSync();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// One-line logging status for the Settings page: states plainly when the
+  /// log is OFF (and when it last wrote), else the size + rotation cap.
+  static String statusLine({
+    required bool enabled,
+    required int sizeBytes,
+    required int maxBytes,
+    required DateTime? lastWrittenAt,
+  }) {
+    if (!enabled) {
+      final when = lastWrittenAt == null ? 'never' : _fmtWhen(lastWrittenAt);
+      return 'Logging is OFF — last wrote $when';
+    }
+    return 'Logging — ${fmtSize(sizeBytes)} (rotates at ${fmtSize(maxBytes)})';
+  }
+
+  /// `2026-09-20 14:05` (local time, minute resolution).
+  static String _fmtWhen(DateTime t) {
+    final l = t.toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${l.year}-${two(l.month)}-${two(l.day)} '
+        '${two(l.hour)}:${two(l.minute)}';
+  }
+
   /// How many rotations have happened this session (tests / diagnostics).
   int get rotations => _rotations;
 
@@ -248,6 +286,19 @@ class RawLogger {
   /// One stray byte dropped by the parser's resync path (issue #20). Logged so
   /// no byte is ever silently discarded; the running per-battery count is passed
   /// through in the summary for context.
+  /// #60: the ASCII '0' status byte the firmware's AT bridge returns for
+  /// `AT+V` (live-confirmed, #23). Known and harmless — logged under its own
+  /// label, never as UNRECOGNISED, and not counted.
+  void logAtStatus(String serial, int byte) => _write(
+        formatLine(
+          time: DateTime.now(),
+          serial: serial,
+          label: 'AT status',
+          raw: [byte],
+          summary: "AT+V status byte '0' (AT bridge return code)",
+        ),
+      );
+
   void logUnrecognised(String serial, int byte, {int? runningCount}) => _write(
         formatLine(
           time: DateTime.now(),

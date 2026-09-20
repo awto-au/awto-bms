@@ -179,8 +179,13 @@ void main() {
       final m = BatteryManager();
       m.batteries.add(a);
       m.setInFleet(a, true);
-      await expectLater(m.fleetSetOutput(true), throwsA(isA<StateError>()));
+      // Output OFF can cut something: refused without a fresh base.
+      await expectLater(m.fleetSetOutput(false), throwsA(isA<StateError>()));
       expect(tA.gateWrites, isEmpty);
+      // #59: output ON cannot — it goes out on the safe base (both MOS = 1).
+      final r = await m.fleetSetOutput(true);
+      expect(r.allOk, isTrue);
+      expect(tA.gateWrites.single.sublist(2, 4), [1, 1]);
     });
   });
 

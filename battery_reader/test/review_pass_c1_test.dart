@@ -347,8 +347,12 @@ void main() {
       expect(SettingsStore.verbose.key, 'verbose_logging_v1');
       expect(SettingsStore.useFahrenheit.key, 'temp_fahrenheit_v1');
       expect(SettingsStore.alertNotifications.key, 'alert_notifications_v1');
+      // #52 added background monitoring (default ON); the original keys and
+      // defaults above are unchanged.
+      expect(SettingsStore.backgroundMonitoring.key,
+          'background_monitoring_v1');
       expect(SettingsStore.all.map((s) => s.defaultValue),
-          [false, true, false, true]);
+          [false, true, false, true, true]);
     });
 
     test('data persisted under the old keys still loads', () async {

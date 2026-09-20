@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:battery_reader/raw_log.dart';
 
@@ -6,6 +8,48 @@ import 'package:battery_reader/raw_log.dart';
 /// through the [RawLogger.onLine] hook, which fires synchronously for every line
 /// without touching the filesystem (init() is never called here).
 void main() {
+  group('Settings status line (raw logging OFF is stated plainly)', () {
+    test('OFF: "Logging is OFF — last wrote <when>", "never" with no file', () {
+      expect(
+          RawLogger.statusLine(
+              enabled: false, sizeBytes: 0, maxBytes: 50, lastWrittenAt: null),
+          'Logging is OFF — last wrote never');
+      final s = RawLogger.statusLine(
+          enabled: false,
+          sizeBytes: 0,
+          maxBytes: 50,
+          lastWrittenAt: DateTime(2026, 9, 20, 14, 5));
+      expect(s, startsWith('Logging is OFF — last wrote 2026-09-20 14:05'));
+    });
+
+    test('ON: size + rotation cap', () {
+      expect(
+          RawLogger.statusLine(
+              enabled: true,
+              sizeBytes: 3 * 1024 * 1024,
+              maxBytes: RawLogger.defaultMaxBytes,
+              lastWrittenAt: null),
+          'Logging — 3.0 MB (rotates at 50.0 MB)');
+    });
+
+    test('lastWrittenAt is null before any file, then the file mtime',
+        () async {
+      final dir = await Directory.systemTemp.createTemp('rawlog_mtime');
+      try {
+        final log = RawLogger.forTest(dir: dir);
+        expect(log.lastWrittenAt, isNull, reason: 'no file before init');
+        await log.init();
+        log.logRaw('JS-A', [0x01, 0x02]);
+        await log.flush();
+        final t = log.lastWrittenAt;
+        expect(t, isNotNull);
+        expect(File(log.path!).lastModifiedSync(), t);
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    });
+  });
+
   group('formatLine (pure)', () {
     final t = DateTime(2026, 9, 19, 14, 23, 1, 123);
 

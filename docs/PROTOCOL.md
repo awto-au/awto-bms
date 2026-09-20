@@ -101,7 +101,7 @@ The parser (BM `ProcessWatchRunnable`, L281 on) dispatches on the begin pair. No
 |---|---|---|
 | `CMD_BEGIN` | `FB C8 7C 9D 26 EC` | handshake |
 | `CMD_GET_EST` | `C4 7D F4 D5 86` | request estimated time |
-| `CMD_GET_VERSION` | `41 54 2B 56 0D 0A` | ASCII `AT+V\r\n` |
+| `CMD_GET_VERSION` | `41 54 2B 56 0D 0A` | ASCII `AT+V\r\n`. The reply is the framed `CMD_VERSION` **plus one stray ASCII `'0'` byte (`0x30`)** — see "AT+V stray byte" below. |
 | set BLE name | `41 54 2B 3D` + name + `0D 0A` | ASCII `AT+=<name>\r\n`; BMS replies `OK\r\n` |
 | `CMD_GATE_CONTROL` | `C3 1E` + 8 bytes + `D4 3B` | see below |
 | `CMD_BATTERY` (capacity) | `C5 60` + 3 bytes + `D6 2A` | Ah × 1000, **little-endian** u24 (BM `setBattery`, L168). **[deep pass]** `longToBytes` emits LSB first: `"100"` → `C5 60 A0 86 01 D6 2A`. Not BE. |
@@ -115,6 +115,20 @@ The parser (BM `ProcessWatchRunnable`, L281 on) dispatches on the begin pair. No
 | `CMD_BEGIN_UPDATE` | `EB 90 00 07 BB 03 40` | OTA start (BM `update`, L173) |
 | `CMD_UPDATE_FINISH` | `01 01 EC 00 00 12` | |
 | `CMD_UPDATE_END` | `AA BB 01 02 03 04 CC DD` | |
+
+#### AT+V stray byte (`0x30`) — live-confirmed 2026-09-20
+
+The only bytes the BMS ever sends that are not part of a framed message are
+single stray `0x30` (ASCII `'0'`) bytes, seen ~64 times across ~49k captured
+frames, always within the first few seconds after a (re)connect. A live A/B
+test settled their origin: 20 reconnects **with** `AT+V` produced exactly one
+`0x30` on **14/14** good connects; 20 reconnects **without** `AT+V` produced one
+on **1/13** (an outlier best explained as a buffered reply left over from another
+central's `AT+V`, since the firmware has one TX buffer). Every connect in both
+arms sent `CMD_BEGIN`, so the byte is **not** a wake/begin artefact: it is the
+status/return-code character the firmware's AT-command bridge emits in reply to
+`AT+V`, alongside the framed version. It is harmless — the byte-level resync
+parser drops it and it is counted (`unrecognisedBytes`). Only `AT+V` triggers it.
 
 ### `CMD_GATE_CONTROL` payload (BM `setMos` / `setHeat` / `setPassiva` / `setRestart` / `setFactory`, L131–L166)
 

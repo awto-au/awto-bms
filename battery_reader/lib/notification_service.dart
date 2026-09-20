@@ -25,11 +25,38 @@ import 'diagnostics.dart';
 /// monitoring foreground service.
 class AlertNotificationService {
   static const _source = 'Notifications';
-  AlertNotificationService({this.onOpenBattery});
+  AlertNotificationService({
+    this.onOpenBattery,
+    this.onStopRequested,
+    this.onExitRequested,
+  });
 
   /// Deep-link callback: invoked with the tapped notification's payload (the
   /// battery serial) so the app can navigate to that battery's detail page.
   final void Function(String serial)? onOpenBattery;
+
+  /// #52: the user pressed "Stop monitoring" on the persistent notification
+  /// (or dismissed it, Android 14+). The service is already stopping itself;
+  /// the app must stop BLE and remember the user stop so the tick does not
+  /// start it again.
+  final void Function()? onStopRequested;
+
+  /// #54: the user pressed "Exit" on the persistent notification: full
+  /// shutdown (release BLE, flush logs, terminate). The service is already
+  /// stopping itself.
+  final void Function()? onExitRequested;
+
+  /// #52: id of the "Stop monitoring" action on the persistent notification.
+  static const stopButtonId = 'stop_monitoring';
+
+  /// #54: id of the "Exit" action on the persistent notification.
+  static const exitButtonId = 'exit_app';
+
+  /// #52: message the task isolate sends to the main isolate for a user stop.
+  static const stopCommand = 'stop_monitoring';
+
+  /// #54: message the task isolate sends to the main isolate for Exit.
+  static const exitCommand = 'exit_app';
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -51,6 +78,12 @@ class AlertNotificationService {
   bool _available = false;
   bool _initDone = false;
   bool _serviceRunning = false;
+
+  /// #52: the notification text the running service was last given. The
+  /// 300 ms tick calls [updateForegroundService] continuously; the service
+  /// notification is re-posted ONLY when this changes (logcat showed the
+  /// system UI re-inflating "Monitoring N batteries" many times a second).
+  String? _serviceText;
 
   /// M10: in-flight guards. The UI ticker calls [apply] and
   /// [updateForegroundService] every 300 ms and never awaits them, so a slow
@@ -133,6 +166,10 @@ class AlertNotificationService {
   }
 
   void _initForegroundTask() {
+    // #52: the task isolate relays the notification's "Stop monitoring" button
+    // to this (UI) isolate over the plugin's named port.
+    FlutterForegroundTask.initCommunicationPort();
+    FlutterForegroundTask.addTaskDataCallback(_onTaskData);
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: monitoringChannelId,
@@ -144,14 +181,54 @@ class AlertNotificationService {
       ),
       iosNotificationOptions: const IOSNotificationOptions(),
       foregroundTaskOptions: ForegroundTaskOptions(
-        // No repeating Dart task handler: the main isolate keeps BLE + the alert
-        // logic running; the service exists only to raise the process priority
-        // (and show the persistent notification) so it survives backgrounding.
+        // No repeating Dart task: the main isolate keeps BLE + the alert logic
+        // running; the service exists to raise the process priority (and show
+        // the persistent notification) so it survives BACKGROUNDING. The task
+        // isolate only relays the notification button (#52).
         eventAction: ForegroundTaskEventAction.nothing(),
+        // #52: NO resurrection. Every plugin restart path is off:
+        //  * allowAutoRestart (plugin default TRUE) armed a 5 s restart alarm
+        //    from onDestroy whenever the service was not "correctly stopped"
+        //    (force-stop, task swipe, OS kill) — this was the app coming back
+        //    on its own and re-grabbing the batteries.
+        //  * autoRunOnBoot / autoRunOnMyPackageReplaced: never start on boot
+        //    or after an update.
+        //  * stopWithTask is left null so the manifest's
+        //    android:stopWithTask="true" governs: START_NOT_STICKY, stopSelf()
+        //    on task removal (instead of a 1 s restart alarm), reboot receiver
+        //    ignored. (Setting it true HERE would install the plugin's
+        //    visibility tracker, which stops the service as soon as the app is
+        //    merely backgrounded — the one case the service exists for.)
+        allowAutoRestart: false,
         autoRunOnBoot: false,
+        autoRunOnMyPackageReplaced: false,
         allowWakeLock: true,
       ),
     );
+  }
+
+  /// #52: message from the task isolate — the user pressed "Stop monitoring".
+  /// The task isolate stops the service itself, so it is no longer running
+  /// here either; then hand the stop to the app.
+  void _onTaskData(Object data) {
+    if (data == stopCommand) {
+      _serviceRunning = false;
+      _serviceText = null;
+      onStopRequested?.call();
+    } else if (data == exitCommand) {
+      _serviceRunning = false;
+      _serviceText = null;
+      onExitRequested?.call();
+    }
+  }
+
+  /// #54: clear every alert notification (Exit). Best effort.
+  Future<void> cancelAll() async {
+    if (!_available) return;
+    await guard<void>('cancel all notifications', () async {
+      await _plugin.cancelAll();
+      _active = {};
+    }, source: _source);
   }
 
   void _onTap(NotificationResponse response) {
@@ -256,14 +333,19 @@ class AlertNotificationService {
 
   // --- foreground service ----------------------------------------------------
 
-  /// Ensure the monitoring foreground service matches whether we are monitoring:
-  /// start (or update the count on) it while [monitoredCount] > 0, stop it when
-  /// there is nothing to monitor. No-op off Android.
-  Future<void> updateForegroundService(int monitoredCount) async {
+  /// Ensure the monitoring foreground service matches the decision: start (or
+  /// update the count on) it while [shouldRun], stop it otherwise. The caller
+  /// derives [shouldRun] from [MonitoringPolicy.serviceShouldRun] (#52) —
+  /// monitored batteries > 0, background monitoring ON, no user stop — so a
+  /// user stop always wins over the 300 ms tick. No-op off Android.
+  Future<void> updateForegroundService({
+    required bool shouldRun,
+    required int monitoredCount,
+  }) async {
     if (!_available || !Platform.isAndroid || _updatingService) return;
     _updatingService = true;
     try {
-      if (monitoredCount <= 0) {
+      if (!shouldRun) {
         await _stopService();
         return;
       }
@@ -273,7 +355,12 @@ class AlertNotificationService {
       // monitoring simply stays foreground-only. Never crashes the caller.
       await guard<void>('foreground service', () async {
         if (_serviceRunning) {
-          await FlutterForegroundTask.updateService(notificationText: text);
+          if (text == _serviceText) return; // unchanged: no re-post
+          await FlutterForegroundTask.updateService(
+            notificationText: text,
+            notificationButtons: _buttons,
+          );
+          _serviceText = text;
           return;
         }
         final result = await FlutterForegroundTask.startService(
@@ -281,16 +368,34 @@ class AlertNotificationService {
           serviceTypes: [ForegroundServiceTypes.connectedDevice],
           notificationTitle: 'Battery Reader',
           notificationText: text,
+          notificationButtons: _buttons,
+          // #52: the task isolate that relays the "Stop monitoring" button.
+          callback: monitoringTaskEntry,
         );
         // M10: only a confirmed start flips the flag (a throw leaves it
         // false, so the next tick retries rather than believing a phantom
-        // service).
-        if (result is ServiceRequestSuccess) _serviceRunning = true;
+        // service). #52: a service that is ALREADY running (left over from a
+        // previous instance of the page) is adopted rather than retried
+        // forever.
+        if (result is ServiceRequestSuccess) {
+          _serviceRunning = true;
+          _serviceText = text;
+        } else if (result is ServiceRequestFailure &&
+            result.error is ServiceAlreadyStartedException) {
+          _serviceRunning = true;
+          _serviceText = null; // adopted: text unknown, update once
+        }
       }, source: _source);
     } finally {
       _updatingService = false;
     }
   }
+
+  /// #52/#54: the persistent notification's action buttons.
+  static const _buttons = [
+    NotificationButton(id: stopButtonId, text: 'Stop monitoring'),
+    NotificationButton(id: exitButtonId, text: 'Exit'),
+  ];
 
   /// Stop the monitoring service (page dispose). Serialised with
   /// [updateForegroundService] through the same in-flight guard.
@@ -311,6 +416,54 @@ class AlertNotificationService {
     await guard<void>('stop foreground service', () async {
       await FlutterForegroundTask.stopService();
       _serviceRunning = false; // M10: only on success
+      _serviceText = null;
     }, source: _source);
+  }
+}
+
+// --- task isolate (#52) ------------------------------------------------------
+
+/// Entry point of the foreground service's task isolate. It runs no periodic
+/// work (eventAction is `nothing`); it exists only because the plugin delivers
+/// the notification's button presses to the TASK isolate, not the UI one. On
+/// "Stop monitoring" it tells the main isolate (which stops BLE and records the
+/// user stop) and stops the service itself — so the stop also works when the
+/// UI isolate is already gone.
+@pragma('vm:entry-point')
+void monitoringTaskEntry() {
+  FlutterForegroundTask.setTaskHandler(_MonitoringTaskHandler());
+}
+
+class _MonitoringTaskHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
+
+  @override
+  void onRepeatEvent(DateTime timestamp) {}
+
+  @override
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
+
+  @override
+  void onNotificationButtonPressed(String id) {
+    if (id == AlertNotificationService.stopButtonId) _userStop();
+    if (id == AlertNotificationService.exitButtonId) _exit();
+  }
+
+  /// #54: Exit — the main isolate (if alive) runs the full shutdown; the
+  /// service stops itself either way.
+  void _exit() {
+    FlutterForegroundTask.sendDataToMain(AlertNotificationService.exitCommand);
+    FlutterForegroundTask.stopService();
+  }
+
+  /// Android 14+ lets the user swipe the persistent notification away; treat
+  /// that as the same explicit stop rather than monitoring on invisibly.
+  @override
+  void onNotificationDismissed() => _userStop();
+
+  void _userStop() {
+    FlutterForegroundTask.sendDataToMain(AlertNotificationService.stopCommand);
+    FlutterForegroundTask.stopService();
   }
 }

@@ -516,7 +516,9 @@ class BatteryState {
 
   /// Count of stray bytes the parser has dropped on resync (issue #20). Every
   /// increment corresponds to one `UNRECOGNISED` line in the raw log — no byte
-  /// is ever silently discarded. Includes the stray 0x30 resync byte and any
+  /// is ever silently discarded. #60: the AT+V status byte '0' (0x30, after
+  /// AT+V was sent on the link) is classified separately and NOT counted here.
+  /// Includes any other stray byte and any
   /// byte that never forms a recognised frame.
   int unrecognisedBytes = 0;
 
@@ -684,15 +686,37 @@ class BatteryParser {
   /// bytes that produced the decoded line.
   List<int> lastFrameBytes = const [];
 
-  BatteryParser({BatteryState? state, this.onEvent, this.onUnrecognisedByte})
-      : state = state ?? BatteryState();
+  /// #60: called with the ASCII '0' (0x30) status byte the firmware's AT
+  /// bridge returns for `AT+V` (proven by the live A/B test, #23). Only
+  /// classified as such once [atVersionSent] is true for this link; it is
+  /// NOT counted in [BatteryState.unrecognisedBytes] and NOT reported through
+  /// [onUnrecognisedByte].
+  final void Function(int byte)? onAtStatusByte;
+
+  /// #60: set by the connection once `AT+V` has been sent on the current
+  /// link; cleared by [reset] (a new link). While false, a stray 0x30 is
+  /// still an unrecognised byte.
+  bool atVersionSent = false;
+
+  BatteryParser({
+    BatteryState? state,
+    this.onEvent,
+    this.onUnrecognisedByte,
+    this.onAtStatusByte,
+  }) : state = state ?? BatteryState();
 
   void addBytes(List<int> data) {
     _buf.addAll(data);
     _drain();
   }
 
-  void reset() => _buf.clear();
+  void reset() {
+    _buf.clear();
+    atVersionSent = false;
+  }
+
+  /// The AT bridge's status/return-code character for `AT+V` (#60).
+  static const int atStatusByte = 0x30;
 
   bool _match(int at, List<int> sentinel) {
     if (at + sentinel.length > _buf.length) return false;
@@ -748,12 +772,17 @@ class BatteryParser {
       }
       if (consumed < 0) {
         // Unknown begin or bad end sentinel: drop one byte, resync. Every frame
-        // in the spec is decoded above, so a dropped byte is genuinely
-        // unrecognised data (the stray 0x30 resync byte or an undocumented
-        // frame). Count it and surface it — no byte is ever silently dropped.
+        // in the spec is decoded above, so a dropped byte is either the KNOWN
+        // AT+V status byte '0' (#60 — once AT+V went out on this link) or
+        // genuinely unrecognised data (an undocumented frame). Either way it
+        // is surfaced — no byte is ever silently dropped.
         final dropped = _buf[0] & 0xff;
-        state.unrecognisedBytes++;
-        onUnrecognisedByte?.call(dropped);
+        if (dropped == atStatusByte && atVersionSent) {
+          onAtStatusByte?.call(dropped);
+        } else {
+          state.unrecognisedBytes++;
+          onUnrecognisedByte?.call(dropped);
+        }
         _buf.removeAt(0);
         continue;
       }

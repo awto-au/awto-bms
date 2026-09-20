@@ -183,6 +183,10 @@ String writeFailureReason(Object e) => switch (e) {
 class BusyWrites {
   final Set<String> _keys = {};
 
+  /// #54: app-wide number of writes in flight across every [BusyWrites]
+  /// (each detail page has its own), so Exit can ask before cutting one off.
+  static int inFlight = 0;
+
   bool get any => _keys.isNotEmpty;
   bool contains(String key) => _keys.contains(key);
 
@@ -196,11 +200,13 @@ class BusyWrites {
       String key, VoidCallback onChanged, Future<void> Function() body) async {
     if (_keys.contains(key)) return;
     _keys.add(key);
+    inFlight++;
     onChanged();
     try {
       await body();
     } finally {
       _keys.remove(key);
+      inFlight--;
       onChanged();
     }
   }
@@ -362,7 +368,7 @@ WriteAction outputAction(BatteryConnection conn, {required bool target}) {
     busyKey: WriteKeys.output,
     title: target ? 'Turn output on' : 'Turn output OFF',
     message: 'Turn the output (charge + discharge MOS) ${target ? 'ON' : 'OFF'} '
-        'on $serial?',
+        'on $serial?${target ? noFreshBaseNote(conn) : ''}',
     sternWarning: target
         ? null
         : 'This cuts $serial\'s output — anything powered by it will lose '
@@ -468,9 +474,41 @@ WriteAction capacityAction(BatteryConnection conn, double ah) {
   );
 }
 
+/// #55: the note shown while the persistent gate controls are unavailable.
+/// This is AUTOMATIC — never a user approval step — so the wording must not
+/// read like a permission ("locked", "approve"). [restartAvailable] adds that
+/// the momentary Restart / Factory actions still work (their looser rule).
+String controlsUnavailableText(String reason,
+        {bool safeWritesAvailable = false}) =>
+    'Controls unavailable — $reason. They become available again '
+    'automatically once the battery is connected and reporting its status.'
+    '${safeWritesAvailable ? ' Output ON and Restart BMS stay available.' : ''}';
+
+/// #55: the note under the Restart button while it is unavailable.
+String restartUnavailableText(String reason) =>
+    'Restart unavailable — $reason. It becomes available automatically once '
+    'the battery is connected.';
+
+/// #59: appended to the Output ON / Restart confirmation when there is no
+/// fresh gate status — the frame still goes out, built from
+/// [BatteryConnection.safeWriteBase] (both MOS forced ON, the other gates
+/// last-known or protective defaults), and the user is told so.
+String noFreshBaseNote(BatteryConnection conn) {
+  final r = conn.gateControlsDisabledReason;
+  // Only for a CONNECTED row without a fresh base: that is the one case the
+  // safe write actually goes out on safeWriteBase.
+  if (r == null || conn.safeWritesDisabledReason != null) return '';
+  final known = conn.lastKnownGates != null;
+  return '\n\nNote: no fresh gate status from ${serialOf(conn)} ($r). The '
+      'command sets output ON (both MOS bytes = 1) and carries '
+      '${known ? 'the last-known values' : 'safe defaults (low-temp protection on, smoke and heater off)'} '
+      'for the other gates.';
+}
+
 /// The ONE Restart-BMS action (double-confirmed, names the serial), shared by
-/// the Controls section and the #50 latched over-temp warning card. Refused by
-/// the connection unless the gate base is fresh (C1).
+/// the Controls section and the #50 latched over-temp warning card. #55: a
+/// momentary action — the connection allows it whenever it is connected and
+/// has decoded a gate base on this link, regardless of the base's age.
 WriteAction restartAction(BatteryConnection conn) {
   final serial = serialOf(conn);
   return WriteAction(
@@ -481,7 +519,7 @@ WriteAction restartAction(BatteryConnection conn) {
         'The battery management system on $serial will reboot; output may '
         'drop briefly and the link will reconnect. A restart also CLEARS the '
         'latched over-temperature protection (temp-alarm byte[2]), which '
-        'inhibits charging while set.',
+        'inhibits charging while set.${noFreshBaseNote(conn)}',
     confirmLabel: 'Restart',
     label: gateWriteLabel(GateAction.restart, on: true),
     send: () => conn.sendGateControl(GateAction.restart, on: true),
@@ -489,7 +527,8 @@ WriteAction restartAction(BatteryConnection conn) {
   );
 }
 
-/// Factory reset — double confirm with a stern warning.
+/// Factory reset — double confirm with a stern warning. Momentary (#55), like
+/// restart.
 WriteAction factoryAction(BatteryConnection conn) {
   final serial = serialOf(conn);
   return WriteAction(
@@ -547,70 +586,95 @@ WriteAction fleetOutputAction(BatteryManager manager, {required bool on}) {
   );
 }
 
-/// Ask for a capacity (validated 1–1000 Ah) or null on cancel. L7: the text
-/// controller is disposed on every exit path.
-Future<double?> askCapacity(BuildContext context, BatteryConnection conn) async {
-  final serial = serialOf(conn);
+/// Ask for a capacity (validated 1–1000 Ah) or null on cancel.
+///
+/// #57: the dialog widget OWNS its text controller and disposes it in
+/// `State.dispose` (when the route has fully gone). The former "dispose on
+/// every exit path" `finally` ran the moment the dialog was popped — while its
+/// TextField was still mounted for the pop transition — and the resulting
+/// "used after being disposed" throw inside `Element.update` left orphaned
+/// dependents behind, which the route teardown then reported as the red
+/// `'_dependents.isEmpty': is not true` screen. See `_RenameDialog` in
+/// main.dart for the full chain; regression test in test/crash_57_test.dart.
+Future<double?> askCapacity(BuildContext context, BatteryConnection conn) {
   final current = conn.ratedCapacityAh;
-  final controller = TextEditingController(
-      text: current != null ? current.toStringAsFixed(0) : '');
-  try {
-    return await showDialog<double>(
-      context: context,
-      builder: (ctx) {
-        String? error;
-        return StatefulBuilder(
-          builder: (ctx, setLocal) => AlertDialog(
-            title: const Text('Set rated capacity'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  "Enter $serial's rated capacity in amp-hours (1–1000 Ah). "
-                  'This changes the pack’s SOC and remaining-time estimator basis.',
-                  style: const TextStyle(fontSize: 13),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: controller,
-                  autofocus: true,
-                  keyboardType:
-                      const TextInputType.numberWithOptions(decimal: true),
-                  decoration: InputDecoration(
-                    labelText: 'Capacity',
-                    suffixText: 'Ah',
-                    errorText: error,
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: () {
-                  final v = double.tryParse(controller.text.trim());
-                  if (v == null ||
-                      !v.isFinite ||
-                      v < CapacityWrite.minAh ||
-                      v > CapacityWrite.maxAh) {
-                    setLocal(
-                        () => error = 'Enter a number between 1 and 1000');
-                    return;
-                  }
-                  Navigator.pop(ctx, v);
-                },
-                child: const Text('Next…'),
-              ),
-            ],
+  return showDialog<double>(
+    context: context,
+    builder: (_) => _CapacityDialog(
+      serial: serialOf(conn),
+      initial: current != null ? current.toStringAsFixed(0) : '',
+    ),
+  );
+}
+
+class _CapacityDialog extends StatefulWidget {
+  final String serial;
+  final String initial;
+  const _CapacityDialog({required this.serial, required this.initial});
+
+  @override
+  State<_CapacityDialog> createState() => _CapacityDialogState();
+}
+
+class _CapacityDialogState extends State<_CapacityDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initial);
+  String? _error;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _next() {
+    final v = double.tryParse(_controller.text.trim());
+    if (v == null ||
+        !v.isFinite ||
+        v < CapacityWrite.minAh ||
+        v > CapacityWrite.maxAh) {
+      setState(() => _error = 'Enter a number between 1 and 1000');
+      return;
+    }
+    Navigator.pop(context, v);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Set rated capacity'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            "Enter ${widget.serial}'s rated capacity in amp-hours (1–1000 Ah). "
+            'This changes the pack’s SOC and remaining-time estimator basis.',
+            style: const TextStyle(fontSize: 13),
           ),
-        );
-      },
+          const SizedBox(height: 12),
+          TextField(
+            controller: _controller,
+            autofocus: true,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(
+              labelText: 'Capacity',
+              suffixText: 'Ah',
+              errorText: _error,
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _next,
+          child: const Text('Next…'),
+        ),
+      ],
     );
-  } finally {
-    controller.dispose();
   }
 }

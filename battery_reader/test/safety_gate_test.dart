@@ -38,6 +38,11 @@ void main() {
 
   List<int> payload(List<int> frame) => frame.sublist(2, frame.length - 2);
 
+  // A cell-voltage frame (A0 C1): telemetry that is not a BAL_STATUS.
+  const cells = [
+    0xA0, 0xC1, 0x04, 0x05, 0x0d, 0x08, 0x0d, 0x07, 0x0d, 0x05, 0x0d, 0xB1, 0xD2
+  ];
+
   group('C1: gate write is refused without a fresh BAL_STATUS', () {
     test('not connected -> refused, nothing written', () async {
       final t = FakeTransport();
@@ -66,10 +71,14 @@ void main() {
           throwsA(isA<StateError>()));
       await expectLater(c.sendGateControl(GateAction.heatGate, on: true),
           throwsA(isA<StateError>()));
-      await expectLater(c.sendGateControl(GateAction.restart),
+      await expectLater(c.sendGateControl(GateAction.output, on: false),
           throwsA(isA<StateError>()));
       expect(t.writes.length, before, reason: 'no gate frame was written');
       expect(t.gateWrites, isEmpty);
+      // #59: restart is a SAFE write — it goes out on the safe base (both MOS
+      // = 1, never the zero-filled base above).
+      await c.sendGateControl(GateAction.restart);
+      expect(payload(t.gateWrites.single), [1, 1, 1, 0, 0, 1, 0, 0]);
     });
 
     test('after a BAL_STATUS the write is allowed and built from LIVE gates',
@@ -89,18 +98,22 @@ void main() {
       expect(payload(t.gateWrites.single), [1, 1, 1, 0, 0, 0, 1, 0]);
     });
 
-    test('a BAL_STATUS older than 5 s is stale -> refused', () async {
+    test('a BAL_STATUS older than 15 s (#55) is stale -> toggle refused',
+        () async {
       var clock = DateTime.utc(2026, 1, 1, 12);
       final t = FakeTransport();
       final c = BatteryConnection(transport: t, now: () => clock);
       await c.connectTo('dev-1', name: 'JS-A');
       c.parser.addBytes(bal());
       expect(c.hasFreshGateState, isTrue);
-      clock = clock.add(const Duration(milliseconds: 4999));
+      clock = clock.add(const Duration(milliseconds: 14999));
+      // Other telemetry keeps flowing (else the #59 "not streaming" watchdog
+      // reports first, at 10 s); only the BAL_STATUS is stalled.
+      c.parser.addBytes(cells);
       expect(c.hasFreshGateState, isTrue);
       clock = clock.add(const Duration(milliseconds: 2));
       expect(c.hasFreshGateState, isFalse);
-      expect(c.gateControlsDisabledReason, contains('stale'));
+      expect(c.gateControlsDisabledReason, contains('No gate status'));
       await expectLater(c.sendGateControl(GateAction.output, on: false),
           throwsA(isA<StateError>()));
       expect(t.gateWrites, isEmpty);
