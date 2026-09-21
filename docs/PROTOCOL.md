@@ -23,8 +23,8 @@ not exercised against hardware.
 | RV Battery | `com.joysuny.mimibattery` | 1.0.2 | `artifacts/rv-battery-1.0.2/` |
 | RV Battery ("RV TECH") | `com.joysuny.mimibattery` | 1.0.4 | `artifacts/rv-battery-1.0.4/` |
 
-**Same across all three:** the UUIDs (FCF0 service, FCF1 write, FCF2 notify; Telink OTA
-`e49a25e0…`), the sentinel framing, the handshake, every RX/TX command in the tables below,
+**Same across all three:** the UUIDs (FCF0 service, FCF1 write, FCF2 notify; Actions/iBluz OTA-transparent UUID family
+`e49a25e0…` (NOT Telink)), the sentinel framing, the handshake, every RX/TX command in the tables below,
 the status frame, and the hidden service-mode gesture (logo ×4 → current ×4 → long-press
 info → password). **[deep pass]** All three `BatteryCMD.java` are **byte-identical** — every
 `CMD_*` constant, including the BLE-rename command (`AT+=` in all three), matches. The only
@@ -65,7 +65,7 @@ provenance and hashes are in each tree's `PROVENANCE.md`.
 | Service | `0000FCF0-0000-1000-8000-00805F9B34FB` |
 | Write char | `0000FCF1-…` (app → BMS) |
 | Notify char | `0000FCF2-…` (BMS → app), CCCD `2902` |
-| OTA | Telink service `e49a25e0-f69a-11e8-8eb2-f2801f1b9fd1`, chars `…25f8`, `…28e1` |
+| OTA / 2nd pipe | The app's SDK defaults name the Actions Technology (iBluz) OTA/transparent UUIDs `e49a25f8` (service) / `e49a25e0` (write) / `e49a28e1` (notify) — **not Telink** (Telink's are `00010203-…1910/2b12`). The app never uses them. A live GATT dump of a JS5.1 pack (2026-09-21) shows no `e49a` service at all; instead an undocumented service `11110001-1111-1111-1111-111111111111` with chars `11110002` (write-without-response) and `11110003` (notify, write). Writing the wake/AT frames to it produced no reply on a dormant pack. The bridge identifies itself over the standard Device Information service as Manufacturer `Nations`, Model `NS-BLE-1.0`, Serial `1.0.0.0-LE`, HW/FW/SW rev `1.0.0`, System ID `12 34 56 ff fe 9a bc de`, PnP ID `02 5e 04 40 00 00 03` — i.e. a Nations N32WB03x BLE SoC running Nations' stock BLE profile (the `1111…` service is the SDK's UART-transparent RDTSS service) with JoySuny's FCF0 service added. |
 | Adv name | prefix `JS` (`Global.DEFAULT_BLUE_HEAD`); app stores renames as `Sphere_device_<name>` |
 | MTU | app sends `C3 F2 <mtu> ED CE` after negotiation (BM `sendMtu`) |
 
