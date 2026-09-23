@@ -1415,7 +1415,7 @@ class BatteryLogger {
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
     // ignore: avoid_print
-    print('lifetime totals $serial extended '
+    logLine('LIFETIME', 'lifetime totals $serial extended '
         '(${prior.totals.throughputAh.toStringAsFixed(2)}Ah) -> '
         '(${updated.totals.throughputAh.toStringAsFixed(2)}Ah) '
         'over ${newRows.length} new rows');

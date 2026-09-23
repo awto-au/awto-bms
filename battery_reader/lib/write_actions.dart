@@ -156,7 +156,7 @@ Future<bool> runWrite(
   } catch (e) {
     final reason = writeFailureReason(e);
     // ignore: avoid_print
-    print('[WRITE-FAIL] $label: $e');
+    logLine('WRITE-FAIL', '$label: $e');
     if (context.mounted) {
       await warnDialog(context,
           title: 'Write failed', message: 'Failed: $label — $reason');
