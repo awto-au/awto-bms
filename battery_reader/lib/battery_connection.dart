@@ -9,7 +9,7 @@ import 'battery_protocol.dart';
 import 'ble_transport.dart';
 import 'demo_source.dart';
 import 'diagnostics.dart';
-import 'fmt.dart' show hexOf;
+import 'fmt.dart' show hexOf, logLine;
 import 'ota_update.dart';
 import 'raw_log.dart';
 
@@ -725,7 +725,7 @@ class BatteryConnection {
 
     await link.discoverAndSubscribe((data) {
       // ignore: avoid_print
-      print('[RX] ${hex(data)}');
+      logLine('RX', hex(data));
       // Issue #19: capture the RAW notification bytes verbatim, BEFORE framing,
       // so nothing is ever lost (stray 0x30 resync byte / unrecognised bytes).
       RawLogger.instance.logRaw(state.serial ?? deviceId, data);
@@ -763,7 +763,7 @@ class BatteryConnection {
   /// "not confirmed" warning that could never be satisfied.
   Future<void> _send(List<int> bytes, {String label = 'command'}) async {
     // ignore: avoid_print
-    print('[TX] ${hex(bytes)}');
+    logLine('TX', hex(bytes));
     final demo = _demo;
     if (demo != null) {
       RawLogger.instance.logTx(state.serial ?? '', '$label (demo)', bytes);
@@ -1483,7 +1483,7 @@ class BatteryConnection {
           : '${_warnListFor(category)}',
     };
     // ignore: avoid_print
-    print('[EVT] ${e.label.padRight(16)} $detail');
+    logLine('EVT', '${e.label.padRight(16)} $detail');
     // Issue #19: mirror the decoded frame into the single raw log — plain-English
     // label, the frame's raw bytes and the short decode summary.
     RawLogger.instance.logEvent(

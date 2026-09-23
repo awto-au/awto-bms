@@ -60,7 +60,7 @@ Future<void> main() async {
     // so the process stays alive (return true = we dealt with it).
     WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
       // ignore: avoid_print
-      print('[UNCAUGHT] $error');
+      logLine('UNCAUGHT', '$error');
       return true;
     };
     // sqflite ships no desktop implementation, so on Windows/Linux/macOS swap in
@@ -81,7 +81,7 @@ Future<void> main() async {
   }, (error, stack) {
     // Last resort: anything that escapes to the zone is logged and swallowed.
     // ignore: avoid_print
-    print('[ZONE-UNCAUGHT] $error');
+    logLine('ZONE-UNCAUGHT', '$error');
   });
 }
 

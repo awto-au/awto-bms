@@ -91,7 +91,7 @@ class AppLog {
     totalRecorded++;
     if (echoToConsole) {
       // ignore: avoid_print
-      print('[DIAG] ${e.source}: ${e.message}');
+      print('${fmt.fmtStamp(e.time)} [DIAG] ${e.source}: ${e.message}');
     }
     final s = sink;
     if (s != null) {

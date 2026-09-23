@@ -22,6 +22,13 @@ String fmtStamp(DateTime d) => '${pad(d.year, 4)}-${pad(d.month)}-${pad(d.day)} 
     '${pad(d.hour)}:${pad(d.minute)}:${pad(d.second)}.${pad(d.millisecond, 3)}';
 
 /// [fmtStamp] of an epoch-ms instant (local time).
+/// Console line with a local timestamp: `2026-09-22 08:41:03.117 [TAG] msg`.
+/// Every console print in the app goes through this so the Windows console and
+/// `adb logcat` output can be correlated with the raw log and Diagnostics.
+void logLine(String tag, String message) =>
+    // ignore: avoid_print
+    print('${fmtStamp(DateTime.now())} [$tag] $message');
+
 String fmtStampMs(int ms) => fmtStamp(DateTime.fromMillisecondsSinceEpoch(ms));
 
 /// Lowercase, space-separated two-hex-digit bytes: `a2 57 85 00`.

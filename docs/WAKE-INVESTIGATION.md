@@ -70,6 +70,15 @@ Do not send: any OTA data/finish frame without a valid image, `AT+STRS` /
 `AT+DEFAULT`-style factory verbs, `AT+SLEEP`, sleep-ON, the factory-reset bit,
 or anything on the `1111…` / `e49a…` services beyond what was tried.
 
+## 4a. Fuzz of the bridge (2026-09-22, with consent)
+
+Bounded, logged fuzz on `FCF1`: `AT+X?`, `AT+X=?` and bare `AT+X` for every
+X in A–Z and 0–9 (108 commands, no parameters, so no persisted-config write was
+attempted), plus all 22 known begin/end sentinel pairs with an empty payload.
+Result: **zero replies** other than one generic `'0'` early in the session. The
+bridge's parser has no verbs beyond `V` and `=`; there is no hidden reset, GPIO
+or wake command. Log: session scratchpad `fuzz_aa.log`.
+
 ## 5. Physical recovery, least to most invasive
 
 1. **Isolate the pack.** Disconnect AA's cables from the bank entirely. Nothing
