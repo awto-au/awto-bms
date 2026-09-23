@@ -83,4 +83,76 @@ class SettingsStore extends PrefsStore {
       readInt(sampleIntervalKey, fallback: defaultSampleIntervalS);
   Future<void> saveSampleIntervalS(int seconds) =>
       writeInt(sampleIntervalKey, seconds);
+
+  /// #68: the desktop window's last bounds (logical px) + maximized flag,
+  /// stored as JSON. Desktop only; absent / unreadable = let the runner fit
+  /// the window to the screen as on first run.
+  static const windowBoundsKey = 'window_bounds_v1';
+
+  Future<WindowBounds?> loadWindowBounds() async {
+    final raw = await readJson(windowBoundsKey);
+    return raw is Map ? WindowBounds.fromMap(raw) : null;
+  }
+
+  Future<void> saveWindowBounds(WindowBounds b) =>
+      writeJson(windowBoundsKey, b.toMap());
+}
+
+/// #68: a remembered desktop window placement in LOGICAL pixels (the runner
+/// scales by the monitor's DPI). Pure value type; [fromMap] rejects anything
+/// that is not four finite numbers of a plausible size.
+class WindowBounds {
+  final double left;
+  final double top;
+  final double width;
+  final double height;
+  final bool maximized;
+  const WindowBounds({
+    required this.left,
+    required this.top,
+    required this.width,
+    required this.height,
+    this.maximized = false,
+  });
+
+  /// The runner's minimum window size (windows/runner/main.cpp).
+  static const double minWidth = 900;
+  static const double minHeight = 600;
+
+  static WindowBounds? fromMap(Map<dynamic, dynamic> m) {
+    double? at(String k) {
+      final v = m[k];
+      return v is num && v.isFinite ? v.toDouble() : null;
+    }
+
+    final l = at('left'), t = at('top'), w = at('width'), h = at('height');
+    if (l == null || t == null || w == null || h == null) return null;
+    if (w < minWidth || h < minHeight || w > 20000 || h > 20000) return null;
+    return WindowBounds(
+        left: l, top: t, width: w, height: h, maximized: m['maximized'] == true);
+  }
+
+  Map<String, Object> toMap() => {
+        'left': left,
+        'top': top,
+        'width': width,
+        'height': height,
+        'maximized': maximized,
+      };
+
+  @override
+  bool operator ==(Object other) =>
+      other is WindowBounds &&
+      other.left == left &&
+      other.top == top &&
+      other.width == width &&
+      other.height == height &&
+      other.maximized == maximized;
+
+  @override
+  int get hashCode => Object.hash(left, top, width, height, maximized);
+
+  @override
+  String toString() =>
+      'WindowBounds($left, $top, ${width}x$height${maximized ? ', maximized' : ''})';
 }

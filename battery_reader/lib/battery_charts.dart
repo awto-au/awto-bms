@@ -41,7 +41,11 @@ const int _gapMs = BatteryLogger.gapMs;
 
 class BatteryChartsPage extends StatefulWidget {
   final String serial;
-  const BatteryChartsPage({super.key, required this.serial});
+
+  /// #68: rendered inside the desktop right pane — no Scaffold / app bar; the
+  /// window selector and Refresh become a toolbar row above the chart grid.
+  final bool embedded;
+  const BatteryChartsPage({super.key, required this.serial, this.embedded = false});
 
   @override
   State<BatteryChartsPage> createState() => _BatteryChartsPageState();
@@ -232,16 +236,64 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
 
   @override
   Widget build(BuildContext context) {
+    final selector = SegmentedButton<LookbackWindow>(
+      segments: [
+        for (final w in LookbackWindow.chartWindows)
+          ButtonSegment(value: w, label: Text(w.label)),
+      ],
+      selected: {_window},
+      onSelectionChanged: (s) {
+        setState(() => _window = s.first);
+        _load();
+      },
+    );
+    final refresh = IconButton(
+      tooltip: 'Refresh',
+      icon: const Icon(Icons.refresh),
+      onPressed: _load,
+    );
+    // #68: the chart cards in a responsive grid — 1 column on a phone, 2 at
+    // a window >= 1100 px, 3 at >= 1500 ([chartColumnsFor]).
+    final columns = chartColumnsFor(MediaQuery.sizeOf(context).width);
+    final body = Expanded(
+      child: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _error != null
+              ? _ErrorState(reason: _error!, onRetry: _load)
+              : !_hasAnyData
+                  ? const _EmptyState()
+                  : ListView(
+                      padding: const EdgeInsets.fromLTRB(12, 4, 12, 32),
+                      children: chartGridRows(_charts(), columns),
+                    ),
+    );
+    if (widget.embedded) {
+      // The desktop pane: a toolbar (selector as a segmented control, Refresh
+      // on the right) over the grid; the tab strip is the chrome.
+      return Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 8, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: selector,
+                  ),
+                ),
+                refresh,
+              ],
+            ),
+          ),
+          body,
+        ],
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         title: Text('${widget.serial} · history'),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            icon: const Icon(Icons.refresh),
-            onPressed: _load,
-          ),
-        ],
+        actions: [refresh],
       ),
       body: PageShell(
         maxWidth: 720,
@@ -249,31 +301,9 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
-              child: SegmentedButton<LookbackWindow>(
-                segments: [
-                  for (final w in LookbackWindow.chartWindows)
-                    ButtonSegment(value: w, label: Text(w.label)),
-                ],
-                selected: {_window},
-                onSelectionChanged: (s) {
-                  setState(() => _window = s.first);
-                  _load();
-                },
-              ),
+              child: selector,
             ),
-            Expanded(
-              child: _loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _error != null
-                      ? _ErrorState(reason: _error!, onRetry: _load)
-                      : !_hasAnyData
-                          ? const _EmptyState()
-                          : ListView(
-                              padding:
-                                  const EdgeInsets.fromLTRB(12, 4, 12, 32),
-                              children: _charts(),
-                            ),
-            ),
+            body,
           ],
         ),
       ),
@@ -354,6 +384,37 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
           policy: _policy,
         ),
       ];
+}
+
+/// #68: chart-grid columns for a window [width] (logical px): 1 on a phone,
+/// 2 from 1100 px, 3 from 1500 px. Pure.
+int chartColumnsFor(double width) => width >= 1500
+    ? 3
+    : width >= 1100
+        ? 2
+        : 1;
+
+/// #68: lay [cards] out [columns] per row (each row's cards stretched to the
+/// same height); with one column the list is returned as is, so the phone
+/// page is unchanged. Pure over the widgets.
+List<Widget> chartGridRows(List<Widget> cards, int columns) {
+  if (columns <= 1) return cards;
+  return [
+    for (var i = 0; i < cards.length; i += columns)
+      IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (var c = 0; c < columns; c++)
+              Expanded(
+                child: i + c < cards.length
+                    ? cards[i + c]
+                    : const SizedBox.shrink(),
+              ),
+          ],
+        ),
+      ),
+  ];
 }
 
 /// One named series: a metric's held intervals.

@@ -28,6 +28,9 @@ class AlarmEventsSection extends StatelessWidget {
   /// Why the load failed (DB error), or null.
   final String? error;
 
+  /// #68: desktop density (halved card padding).
+  final bool dense;
+
   const AlarmEventsSection({
     super.key,
     required this.serial,
@@ -36,6 +39,7 @@ class AlarmEventsSection extends StatelessWidget {
     this.showingAll = false,
     this.onShowAll,
     this.error,
+    this.dense = false,
   });
 
   Future<void> _copy(BuildContext context) async {
@@ -52,7 +56,7 @@ class AlarmEventsSection extends StatelessWidget {
     final more = total > events.length;
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: dense ? const EdgeInsets.all(8) : const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [

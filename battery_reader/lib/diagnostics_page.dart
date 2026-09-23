@@ -35,7 +35,18 @@ class DiagnosticsPage extends StatefulWidget {
   /// whether its controls are available (with the reason when not). Called
   /// on every build so Refresh shows the live values.
   final List<String> Function()? batteryStatus;
-  const DiagnosticsPage({super.key, this.scanError, this.batteryStatus});
+
+  /// #68: rendered inside the desktop Settings tab — no Scaffold / app bar;
+  /// a header row with a back arrow ([onBack]) and the actions instead.
+  final bool embedded;
+  final VoidCallback? onBack;
+  const DiagnosticsPage({
+    super.key,
+    this.scanError,
+    this.batteryStatus,
+    this.embedded = false,
+    this.onBack,
+  });
 
   @override
   State<DiagnosticsPage> createState() => _DiagnosticsPageState();
@@ -69,32 +80,65 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     final raw = RawLogger.instance;
     final entries = AppLog.instance.recent();
     final scheme = Theme.of(context).colorScheme;
+    final actions = [
+      IconButton(
+        tooltip: 'Copy all',
+        icon: const Icon(Icons.copy),
+        onPressed: _copy,
+      ),
+      IconButton(
+        tooltip: 'Clear',
+        icon: const Icon(Icons.delete_outline),
+        onPressed: () => setState(AppLog.instance.clear),
+      ),
+      IconButton(
+        tooltip: 'Refresh',
+        icon: const Icon(Icons.refresh),
+        onPressed: () => setState(() {}),
+      ),
+    ];
+    final list = _list(context, log, raw, entries, scheme);
+    if (widget.embedded) {
+      return Column(
+        children: [
+          Row(
+            children: [
+              IconButton(
+                tooltip: 'Back to Settings',
+                icon: const Icon(Icons.arrow_back),
+                onPressed: widget.onBack,
+              ),
+              Expanded(
+                child: Text('Diagnostics',
+                    style: Theme.of(context).textTheme.titleMedium),
+              ),
+              ...actions,
+            ],
+          ),
+          const Divider(height: 1),
+          Expanded(child: list),
+        ],
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         title: const Text('Diagnostics'),
-        actions: [
-          IconButton(
-            tooltip: 'Copy all',
-            icon: const Icon(Icons.copy),
-            onPressed: _copy,
-          ),
-          IconButton(
-            tooltip: 'Clear',
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () => setState(AppLog.instance.clear),
-          ),
-          IconButton(
-            tooltip: 'Refresh',
-            icon: const Icon(Icons.refresh),
-            onPressed: () => setState(() {}),
-          ),
-        ],
+        actions: actions,
       ),
       body: SafeArea(
         child: Center(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 720),
-            child: ListView(
+            child: list,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _list(BuildContext context, BatteryLogger log, RawLogger raw,
+      List<AppLogEntry> entries, ColorScheme scheme) {
+    return ListView(
               padding: const EdgeInsets.symmetric(vertical: 8),
               children: [
                 ListTile(
@@ -176,10 +220,6 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                     ),
                   ),
               ],
-            ),
-          ),
-        ),
-      ),
-    );
+            );
   }
 }
