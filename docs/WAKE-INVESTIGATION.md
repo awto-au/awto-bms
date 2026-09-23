@@ -1,9 +1,14 @@
 # Waking a dormant JoySuny BMS — investigation (2026-09-21)
 
-**Case.** JS-2C14AA (Sphere EVO, firmware JS5.1) had both MOS switches turned OFF
-while Bluetooth-standby ("Low Power Sleep Mode") was ON. It went dormant: the BLE
-bridge still advertises and connects, but the BMS microcontroller behind it does
-not run. The pack is permanently paralleled with JS-2C14B8 (healthy).
+**Case.** JS-2C14AA (Sphere EVO, firmware JS5.1) went dormant between 07:03 and
+21:02 on 20 Sep 2026 with no observer. Its last telemetry showed MOS **on**,
+idle at 0 A, 93 %, 3.33 V/cell, no alarm bits, and its Bluetooth-standby flag
+**off** (see ALARM-CORRELATION.md — an earlier draft of this note assumed the
+output had been switched off with standby on; the logs show neither). The BLE
+bridge still advertises and connects, but the BMS microcontroller behind it
+does not run. The pack is permanently paralleled with JS-2C14B8 (healthy).
+The cause is undetermined; the vendor's documented standby behaviour does not
+apply, and the spec row "BMS Re-Connect: Auto" did not hold.
 
 **Verdict.** There is no Bluetooth path to wake it — proven by three clients
 (our app, the vendor app, a Python tool), a byte-level re-reverse of all three
@@ -55,9 +60,10 @@ common node. With **both FETs open, each direction meets one reverse-biased
 body diode — zero current in either direction.** The vendor's only documented
 wake is "detects charging or discharging", i.e. current, which can never occur.
 In a parallel bank the pack's terminals are additionally clamped to the healthy
-pack, so it never even sees a voltage step. Output-OFF + standby-ON is therefore
-a state the firmware cannot leave on its own; the app now refuses to enter it
-(standby is switched off before any switch-off, with a parallel-bank warning).
+pack, so it never even sees a voltage step. Whether AA's FETs are actually open is unobserved (they were on in its last
+frame); a pack sitting 0.5 V below its parallel partner yet taking no charge
+current behaves as if they are. A meter on the isolated pack's posts settles it.
+The app still refuses output-off with standby on, as a precaution.
 
 ## 4. Options that remain on the radio (consent only; low value)
 

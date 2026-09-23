@@ -50,14 +50,14 @@ frames, 5 000+ Python frames, every interval-DB row).
   alarm bytes 0. From 20 Sep 21:02 the app only ever saw "no telemetry". The
   app's "Charge — / Output —" at that point was the no-data display, not an
   OFF reading. Whatever silenced AA happened between 07:03 and 21:02 on 20 Sep
-  with no observer and no alarm precursor. The most consistent explanation is
-  the vendor-documented one: Bluetooth standby had been switched ON on AA
-  (the toggle became available that day) and the pack was idle at 0 A, so it
-  entered standby; the healthy pack kept streaming because its standby was
-  switched OFF during testing. Whether the BMS also opens its FETs when it
-  enters standby is not observable from the data — but a pack sitting in
-  parallel at a 0.5 V deficit that takes no charge current behaves as if they
-  are open.
+  with no observer and no alarm precursor. **Bluetooth standby was OFF on AA**
+  (its stored flag read "mode=off" at every handshake on 19 Sep; no standby-ON
+  was ever sent to it before it went silent — the only one in the log is at
+  20 Sep 21:04, after it was already dormant). So the vendor's documented
+  standby behaviour does not explain it: a pack with standby off, MOS on, idle,
+  no alarms, stopped transmitting. Cause undetermined — a BMS hang or an
+  undocumented protection state; the spec row "BMS Re-Connect: Auto" did not
+  hold. Confidence in any specific cause: low (a 14 h blind spot, one event).
 
 ## Measured envelope (real frames only)
 
