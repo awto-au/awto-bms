@@ -347,6 +347,172 @@ A8 AC  s0 s1 s2 s3 s4 s5 s6  B9 21
 The normal main screen consumes only `s0` (dial label). `s3` is dropped there and only
 surfaces in the hidden service screen (`fragment_dial.xml` → `sbtn_bla`), display-only.
 
+## Frame table with value summaries and the sentinel pattern
+
+Added 2026-09-23 from a read-only pass over every `CMD_*` constant in `BatteryCMD.java`, the
+two reference parsers (`python_ble/read_batteries.py` `Parser.FIXED`, `battery_reader/lib/battery_protocol.dart`
+`_fixed`) and three captures: `python_ble/logs/JS-2C14B8.log` + `JS-2C14AA.log` (2026-09-19
+14:00–16:13, both packs) and the phone raw log (2026-09-19 20:38 → 2026-09-23 05:25, ~13.3 k
+frames of each periodic type, mostly `JS-2C14B8`). Both packs are 4S LiFePO4, 100 Ah, firmware
+`JS5.1`. Timestamps below are from those logs; `hh:mm:ss` alone means the 2026-09-19 Python log.
+
+### Sentinel pattern
+
+Every begin/end pair in the app, with the arithmetic that was tested. `Δ0 = end[0] − begin[0]`,
+`Δ1 = end[1] − begin[1]` (mod 256). `Rule` says which rule the pair obeys.
+
+| Frame | Dir | Begin | End | Δ0 | Δ1 | end[1] ⊕ begin[1] | Rule |
+|---|---|---|---|---|---|---|---|
+| VOL | RX | `A0 C1` | `B1 D2` | +11 | +11 | 13 | 1 |
+| TEMPUTER | RX | `A1 4F` | `B2 E3` | +11 | +94 | AC | 1 |
+| ALL_DATA | RX | `A2 57` | `B3 6C` | +11 | +15 | 3B | 1 |
+| MOS_STATUS | RX | `A3 9F` | `B4 C7` | +11 | +28 | 58 | 1 |
+| WARN_CUR_ALARM | RX | `A4 8B` | `B5 DD` | +11 | +52 | 56 | 1 |
+| WARN_VOL_ALARM | RX | `A5 99` | `B6 17` | +11 | +7E | 8E | 1 |
+| WARN_TEMP_ALARM | RX | `A6 C0` | `B7 72` | +11 | +B2 | B2 | 1 |
+| OTHER (trailer observed on the wire, not in Java) | RX | `A7 4E` | `B8 29` | +11 | +DB | 67 | 1 |
+| BAL_STATUS | RX | `A8 AC` | `B9 21` | +11 | +75 | 8D | 1 |
+| SOC | RX | `A9 64` | `BA 5E` | +11 | +FA | 3A | 1 |
+| EST_TIME | RX | `AA AF` | `BB 22` | +11 | +73 | 8D | 1 |
+| VERSION | RX | `AC 9A` | `BD 10` | +11 | +76 | 8A | 1 |
+| GATE_CONTROL | TX | `C3 1E` | `D4 3B` | +11 | +1D | 25 | 1 |
+| GET_EST (5-byte, payload `F4`) | TX | `C4 7D` | `D5 86` | +11 | +09 | FB | 1 |
+| BATTERY (capacity) | TX | `C5 60` | `D6 2A` | +11 | +CA | 4A | 1 |
+| GET_HISTORY (payload `CF 00`) | TX | `C6 7C` | `D7 52` | +11 | +D6 | 2E | 1 |
+| CLEAR_HISTORY (no payload) | TX | `C7 46` | `D8 82` | +11 | +3C | C4 | 1 |
+| SET_TIME | TX | `C8 18` | `D9 74` | +11 | +5C | 6C | 1 |
+| SETTING_RESPOND | RX | `AB BA` | `CD DC` | +22 | +22 | 66 | 2 |
+| UPDATE_END (OTA, 8-byte) | TX | `AA BB` | `CC DD` | +22 | +22 | 66 | 2 |
+| OPEN/CLOSE_SLEEP_CONTROL | TX | `AA CC` | `DD EE` | +33 | +22 | 22 | 2 |
+| SLEEP_SET_SUCCESS | RX | `AC CA` | `DE ED` | +32 | +23 | 27 | 2 |
+| SEND_MTU | TX | `C3 F2` | `ED CE` | +2A | +DC | 3C | — |
+| GATE_SET (gate ack) | RX | `D2 7E` | `FA 4B` | +28 | +CD | 35 | — |
+| HISTORY (4-byte sentinels) | RX | `FE C9 BD 8A` | `EA 4F 80 DE` | — | — | — | — (see below) |
+| SET_HISTORY_STATUS (4-byte sentinels) | TX | `FF CA BE 9A` | `FA 5F 81 DC` | — | — | — | — (see below) |
+| CMD_BEGIN (6-byte token) | TX | `FB C8 7C 9D 26 EC` | | | | | opaque |
+| NAME_SET / rename | both | ASCII `AT+=` … `\r\n` / `\r\nOK\r\n` | | | | | ASCII |
+| OTA family | both | `EB 90 00 07 BB 03 40`, `01 01 …`, `FF 01 B1 02 EF`, `AA BB 01 02 EF`, `01 01 EC 00 00 12` | | | | | bootloader dialect |
+
+**Rule 1 — `end[0] = begin[0] + 0x11`.** Holds for all 18 pairs of the two *numbered* families:
+the RX reports `A0`–`AC` (every one except `AB` and `AC CA`, which belong to rule 2) and the TX
+commands `C3`–`C8` (every one except `C3 F2`). `begin[0]` is a sequential opcode — `A0`…`AC`
+enumerates the 13 report types in order, `C3`…`C8` the six framed commands — and the end byte is
+the opcode plus 0x11. The observed `A7 4E … B8 29` trailer of the OTHER frame fits this rule
+exactly (`A7 + 11 = B8`), which is the evidence that `B8 29` is its end sentinel (see oddities).
+
+**`end[1]` is not derivable from the begin pair.** Across the 18 rule-1 frames, `Δ1` takes 18
+distinct values and `end[1] ⊕ begin[1]` 17, so neither an additive nor an XOR constant exists.
+Also tested and rejected: one's/two's complement, nibble swap, bit reversal, rotate-by-k with
+any constant, every affine map `a·begin[1] + c` and `a·begin[1] ⊕ c` (65 536 candidates each —
+none fits more than 2 of 18, i.e. chance level), functions of `begin[0] + begin[1]` and
+`begin[0] ⊕ begin[1]`, "sum of the four sentinel bytes is constant", and CRC-8 with polynomials
+0x07 / 0x31 / 0x9B / 0x1D over the begin pair. VOL (`A0 C1 → B1 D2`, both bytes +0x11) is the
+single coincidence. Conclusion: `end[1]` is an independently chosen per-frame magic byte; a
+parser must carry the end pairs as a table, exactly as the app does. `util/ByteUtils.java`
+contains no derivation either — its whole API is `byteJudge`, `byteToInt1`, `intToByte`,
+`intToBytes`, `longToBytes`, `byteToInt`, `byteToIntHigh`, `byteToLong`, `byteCompare`, and the
+read loop only ever `byteCompare`s literal constants (BM L312 onwards).
+
+**Rule 2 — the "hex-word" family.** Four pairs are visibly hand-typed mnemonics where the end is
+the begin with each hex letter moved along the alphabet: `AB BA → CD DC` and `AA BB → CC DD`
+(A→C, B→D, i.e. +0x22 on both bytes); `AA CC → DD EE` and `AC CA → DE ED` (A→D, C→E). Palindromes
+stay palindromes (`ABBA→CDDC`, `ACCA→DEED`). The sleep-control request `AA CC`/`DD EE` and its
+ack `AC CA`/`DE ED` are byte-permutations of each other, as are `AA BB`/`CC DD` (OTA end) and
+`AB BA`/`CD DC` (setting ack). These are the only pairs where `begin[0]` collides with a rule-1
+opcode (`AA` = EST_TIME, `AC` = VERSION), which is why the app compares both begin bytes.
+
+**Outliers.** `C3 F2 → ED CE` (MTU) shares the `C3` opcode with GATE_CONTROL but its end obeys
+neither rule. `D2 7E → FA 4B` (gate ack) obeys neither. The history frames use **4-byte**
+sentinels on both ends and are the only such frames: the RX begin `FE C9 BD 8A` is stored as two
+2-byte constants (`CMD_HISTORY_BEGIN_1/2`) only because the reader compares two bytes at a time
+(`judgeCMD` references `CMD_HISTORY_BEGIN_1[0]` alone), whereas the matching TX
+`CMD_SET_HISTORY_STATUS_BEGIN` is one 4-byte array. The RX and TX history sentinels are
+near-neighbours — TX begin = RX begin + `01 01 01 10` byte-wise, TX end = RX end + `10 10 01 FE` —
+i.e. one set was derived from the other by nudging bytes, not by any rule. The OTA family is a
+separate bootloader dialect: `EB 90` is the classic sync word, `AA BB … CC DD` its frame, `01 01`
+the ACK head, and `CMD_UPDATE_FINISH` `01 01 EC 00 00 12` is itself a well-formed checksummed data
+frame (chunk 0xEC00, length 0, checksum 0x12 → byte sum ≡ 0 mod 256).
+
+### Per-frame value summary (what these packs actually send)
+
+Payload offsets are 0-based after the begin pair and exclude the end pair; "Java read" is the
+`mIO.read(n)` count (payload + 2 end bytes), which matches `Parser.FIXED` / `_fixed` for every
+frame. The stream is unsolicited, in strictly ascending opcode order `A0 A1 A2 A3 A4 A5 A6 A7 A8
+A9 AA` once per cycle, ~0.85 s per cycle (e.g. VOL at 2026-09-21 15:06:48.270, 49.096, 49.944,
+50.786); `AC 9A` (version) and `AC CA` (sleep) are slotted in when triggered.
+
+| Frame | Java read | Layout (offset → meaning, unit, endianness) | Values seen |
+|---|---|---|---|
+| `A0 C1` VOL | `n` then `2n`, end `B1 D2` | p0 = cell count n; then n × u16 LE mV | n = 4 in 13 569/13 569 frames. Cells 3246–3503 mV (`JS-2C14B8`: 3246 under ~90 A at 2026-09-21 15:07:21.932 `a0 c1 04 c8 0c c5 0c bb 0c ae 0c b1 d2`; 3503 at rest after charge 2026-09-21 10:32:10.567; `JS-2C14AA`: 3333–3339 over its 2 h). |
+| `A1 4F` TEMPUTER | 6 | p0..p3 = four signed-8 °C; app reads p1 and p3 | **p0 == p3 in 18 487/18 487 frames; p1 == p2 in 14 293 and differs by 1 °C in 4 194** — the frame is two sensors each sent twice (A = p0/p3, B = p1/p2). 25–43 °C; sensor B is the one that heats under load (43 °C at 2026-09-21 15:09:10.177 `a1 4f 24 2b 2a 24 b2 e3` after the 90 A run; A peaks at 38). Never negative here. |
+| `A2 57` ALL_DATA | 24 | p0..1 packV u16 ÷10 V; p2..4 current u24 ÷100 then ÷10 A (magnitude); p5 load flag; p6 charger flag; p7 chip °C; p8..9 cell sum ÷10 V; p10..11 max, p12..13 min, p14..15 delta, p20..21 avg cell mV (÷10 then ÷100 → V); p16..17 power ÷10 W; p18..19 cycles | packV 13.0–13.9 V, always == cell sum. Current 0–90.4 A (raw 90 496 at 2026-09-21 15:06:10.910, 1188.4 W); charging 13.8 A (raw 13 816) at 2026-09-21 10:27:11.143 with **load = charger = 0**. Sign never carried (no raw > 0x7FFFFF). p5 load = 1 in 5 887 frames, 5 111 of them at 0 A; p6 charger = 1 in 1 985 frames, all at 0 A on 2026-09-19 (charger present, charging inhibited by the latched over-temp) and **never while actually charging**; p5 and p6 never both 1. p7 chip = 0 in 18 468/18 468 (unused). Cell max/min/avg 3246–3503 mV, delta 0–39 mV (0x27 at 2026-09-21 06:48:18.843). Cycles 0 or 1 only (see oddities). |
+| `A3 9F` MOS_STATUS | 8 | p0 charge MOS, p1 discharge MOS (app: on iff both 1); p2..p5 unknown | p0 == p1 in every frame; `01 01` in 13 501/13 512, `00 00` for 11 frames 2026-09-21 15:06:50.889–15:07:00.136 (deliberate MOS-off). p3 = 1 exactly once, 15:07:00.136 `a3 9f 00 00 00 01 00 00 b4 c7`, coincident with the short-circuit flag (below). p2, p4, p5 always 0. |
+| `A4 8B` WARN_CUR_ALARM | 7 | p0 over-current discharge, p1 over-current charge, p2 short-circuit, p3..p4 unused | All zero except p2 = 1 in two frames, 2026-09-21 15:06:59.329 and 15:07:00.194 `a4 8b 00 00 01 00 00 b5 dd`, as the MOS was re-closed onto the ~90 A load (TX `c3 1e 01 01 01 …` 15:06:58.849); cleared by itself, MOS back on at 15:07:00.976, current 1.5 → 2.2 → 89 A by 15:07:10. |
+| `A5 99` WARN_VOL_ALARM | 11 | p0 cell over-charge, p1 cell over-discharge, p3 delta alarm, p6 pack over-charge, p7 pack over-discharge, rest unused | All nine bytes zero in 13 247/13 247 frames. |
+| `A6 C0` WARN_TEMP_ALARM | 9 | p0 chip OT, p1 chip UT, p2 latched OT (charge inhibit), p3 unknown MOS, p4 UT discharge, p5 UT charge, p6 unknown MOS | All zero except p2 = 1 in 5 192 frames — every frame from both packs on 2026-09-19 until the restart (last `JS-2C14AA` 16:13:38.101), 0 since. p0, p1, p3–p6 never set. |
+| `A7 4E` OTHER | 9 (discarded) | 7 bytes + `B8 29` | `a7 4e 00 00 00 00 00 00 00 b8 29` in 13 496/13 496 frames — payload all zero, trailer constant. |
+| `A8 AC` BAL_STATUS | 9 | s0 charge state 0/1/2, s1 charge MOS, s2 discharge MOS, s3 passive balance, s4 temp-control gate, s5 smoke gate, s6 heater gate | s0: 0 idle (13 139), 2 discharging (331, whenever load current flowed), 1 charging (3 frames 2026-09-21 10:27:11.392–12.427 at 13.8 A). s1 == s2 always, mirrors MOS frame (00 during the MOS-off test). s3 = 0, s4 = 1, s5 = 0, s6 = 0 in every frame. |
+| `A9 64` SOC | 9 | p0 SOC %, p1..3 full u24 LE mAh, p4..6 remaining u24 LE mAh | p0 ∈ {100, 99, 98, 93, 83, 0}. full = 100 000 (`a0 86 01`) always. **remaining = p0 × 1000 exactly** in every frame (99 000 = `b8 82 01`, 93 000 = `48 6b 01`, 83 000 = `38 44 01`) — no finer resolution than the percentage. SOC 0 / remaining 0 only in the first two SOC frames after a BMS restart (2026-09-20 21:03:59.294 and .626 `a9 64 00 a0 86 01 00 00 00 ba 5e`), then 100 % again from 21:04:00.464. 100 → 93 after the 2026-09-19 restart; 100 → 83 one second after the factory-reset frame (2026-09-21 08:13:05.342). |
+| `AA AF` EST_TIME | 8 | p0..2 time-to-full s, p3..5 time-to-empty s (u24 LE) | time-to-full = 0 in 13 456/13 456 frames. time-to-empty: 3 960 s minimum (66 min at ~90 A, 2026-09-21 15:05:29.918 `aa af 00 00 00 78 0f 00 bb 22`) up to a cap of 360 000 s = 100 h (`40 7e 05`, 10 910 frames, whenever idle); all 115 distinct values are multiples of 60 s; 0 only in the two post-restart frames. |
+| `AC 9A` VERSION | 7 | p0..4 ASCII | `JS5.1` in 105/105 frames, 0.1–4 s after `AT+V`, accompanied by the stray `0x30`. |
+| `AC CA` SLEEP_SET_SUCCESS | 3 (end not checked) | p0: 0 = standby on, 1 = off | End `DE ED` present in 167/167 frames. p0 = 1 in 163; p0 = 0 in 4 (2026-09-20 21:02:41.452, 0.3 s after `aa cc 00 01 dd ee`; 21:03:28.597; 21:08:09.799; 21:08:57.913). Sent unsolicited ~0.5 s after every `CMD_BEGIN` handshake and as the ack to `AA CC`. |
+| `AB BA` SETTING_RESPOND | 3 | p0 type (1 vol, 2 cur, 3 temp, 4 capacity) | Never observed (no capacity/threshold write was ever sent). |
+| `D2 7E` GATE_SET | 10 | p0..7 echo of the gate-control bytes | 20 frames, each 0.1–0.3 s after a `C3 1E` TX, from `JS-2C14B8` only. Echoes b0–b6 exactly, including restart b5 = 1 (`d2 7e 01 01 01 00 00 01 00 00 fa 4b`, 2026-09-20 21:02:56.061). **b7 is not echoed**: the factory frame `c3 1e 01 01 01 00 00 00 00 01 d4 3b` at 2026-09-21 08:13:04.305 was acked `d2 7e 01 01 01 00 00 00 00 00 fa 4b`. |
+| `FE C9 BD 8A` HISTORY | — | never parsed | Never observed; 5 × `CMD_GET_HISTORY` sent (Python log 14:00:08 …) with no reply. |
+| `0D 0A` NAME_SET | 4 | `OK\r\n` | Not exercised. |
+| OTA acks | 3 / 4 / 3 | see "Firmware update" | Not exercised. |
+| stray `0x30` | — | AT bridge return code | 153 single-byte notifications plus two `30 30`, always within seconds of `AT+V`. |
+
+TX commands as actually used in these captures:
+
+| TX | Bytes | When / count | Effect seen |
+|---|---|---|---|
+| `CMD_BEGIN` | `fb c8 7c 9d 26 ec` | every connect (233 handshakes + 7 wake ladders in the phone log) | stream starts within ~50 ms (20:38:46.604 TX → 20:38:46.654 first VOL) |
+| `CMD_GET_EST` | `c4 7d f4 d5 86` | after every handshake (232) | nothing visible — EST is streamed regardless |
+| `AT+V\r\n` | `41 54 2b 56 0d 0a` | after every handshake (228) + probes (273) | `AC 9A` VERSION + one `0x30` |
+| `CMD_GATE_CONTROL` | `c3 1e b0…b7 d4 3b` | 39: restart 13, both MOS on 12, output on 6, charge on 4, output off 1, charge off 1, both off 1, factory 1 | `D2 7E` ack 0.1–0.3 s later; restart re-handshakes ~6 s later (21:03:52.720 → 21:03:58.877) |
+| `CMD_OPEN/CLOSE_SLEEP_CONTROL` | `aa cc 00/01 01 dd ee` | 5 on, 1 off | `AC CA` ack within 0.3 s mirroring the flag |
+| `CMD_GET_HISTORY` | `c6 7c cf 00 d7 52` | 5 (Python log) | no reply |
+| capacity `C5 60`, time `C8 18`, MTU `C3 F2`, clear/set history, OTA, rename | | never sent | |
+
+### Oddities found in this pass
+
+- **`A7 4E` has an end sentinel after all.** The trailer `B8 29` is constant in 13 496/13 496
+  frames and `B8 = A7 + 0x11` matches rule 1, so OTHER is a 7-byte all-zero payload plus a
+  2-byte end — the same 7+2 shape as WARN_TEMP and BAL_STATUS, consistent with the app's
+  `read(9)`. The app merely never checks it. Validating `B8 29` costs nothing and improves resync.
+- **Temperature frame carries two sensors twice** (p0 = p3 always, p1 ≈ p2). The app's choice of
+  p1 and p3 happens to pick one of each. The hotter sensor (B) is the one that tracks load.
+- **The load/charger flags are not a current sign.** Load = 1 at 0 A 87 % of the time; charger = 1
+  only during inhibited charging and never during real charging; current is unsigned. Direction
+  has to come from BAL `s0` (1/2), as the doc already says — the flags mean "something attached".
+- **Cycle count flickers 0 ↔ 1** within seconds on both packs on 2026-09-19 (`JS-2C14B8` cyc = 1 at
+  14:00:20, 0 at 14:00:26, 1 at 14:00:29 …; 218 and 348 frames at 1) and is 0 ever since. It is
+  not a monotonic counter on this firmware; do not trend it.
+- **SOC remaining is SOC × 1000, full is always 100 000.** The two capacity fields add no
+  information beyond the percentage byte on these packs.
+- **First SOC / EST frames after a restart read 0** (2026-09-20 21:03:59.294–.653), then the real
+  values. A reader should ignore SOC/EST for ~1 s after a post-restart handshake.
+- **Gate ack does not echo the factory bit** (b7) although the frame was acted on: SOC dropped
+  100 → 83 % one second later (2026-09-21 08:13:05.342).
+- **MOS frame byte 3 = 1** exactly once, in the same cycle as the short-circuit flag when the MOS
+  was re-closed onto a ~90 A load — a candidate "protection tripped" status bit (single
+  observation). Both cleared within two cycles.
+- **EST is minute-granular and capped at 100 h**; time-to-full has never been non-zero, so that
+  field is unverified.
+- **Java read lengths all match the parsers**: TEMP 6, ALL 24, MOS 8, BAL 9, SOC 9, EST 8,
+  WARN_TEMP 9, WARN_CUR 7, WARN_VOL 11, SETTING 3, GATE_SET 10, VERSION 7, SLEEP 3, OTHER 9,
+  NAME 4, OTA 3/4/3. No length inconsistency exists between the app and the two reference codecs.
+- **About 600 BLE notifications carried two consecutive frames** (VOL+TEMP 21 B, TEMP+ALL 34 B,
+  ALL+MOS 36 B, e.g. 2026-09-19 20:40:26.833 `a1 4f … b2 e3 a2 57 … b3 6c`). This is packing, not
+  a frame type; a parser must treat the link as a byte stream.
+- **Why VOL is count-prefixed**: it is the only field whose size differs by product (4S here; the
+  app's `Global` names four firmware families), so the firmware sends `n` rather than fixing the
+  frame length. Every other frame is fixed-size.
+- **Why history has "two begins"**: it does not — `FE C9 BD 8A` is one 4-byte begin (its TX
+  counterpart `FF CA BE 9A` is declared as a single 4-byte array), split only to suit the
+  2-byte `byteCompare` reader. History and set-history-status are the only 4-byte-sentinel frames.
+
 ## Hidden service mode
 
 Not linked from any menu. Unlock on the main screen (`actvm/MainViewModel.java` L130–L163):
