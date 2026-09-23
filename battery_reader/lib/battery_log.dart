@@ -1385,6 +1385,19 @@ class BatteryLogger {
     return [for (final r in rows) _rowToInterval(r)];
   }
 
+  /// #69: how many durable interval rows [serial] has in `[sinceMs, now]`
+  /// (any metric) — the detail page's "Logging" line. 0 when the store is not
+  /// open. Cheap: one indexed COUNT.
+  Future<int> readingCount(String serial, {int sinceMs = 0}) async {
+    final db = _db;
+    if (db == null) return 0;
+    final rows = await db.rawQuery(
+        'SELECT COUNT(*) AS n FROM $_kReadings '
+        'WHERE serial = ? AND end_ms >= ?',
+        [serial, sinceMs]);
+    return (rows.first['n'] as num?)?.toInt() ?? 0;
+  }
+
   /// Every `cellN` metric ever logged for [serial] (DB rows plus the in-memory
   /// hour), sorted numerically — so the charts draw N cells, not a fixed four
   /// (M14).
@@ -1614,3 +1627,43 @@ class BatteryLogger {
     await db?.close();
   }
 }
+
+/// #69: the ONE-line logging status the battery DETAIL page shows under its
+/// Trends selector (moved off the Charts page, which is charts only). Pure.
+///
+///  * degraded: `Logging failing — <error>`;
+///  * not open: `Logging off — database not open`;
+///  * else `Logging on · continuous` / `· background samples every 5 min`,
+///    then `· N rows in 24h` (or `· no rows yet — telemetry is recorded while
+///    this battery is connected` when the window is empty).
+String loggingStatusLine({
+  required bool enabled,
+  required bool degraded,
+  String? lastError,
+  required int sampleIntervalMs,
+  required int rowsInWindow,
+  required String windowLabel,
+}) {
+  if (degraded) return 'Logging failing — ${lastError ?? 'unknown error'}';
+  if (!enabled) return 'Logging off — database not open';
+  final mode = sampleIntervalMs <= 0
+      ? 'continuous'
+      : 'background samples every ${fmtSampleInterval(sampleIntervalMs)}';
+  final rows = rowsInWindow == 0
+      ? 'no rows yet — telemetry is recorded while this battery is connected'
+      : '$rowsInWindow ${rowsInWindow == 1 ? 'row' : 'rows'} in $windowLabel';
+  return 'Logging on · $mode · $rows';
+}
+
+/// #69: `30 s` / `5 min` / `2 h` for a sample interval in ms. Pure.
+String fmtSampleInterval(int ms) {
+  final s = ms ~/ 1000;
+  if (s < 60) return '$s s';
+  if (s < 3600) return '${s ~/ 60} min';
+  return '${s ~/ 3600} h';
+}
+
+/// #69: the line-style legend for the held/step graphs — shown beside the
+/// logging line only while the window holds background samples (#53).
+const String sampleLegendText =
+    'Dotted = background samples · dashed = offline';

@@ -8,6 +8,12 @@
 /// Review pass C2: which metrics are loaded and drawn, on which card, in which
 /// colour, comes from the metric catalogue (metrics.dart); the run / gap /
 /// splice / axis / window logic is the shared intervals.dart.
+///
+/// #69: this page is charts and the window selector ONLY — the logging status
+/// and the line-style legend live on the battery detail page. #70: every
+/// [ChartCard] carries a stats row (current / max / min / median per series,
+/// [seriesStats]) and a [YAxisToggle] between the FULL (0-based, #32) and FIT
+/// (tight to the data) axis, defaulting to the Settings choice [gYAxisMode].
 library;
 
 import 'dart:async';
@@ -315,7 +321,7 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
               : Series(m.labelOnChart, m.color, _series[m.key] ?? const []),
       ];
     }
-    return _ChartCard(
+    return ChartCard(
       title: spec.title,
       unit: spec.unit,
       fromMs: _fromMs,
@@ -328,6 +334,7 @@ class _BatteryChartsPageState extends State<BatteryChartsPage> {
           : null,
       series: series,
       policy: _policy,
+      mode: gYAxisMode, // #70: the Settings default; the card can override
     );
   }
 
@@ -475,7 +482,61 @@ class _BuiltSeries {
   }
 }
 
-class _ChartCard extends StatefulWidget {
+/// #70: the per-card FULL / FIT axis toggle. A compact labelled button whose
+/// icon AND label show the mode in force — `unfold_more` "Full" (0-based
+/// axis) or `unfold_less` "Fit" (tight to the data) — and whose tooltip names
+/// the action a tap performs ([fitTooltip] / [fullTooltip]).
+class YAxisToggle extends StatelessWidget {
+  final YAxisMode mode;
+  final ValueChanged<YAxisMode> onChanged;
+  const YAxisToggle({super.key, required this.mode, required this.onChanged});
+
+  static const fitTooltip = 'Fit axis to data';
+  static const fullTooltip = 'Show full range';
+
+  /// The icon for a mode: FULL = unfolded, FIT = folded tight.
+  static IconData iconFor(YAxisMode m) =>
+      m == YAxisMode.fit ? Icons.unfold_less : Icons.unfold_more;
+
+  /// The label for a mode.
+  static String labelFor(YAxisMode m) => m == YAxisMode.fit ? 'Fit' : 'Full';
+
+  /// What a tap will do from mode [m].
+  static String tooltipFor(YAxisMode m) =>
+      m == YAxisMode.fit ? fullTooltip : fitTooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final fit = mode == YAxisMode.fit;
+    final colour = fit ? Theme.of(context).colorScheme.primary : Colors.white54;
+    return Tooltip(
+      message: tooltipFor(mode),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: () => onChanged(mode.other),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(iconFor(mode), size: 18, color: colour),
+              const SizedBox(width: 3),
+              Text(labelFor(mode),
+                  style: TextStyle(
+                      color: colour,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// One chart card: title, unit, the FULL/FIT toggle (#70), the legend when
+/// there are several series, the per-series stats row and the line chart.
+class ChartCard extends StatefulWidget {
   final String title;
   final String unit;
   final int fromMs;
@@ -492,7 +553,12 @@ class _ChartCard extends StatefulWidget {
   /// #53: the sample-interval gap policy for this window.
   final GapPolicy policy;
 
-  const _ChartCard({
+  /// #70: the axis mode this card starts in (the Settings default). A tap on
+  /// the card's toggle overrides it for the session.
+  final YAxisMode mode;
+
+  const ChartCard({
+    super.key,
     required this.title,
     required this.unit,
     required this.fromMs,
@@ -503,16 +569,23 @@ class _ChartCard extends StatefulWidget {
     this.maxY,
     this.centreZero = false,
     this.policy = GapPolicy.continuous,
+    this.mode = YAxisMode.full,
   });
 
   @override
-  State<_ChartCard> createState() => _ChartCardState();
+  State<ChartCard> createState() => _ChartCardState();
 }
 
-class _ChartCardState extends State<_ChartCard> {
+class _ChartCardState extends State<ChartCard> {
   /// L8: per-series built bars, keyed by position; rebuilt only for a series
   /// whose interval list (or transform) changed since the last build.
   final Map<int, _BuiltSeries> _built = {};
+
+  /// #70: the session override from the card's toggle, or null = follow the
+  /// widget's (Settings) default.
+  YAxisMode? _override;
+
+  YAxisMode get _mode => _override ?? widget.mode;
 
   List<_BuiltSeries> _buildAll() {
     final out = <_BuiltSeries>[];
@@ -547,6 +620,12 @@ class _ChartCardState extends State<_ChartCard> {
                 ),
                 Text(widget.unit,
                     style: const TextStyle(color: Colors.white54)),
+                const SizedBox(width: 8),
+                // #70: FULL / FIT axis, per card.
+                YAxisToggle(
+                  mode: _mode,
+                  onChanged: (m) => setState(() => _override = m),
+                ),
               ],
             ),
             if (widget.series.length > 1)
@@ -561,12 +640,17 @@ class _ChartCardState extends State<_ChartCard> {
                   ],
                 ),
               ),
-            if (widget.policy.hasBackground)
-              const Padding(
-                padding: EdgeInsets.only(top: 4),
-                child: Text(
-                    'Dotted = background samples · dashed = offline',
-                    style: TextStyle(color: Colors.white38, fontSize: 11)),
+            // #70: current / max / min / median for the window in view, per
+            // series in its colour; recomputed on every live tick.
+            if (hasData)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: _StatsRows(
+                  series: widget.series,
+                  fromMs: widget.fromMs,
+                  toMs: widget.toMs,
+                  transform: widget.valueTransform,
+                ),
               ),
             const SizedBox(height: 10),
             SizedBox(
@@ -597,9 +681,14 @@ class _ChartCardState extends State<_ChartCard> {
     }
 
     // Y bounds (#32): the axis always includes 0 — 0..max for level metrics,
-    // symmetric −max..+max about 0 for signed ones (centreZero).
+    // symmetric −max..+max about 0 for signed ones (centreZero) — or, in FIT
+    // (#70), tight to the data with a small pad. The axis labels are drawn
+    // from these bounds, so the range in force is visible on the card.
     final (yMin, yMax) = yBounds(lo, hi,
-        minY: widget.minY, maxY: widget.maxY, centreZero: widget.centreZero);
+        minY: widget.minY,
+        maxY: widget.maxY,
+        centreZero: widget.centreZero,
+        mode: _mode);
 
     final fromMs = widget.fromMs, toMs = widget.toMs;
     final spanMs = (toMs - fromMs).toDouble().clamp(1.0, double.infinity);
@@ -655,6 +744,52 @@ class _ChartCardState extends State<_ChartCard> {
       lineTouchData: const LineTouchData(enabled: false),
     );
   }
+}
+
+/// #70: the compact stats readout under a card's title: for each series with
+/// data in the window, `now · max · min · med` in the series colour (with the
+/// series label first when the card has several). Values go through the
+/// card's [transform] (°F) like the plotted line.
+class _StatsRows extends StatelessWidget {
+  final List<Series> series;
+  final int fromMs;
+  final int toMs;
+  final double Function(double)? transform;
+  const _StatsRows({
+    required this.series,
+    required this.fromMs,
+    required this.toMs,
+    this.transform,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final multi = series.length > 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final s in series)
+          if (seriesStats(s.intervals, fromMs, toMs) case final st?)
+            Text(
+              multi
+                  ? '${s.label}: ${statsText(st, transform)}'
+                  : statsText(st, transform),
+              style: TextStyle(
+                  color: s.color.withValues(alpha: 0.9),
+                  fontSize: 11,
+                  fontFeatures: const [FontFeature.tabularFigures()]),
+            ),
+      ],
+    );
+  }
+}
+
+/// #70: the readout text for one series' stats, through the card's value
+/// [transform] (°F): `now 3.312 · max 3.320 · min 3.298 · med 3.310`. Pure.
+String statsText(SeriesStats st, [double Function(double)? transform]) {
+  double t(double v) => transform == null ? v : transform(v);
+  return 'now ${fmtStat(t(st.current))} · max ${fmtStat(t(st.max))} · '
+      'min ${fmtStat(t(st.min))} · med ${fmtStat(t(st.median))}';
 }
 
 /// Offline windows: stretches of [from,to] not covered by ANY of [ivs], i.e.
@@ -1109,15 +1244,10 @@ class _EmptyState extends StatelessWidget {
           children: [
             Icon(Icons.show_chart, size: 48, color: Colors.white24),
             SizedBox(height: 12),
-            Text('No history yet',
+            // #69: charts only — the logging status / explanation is on the
+            // battery detail page.
+            Text('No samples in this window',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
-            SizedBox(height: 6),
-            Text(
-              'Telemetry is recorded once this battery is connected. '
-              'Leave it running and charts will fill in.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white54),
-            ),
           ],
         ),
       ),

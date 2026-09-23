@@ -8,7 +8,8 @@
 ///  * HELD / step segments (a value holds from `start_ms` to `end_ms`).
 ///  * OFFLINE GAPS are left UNBRIDGED — a gap between abutting rows wider than
 ///    [BatteryLogger.gapMs] splits the line into separate runs ([splitRuns]).
-///  * the y-axis always includes 0 ([yBounds]).
+///  * the y-axis always includes 0 ([yBounds]) — or, when the app-wide
+///    [gYAxisMode] is FIT (#70), is tight to the data seen in the window.
 ///  * an ALPHA-BLENDED area fill under the line.
 ///
 /// [buildSparklineRuns] is the pure, unit-tested core: it groups intervals into
@@ -77,9 +78,10 @@ List<SparkPoint> _downsample(List<SparkPoint> p, int max) {
 /// The sparkline's y-axis bounds (#32): the shared [yBounds] policy with no
 /// outward padding — 0..max for level metrics, symmetric about 0 for signed
 /// ([centreZero]) ones, a flat-at-0 series widened to −1..+1 so its held line
-/// sits mid-height. Null when there is no finite data.
+/// sits mid-height. In [YAxisMode.fit] (#70) exactly min..max of the data.
+/// Null when there is no finite data.
 (double, double)? sparkYBounds(List<List<SparkPoint>> runs,
-    {bool centreZero = false}) {
+    {bool centreZero = false, YAxisMode mode = YAxisMode.full}) {
   var lo = double.infinity, hi = -double.infinity;
   for (final run in runs) {
     for (final p in run) {
@@ -88,7 +90,7 @@ List<SparkPoint> _downsample(List<SparkPoint> p, int max) {
     }
   }
   if (!lo.isFinite || !hi.isFinite) return null;
-  return yBounds(lo, hi, centreZero: centreZero, pad: 0);
+  return yBounds(lo, hi, centreZero: centreZero, pad: 0, mode: mode);
 }
 
 /// L8: runs built per interval LIST INSTANCE. The detail page hands the same
@@ -113,6 +115,10 @@ class Sparkline extends StatelessWidget {
   /// #53: the sample-interval policy for this window (null = continuous).
   final GapPolicy? policy;
 
+  /// #70: the Y-axis mode; null (the default) follows the app-wide
+  /// [gYAxisMode] — the sparklines always track the Settings default.
+  final YAxisMode? mode;
+
   const Sparkline({
     super.key,
     required this.intervals,
@@ -122,6 +128,7 @@ class Sparkline extends StatelessWidget {
     this.height = 30,
     this.centreZero = false,
     this.policy,
+    this.mode,
   });
 
   @override
@@ -148,6 +155,7 @@ class Sparkline extends StatelessWidget {
                 toMs: toMs,
                 color: color,
                 centreZero: centreZero,
+                mode: mode ?? gYAxisMode,
               ),
             ),
     );
@@ -164,6 +172,7 @@ class _SparkPainter extends CustomPainter {
   final int toMs;
   final Color color;
   final bool centreZero;
+  final YAxisMode mode; // #70
 
   _SparkPainter({
     required this.runs,
@@ -172,6 +181,7 @@ class _SparkPainter extends CustomPainter {
     required this.toMs,
     required this.color,
     required this.centreZero,
+    required this.mode,
   });
 
   @override
@@ -179,8 +189,8 @@ class _SparkPainter extends CustomPainter {
     final span = (toMs - fromMs).toDouble();
     if (span <= 0) return;
     // #32: 0-based (or symmetric-about-0 for signed) y-range — never a zoomed
-    // band far from zero.
-    final bounds = sparkYBounds(runs, centreZero: centreZero);
+    // band far from zero — unless the Settings default is FIT (#70).
+    final bounds = sparkYBounds(runs, centreZero: centreZero, mode: mode);
     if (bounds == null) return;
     final (lo, hi) = bounds;
     final vSpan = hi - lo;
@@ -275,5 +285,6 @@ class _SparkPainter extends CustomPainter {
       old.fromMs != fromMs ||
       old.toMs != toMs ||
       old.color != color ||
-      old.centreZero != centreZero;
+      old.centreZero != centreZero ||
+      old.mode != mode;
 }

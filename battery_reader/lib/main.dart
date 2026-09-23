@@ -29,7 +29,8 @@ import 'diagnostics_page.dart';
 import 'fleet_store.dart';
 import 'fmt.dart';
 import 'health_palette.dart';
-import 'intervals.dart' show GapPolicy, LookbackWindow, computeRange;
+import 'intervals.dart'
+    show GapPolicy, LookbackWindow, YAxisMode, computeRange, gYAxisMode;
 import 'live_indicator.dart';
 import 'metrics.dart';
 import 'monitoring_policy.dart';
@@ -359,6 +360,8 @@ class _BatteryListPageState extends State<BatteryListPage>
         await _settings.loadBackgroundMonitoring(); // #52
     _policy.sampleInterval = BackgroundSampleInterval.fromSeconds(
         await _settings.loadSampleIntervalS()); // #53
+    gYAxisMode =
+        YAxisMode.fromFit(await _settings.loadChartYAxisFit()); // #70
     await _aliases.load(); // #44 per-battery custom names
     await _manager.loadFleetMembership();
     // #45: bring the notification subsystem up and, if alerts are enabled, ask
@@ -726,6 +729,15 @@ class _BatteryListPageState extends State<BatteryListPage>
     _settings.saveUseFahrenheit(useFahrenheit);
   }
 
+  /// #70: the default chart Y-axis mode (FULL 0-based / FIT to the data) and
+  /// persist it. Every chart card starts in this mode; the sparklines follow
+  /// it always.
+  void _setYAxisMode(YAxisMode mode) {
+    if (mode == gYAxisMode) return;
+    setState(() => gYAxisMode = mode);
+    _settings.saveChartYAxisFit(mode.isFit);
+  }
+
   void _openSettings() {
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -735,6 +747,8 @@ class _BatteryListPageState extends State<BatteryListPage>
           onDemoModeChanged: _setDemoMode,
           useFahrenheit: gUseFahrenheit,
           onTempUnitChanged: _setTempUnit,
+          yAxisMode: gYAxisMode, // #70
+          onYAxisModeChanged: _setYAxisMode,
           alertNotifications: _alertNotifications,
           onAlertNotificationsChanged: _setAlertNotifications,
           backgroundMonitoring: _policy.backgroundMonitoring,
@@ -1444,6 +1458,9 @@ class SettingsPage extends StatefulWidget {
   /// #43: temperature-unit toggle (°F when true, else °C).
   final bool useFahrenheit;
   final ValueChanged<bool> onTempUnitChanged;
+  /// #70: default chart Y-axis mode (full range / fit to data).
+  final YAxisMode yAxisMode;
+  final ValueChanged<YAxisMode> onYAxisModeChanged;
   /// #45: system alert notifications toggle (persisted, default ON).
   final bool alertNotifications;
   final ValueChanged<bool> onAlertNotificationsChanged;
@@ -1470,6 +1487,8 @@ class SettingsPage extends StatefulWidget {
     required this.onDemoModeChanged,
     required this.useFahrenheit,
     required this.onTempUnitChanged,
+    this.yAxisMode = YAxisMode.full,
+    this.onYAxisModeChanged = _ignoreYAxis,
     required this.alertNotifications,
     required this.onAlertNotificationsChanged,
     required this.backgroundMonitoring,
@@ -1483,6 +1502,8 @@ class SettingsPage extends StatefulWidget {
     this.batteryStatus,
   });
 
+  static void _ignoreYAxis(YAxisMode _) {}
+
   @override
   State<SettingsPage> createState() => _SettingsPageState();
 }
@@ -1490,6 +1511,7 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   late bool _demo = widget.demoMode;
   late bool _fahrenheit = widget.useFahrenheit;
+  late YAxisMode _yAxis = widget.yAxisMode; // #70
   late bool _alerts = widget.alertNotifications; // #45
   late bool _background = widget.backgroundMonitoring; // #52
   late BackgroundSampleInterval _interval = widget.sampleInterval; // #53
@@ -1750,6 +1772,55 @@ class _SettingsPageState extends State<SettingsPage> {
                       setState(() => _paused = next);
                       widget.onMonitoringPausedChanged(next);
                     },
+            ),
+            const Divider(),
+            // #70: default chart Y-axis mode. Display-only; each chart card
+            // can override it for the session with its own toggle.
+            _sectionHeader(context, 'Charts'),
+            ListTile(
+              leading: const Icon(Icons.show_chart),
+              title: const Text('Chart Y axis'),
+              subtitle: Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SegmentedButton<YAxisMode>(
+                      style: const ButtonStyle(
+                        visualDensity: VisualDensity.compact,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      segments: const [
+                        ButtonSegment(
+                          value: YAxisMode.full,
+                          icon: Icon(Icons.unfold_more),
+                          label: Text('Full range'),
+                        ),
+                        ButtonSegment(
+                          value: YAxisMode.fit,
+                          icon: Icon(Icons.unfold_less),
+                          label: Text('Fit to data'),
+                        ),
+                      ],
+                      selected: {_yAxis},
+                      showSelectedIcon: false,
+                      onSelectionChanged: (sel) {
+                        setState(() => _yAxis = sel.first);
+                        widget.onYAxisModeChanged(sel.first);
+                      },
+                    ),
+                    const SizedBox(height: 6),
+                    Text(_yAxis == YAxisMode.fit
+                        ? 'Fit to data: each axis is tight to the values seen '
+                            'in the window (e.g. cells 3.0–3.3 V). The '
+                            'Full / Fit button on each chart overrides this '
+                            'for that chart.'
+                        : 'Full range: every axis includes 0 (signed values '
+                            'are symmetric about 0). The Full / Fit button '
+                            'on each chart overrides this for that chart.'),
+                  ],
+                ),
+              ),
             ),
             const Divider(),
             // #43: temperature display unit (°C / °F). Display-only.
@@ -2122,6 +2193,10 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
   /// #53: the sample-interval gap policy for the loaded window.
   GapPolicy _sparkPolicy = GapPolicy.continuous;
 
+  /// #69: durable rows logged for this pack in the sparkline window — the
+  /// "Logging" line under the Trends selector.
+  int _rowsInWindow = 0;
+
   /// #61 / #62: a silent link produces no events, so a 1 s watch repaints
   /// the page when the streaming state (silent / probe verdict / connection)
   /// changes — that is what shows or hides the recovery ladder.
@@ -2192,6 +2267,7 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
           await log.multiSeries(serial, sparkMetricKeys, sinceMs: since);
       // #53: the sample-interval rows decide which gaps are expected.
       final modeRows = await log.sampleIntervalRows(serial, sinceMs: since);
+      final rows = await log.readingCount(serial, sinceMs: since); // #69
       if (!mounted) return;
       final range = computeRange(series.values, span, now);
       setState(() {
@@ -2200,6 +2276,7 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
         _sparkFrom = range.fromMs;
         _sparkTo = range.toMs;
         _sparkError = null;
+        _rowsInWindow = rows;
       });
       await _loadAlarms(serial);
     } catch (e) {
@@ -2353,6 +2430,15 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
               conn: widget.conn,
               error: _sparkError,
               policy: _sparkPolicy,
+              // #69: the logging status line (moved off the Charts page).
+              logging: loggingStatusLine(
+                enabled: BatteryLogger.instance.enabled,
+                degraded: BatteryLogger.instance.dbDegraded,
+                lastError: BatteryLogger.instance.lastDbError,
+                sampleIntervalMs: BatteryLogger.instance.sampleIntervalMs,
+                rowsInWindow: _rowsInWindow,
+                windowLabel: _sparkWindow.label,
+              ),
             ),
             _Section('Pack', _rows(DetailSection.pack)),
             _Section('Capacity', _rows(DetailSection.capacity)),
@@ -2620,6 +2706,9 @@ class _TrendsSection extends StatelessWidget {
   /// #53: the sample-interval gap policy for this window.
   final GapPolicy? policy;
 
+  /// #69: the one-line logging status ([loggingStatusLine]).
+  final String logging;
+
   const _TrendsSection({
     required this.window,
     required this.onWindow,
@@ -2627,6 +2716,7 @@ class _TrendsSection extends StatelessWidget {
     required this.fromMs,
     required this.toMs,
     required this.conn,
+    required this.logging,
     this.error,
     this.policy,
   });
@@ -2682,15 +2772,12 @@ class _TrendsSection extends StatelessWidget {
                   ],
                 ),
               ),
-            if (policy?.hasBackground ?? false)
-              const Padding(
-                padding: EdgeInsets.only(top: 6),
-                child: Text(
-                  'Dotted = background samples (one reading per interval); '
-                  'dashed = offline.',
-                  style: TextStyle(color: Colors.white38, fontSize: 11),
-                ),
-              ),
+            // #69: the logging status + line-style legend live HERE, on the
+            // detail page, not on the Charts page.
+            LoggingLine(
+              text: logging,
+              legend: policy?.hasBackground ?? false,
+            ),
             const Divider(height: 20),
             for (final m in sparkMetrics)
               _SparkRow(
@@ -2705,6 +2792,45 @@ class _TrendsSection extends StatelessWidget {
               ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// #69: the small "Logging" line under the Trends window selector: the
+/// logger's state / mode / row count for the window ([loggingStatusLine]) and,
+/// while the window holds background samples, the dotted / dashed legend
+/// ([sampleLegendText]) that the sparklines and charts share.
+class LoggingLine extends StatelessWidget {
+  final String text;
+  final bool legend;
+  const LoggingLine({super.key, required this.text, this.legend = false});
+
+  @override
+  Widget build(BuildContext context) {
+    const style = TextStyle(color: Colors.white38, fontSize: 11);
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 1),
+                child: Icon(Icons.storage, size: 12, color: Colors.white38),
+              ),
+              const SizedBox(width: 5),
+              Expanded(child: Text(text, style: style)),
+            ],
+          ),
+          if (legend)
+            const Padding(
+              padding: EdgeInsets.only(top: 2, left: 17),
+              child: Text(sampleLegendText, style: style),
+            ),
+        ],
       ),
     );
   }

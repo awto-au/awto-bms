@@ -62,6 +62,11 @@ String fmtAxis(double v) {
   return v.toStringAsFixed(2);
 }
 
+/// #70: a chart-card stats readout (current / max / min / median). Like
+/// [fmtAxis] but with three decimals below 10 so cell voltages read to the mV.
+String fmtStat(double v) =>
+    v.abs() < 10 ? v.toStringAsFixed(3) : fmtAxis(v);
+
 // --- unit formatters (an em dash for a missing value) ----------------------
 
 String fPct(int? v) => v == null ? '—' : '$v%';

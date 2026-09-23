@@ -352,7 +352,7 @@ void main() {
       expect(SettingsStore.backgroundMonitoring.key,
           'background_monitoring_v1');
       expect(SettingsStore.all.map((s) => s.defaultValue),
-          [false, true, false, true, true]);
+          [false, true, false, true, true, false]);
     });
 
     test('data persisted under the old keys still loads', () async {

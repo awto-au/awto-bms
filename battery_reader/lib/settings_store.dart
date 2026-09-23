@@ -40,6 +40,11 @@ class SettingsStore extends PrefsStore {
   static const backgroundMonitoring =
       BoolSetting('background_monitoring_v1', true);
 
+  /// Chart Y-axis default (#70). Default OFF = full range (the 0-based /
+  /// symmetric #32 policy); ON = fit the axis to the data seen in the window.
+  /// Display-only; each chart card can override it for the session.
+  static const chartYAxisFit = BoolSetting('chart_y_axis_fit_v1', false);
+
   /// Every persisted boolean setting.
   static const all = [
     demoMode,
@@ -47,6 +52,7 @@ class SettingsStore extends PrefsStore {
     useFahrenheit,
     alertNotifications,
     backgroundMonitoring,
+    chartYAxisFit,
   ];
 
   Future<bool> load(BoolSetting s) =>
@@ -65,6 +71,8 @@ class SettingsStore extends PrefsStore {
   Future<bool> loadBackgroundMonitoring() => load(backgroundMonitoring);
   Future<void> saveBackgroundMonitoring(bool v) =>
       save(backgroundMonitoring, v);
+  Future<bool> loadChartYAxisFit() => load(chartYAxisFit);
+  Future<void> saveChartYAxisFit(bool v) => save(chartYAxisFit, v);
 
   /// #53: background sample interval, persisted as SECONDS (0 = continuous).
   /// Additive key; the default (5 min) applies when absent or unreadable.

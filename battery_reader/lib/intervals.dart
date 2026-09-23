@@ -18,7 +18,10 @@
 ///    complement within a window (the offline stretches the charts shade).
 ///  * [spliceTail] — append the live in-memory tail onto the durable DB body
 ///    without duplicating or dropping anything (audit H4).
-///  * [yBounds] — the 0-inclusive / symmetric-about-0 axis policy (#32).
+///  * [yBounds] — the 0-inclusive / symmetric-about-0 axis policy (#32), or
+///    the tight FIT policy when asked ([YAxisMode], #70).
+///  * [seriesStats] — current / max / min / time-weighted median of a series
+///    over a window (#70).
 ///  * [LookbackWindow] + [computeRange] — the selectable look-back windows and
 ///    the from/to derivation the charts and sparklines share.
 library;
@@ -256,8 +259,29 @@ List<ReadingInterval> spliceTail(
   return [...body, ...tail];
 }
 
-/// The ONE y-axis policy (#32) for the charts and the sparklines. The axis
-/// ALWAYS includes 0:
+/// #70: how a chart's Y axis is ranged. [full] is the original #32 policy —
+/// the axis always includes 0 (see [yBounds]); [fit] is tight to the data
+/// seen in the window plus a small pad, so cells at 3.0–3.3 V or temperatures
+/// at 25–43 °C fill the card instead of hugging the top of a 0-based axis.
+enum YAxisMode {
+  full,
+  fit;
+
+  YAxisMode get other => this == full ? fit : full;
+
+  /// Persisted form (Settings): true = fit.
+  bool get isFit => this == fit;
+  static YAxisMode fromFit(bool fit) => fit ? YAxisMode.fit : YAxisMode.full;
+}
+
+/// #70: the app-wide DEFAULT Y-axis mode (Settings > Charts). Restored from
+/// [SettingsStore] at start-up, flipped from the Settings page; every chart
+/// card starts in this mode (a tap on its toggle overrides it for the
+/// session) and the detail-page sparklines always follow it.
+YAxisMode gYAxisMode = YAxisMode.full;
+
+/// The ONE y-axis policy (#32) for the charts and the sparklines. In
+/// [YAxisMode.full] (the default) the axis ALWAYS includes 0:
 ///  * explicit [minY]/[maxY] win (e.g. SOC 0..100);
 ///  * [centreZero] metrics (signed current / power) get a symmetric −m..+m
 ///    about 0 so the sign reads;
@@ -269,6 +293,14 @@ List<ReadingInterval> spliceTail(
 /// widened to −1..+1 so its held line sits mid-height; with a positive pad a
 /// flat series at 0 keeps 0 as the hard floor (0..1). [lo]/[hi] are the data
 /// min/max; non-finite (no data) falls back to 0..1.
+///
+/// In [YAxisMode.fit] (#70) the axis is TIGHT to the data: `lo..hi` widened
+/// outward by [pad] × the data span on each side (cells 3.0–3.3 V with the
+/// charts' 0.1 pad -> 2.97..3.33; the sparklines' pad 0 -> exactly 3.0..3.3).
+/// Explicit [minY]/[maxY] and [centreZero] are IGNORED in fit mode — the whole
+/// point is to zoom on the values seen (SOC 78–82 % fits to 78–82, not
+/// 0–100). A flat series is widened by 1 % of its magnitude (±1 at 0) so the
+/// held line sits mid-height instead of on a zero-height axis.
 (double, double) yBounds(
   double lo,
   double hi, {
@@ -276,7 +308,9 @@ List<ReadingInterval> spliceTail(
   double? maxY,
   bool centreZero = false,
   double pad = 0.1,
+  YAxisMode mode = YAxisMode.full,
 }) {
+  if (mode == YAxisMode.fit) return _fitBounds(lo, hi, pad);
   if (minY != null && maxY != null) return (minY, maxY);
   if (!lo.isFinite || !hi.isFinite) return (0, 1);
   if (centreZero) {
@@ -292,6 +326,103 @@ List<ReadingInterval> spliceTail(
   final yMin = rawMin < 0 ? rawMin - p : 0.0;
   final yMax = rawMax > 0 ? rawMax + p : 0.0;
   return (yMin, yMax);
+}
+
+/// The FIT half of [yBounds] (#70): `lo..hi` padded outward by [pad] × span.
+(double, double) _fitBounds(double lo, double hi, double pad) {
+  if (!lo.isFinite || !hi.isFinite) return (0, 1);
+  final span = hi - lo;
+  if (span.abs() < 1e-9) {
+    final p = lo.abs() > 0 ? lo.abs() * 0.01 : 1.0;
+    return (lo - p, hi + p);
+  }
+  final p = span * pad;
+  return (lo - p, hi + p);
+}
+
+/// #70: the readouts each chart card shows for the window in view.
+class SeriesStats {
+  /// The latest value: the row that ends last in the window.
+  final double current;
+  final double max;
+  final double min;
+
+  /// TIME-WEIGHTED median (see [seriesStats]).
+  final double median;
+
+  /// How many rows contributed.
+  final int rows;
+
+  const SeriesStats({
+    required this.current,
+    required this.max,
+    required this.min,
+    required this.median,
+    required this.rows,
+  });
+
+  @override
+  String toString() =>
+      'SeriesStats(now $current max $max min $min med $median, $rows rows)';
+}
+
+/// #70: current / max / min / median of a held series over `[fromMs, toMs]`,
+/// or null when no numeric row overlaps the window. Pure.
+///
+/// Every row with a numeric value that overlaps the window counts; the part
+/// of it outside the window is clipped off. `current` is the value of the row
+/// that ENDS latest (the live open interval on a connected pack). `max`/`min`
+/// are over the row values. The MEDIAN IS TIME-WEIGHTED over the held
+/// durations (clipped to the window): a value held for ten minutes counts ten
+/// times one held for a minute, so a background sample — one reading held
+/// until the next, #53 — counts by its hold, not as a single point, and a
+/// long-held level cannot be outvoted by a burst of short changes. It is the
+/// value at which the cumulative held time first reaches half the total. When
+/// every overlapping row has zero clipped duration (all just-opened rows) the
+/// median falls back to the plain (lower-middle) sample median.
+SeriesStats? seriesStats(
+    Iterable<ReadingInterval> ivs, int fromMs, int toMs) {
+  final weighted = <(double, int)>[];
+  double? current;
+  var currentEnd = -1 << 62;
+  var lo = double.infinity, hi = -double.infinity;
+  for (final iv in ivs) {
+    final v = iv.valueNum;
+    if (v == null || !v.isFinite) continue;
+    if (iv.endMs < fromMs || iv.startMs > toMs) continue;
+    final s = iv.startMs > fromMs ? iv.startMs : fromMs;
+    final e = iv.endMs < toMs ? iv.endMs : toMs;
+    weighted.add((v, e - s > 0 ? e - s : 0));
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    if (iv.endMs >= currentEnd) {
+      currentEnd = iv.endMs;
+      current = v;
+    }
+  }
+  if (weighted.isEmpty || current == null) return null;
+  weighted.sort((a, b) => a.$1.compareTo(b.$1));
+  var total = 0;
+  for (final w in weighted) {
+    total += w.$2;
+  }
+  double median;
+  if (total <= 0) {
+    median = weighted[(weighted.length - 1) ~/ 2].$1;
+  } else {
+    final half = total / 2;
+    var acc = 0;
+    median = weighted.last.$1;
+    for (final w in weighted) {
+      acc += w.$2;
+      if (acc >= half) {
+        median = w.$1;
+        break;
+      }
+    }
+  }
+  return SeriesStats(
+      current: current, max: hi, min: lo, median: median, rows: weighted.length);
 }
 
 /// Selectable look-back windows. The charts page offers [chartWindows]; the
