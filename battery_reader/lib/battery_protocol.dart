@@ -447,6 +447,17 @@ const _warnVol = <int, String>{
   7: 'Overall voltage over discharge protection',
 };
 
+/// #67: every documented alarm byte by frame name (`'current'` /
+/// `'voltage'` / `'temperature'`, the `WarningEvent.category` words), for the
+/// alarm EVENT records. The temperature frame's latched byte [2] is named here
+/// too (it is not a live fault, so it stays out of [_warnTemp]); any byte not
+/// listed is an unknown byte.
+const alarmBitNames = <String, Map<int, String>>{
+  'current': _warnCur,
+  'voltage': _warnVol,
+  'temperature': {..._warnTemp, 2: 'Latched over-temperature protection'},
+};
+
 // ---------------------------------------------------------------------------
 // Decoded telemetry, accumulated across frames.
 // ---------------------------------------------------------------------------

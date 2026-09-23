@@ -31,6 +31,18 @@ void logLine(String tag, String message) =>
 
 String fmtStampMs(int ms) => fmtStamp(DateTime.fromMillisecondsSinceEpoch(ms));
 
+const _monthAbbr = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+/// Short local stamp for an event list: `21 Sep 15:06:59` (#67).
+String fmtShortStamp(int ms) {
+  final d = DateTime.fromMillisecondsSinceEpoch(ms);
+  return '${d.day} ${_monthAbbr[d.month - 1]} '
+      '${pad(d.hour)}:${pad(d.minute)}:${pad(d.second)}';
+}
+
 /// Lowercase, space-separated two-hex-digit bytes: `a2 57 85 00`.
 String hexOf(List<int> bytes) =>
     bytes.map((b) => (b & 0xff).toRadixString(16).padLeft(2, '0')).join(' ');

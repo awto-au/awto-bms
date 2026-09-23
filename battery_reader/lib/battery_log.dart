@@ -44,6 +44,7 @@ import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
+import 'alarm_events.dart';
 import 'battery_connection.dart';
 import 'battery_protocol.dart';
 import 'diagnostics.dart';
@@ -601,8 +602,13 @@ class BatteryLogger {
   static const _dbName = 'battery_intervals.db';
   static const _kReadings = 'readings';
 
-  /// Schema version. v3 (review pass C1, H2) adds the epoch-ms columns.
-  static const int schemaVersion = 3;
+  /// Schema version. v3 (review pass C1, H2) adds the epoch-ms columns; v4
+  /// (#67) adds the additive `alarm_events` table.
+  static const int schemaVersion = 4;
+
+  /// #67: one row per alarm-byte transition with its snapshot. Additive —
+  /// nothing else in the store refers to it.
+  static const _kAlarms = 'alarm_events';
 
   /// Checkpointed per-battery lifetime totals (issue #37). One row per serial;
   /// updated incrementally from `readings` and never a source of truth for the
@@ -853,6 +859,7 @@ class BatteryLogger {
     await _createMsIndex(db);
     await _createFlagsView(db);
     await _createLifetimeTable(db);
+    await _createAlarmTable(db);
   }
 
   static Future<void> _onUpgrade(Database db, int oldV, int newV) async {
@@ -862,6 +869,50 @@ class BatteryLogger {
     // v2 -> v3 (H2): add the epoch-ms columns + index and BACKFILL them ONCE by
     // parsing the existing text columns. The text columns are kept as they are.
     if (oldV < 3) await migrateToV3(db);
+    // v3 -> v4 (#67): the alarm-event table. Purely additive; every existing
+    // row of `readings` / `lifetime_totals` is untouched.
+    if (oldV < 4) await _createAlarmTable(db);
+  }
+
+  /// #67: the alarm EVENT table (see [AlarmEvent.toRow] for the columns).
+  static Future<void> _createAlarmTable(DatabaseExecutor db) async {
+    await db.execute('CREATE TABLE IF NOT EXISTS $_kAlarms ('
+        ' id INTEGER PRIMARY KEY,'
+        ' serial TEXT NOT NULL,'
+        ' at_ms INTEGER NOT NULL,'
+        ' at_time TEXT NOT NULL,'
+        ' frame TEXT NOT NULL,'
+        ' byte_index INTEGER NOT NULL,'
+        ' bit_name TEXT NOT NULL,'
+        ' transition TEXT NOT NULL,'
+        ' from_value INTEGER,'
+        ' to_value INTEGER,'
+        ' duration_ms INTEGER,'
+        ' pack_i REAL,'
+        ' pack_v REAL,'
+        ' cell_min REAL,'
+        ' cell_max REAL,'
+        ' cell_delta REAL,'
+        ' temp0 INTEGER,'
+        ' temp1 INTEGER,'
+        ' temp2 INTEGER,'
+        ' temp3 INTEGER,'
+        ' chip INTEGER,'
+        ' soc INTEGER,'
+        ' charge_state TEXT,'
+        ' chg_mos INTEGER,'
+        ' dis_mos INTEGER,'
+        ' temp_gate INTEGER,'
+        ' smoke_gate INTEGER,'
+        ' heat_gate INTEGER,'
+        ' over_temp_latched INTEGER,'
+        ' standby_on INTEGER,'
+        ' last_tx_label TEXT,'
+        ' last_tx_hex TEXT,'
+        ' since_last_tx_ms INTEGER,'
+        ' since_connect_ms INTEGER)');
+    await db.execute('CREATE INDEX IF NOT EXISTS ix_alarm_events ON $_kAlarms '
+        '(serial, at_ms)');
   }
 
   static Future<void> _createMsIndex(Database db) => db.execute(
@@ -1012,6 +1063,7 @@ class BatteryLogger {
     if (previous != null) unawaited(previous.cancel());
     final subs = <StreamSubscription<dynamic>>[
       conn.events.listen((_) => _onEvent(conn)),
+      conn.alarmEvents.listen(recordAlarmEvent), // #67
       conn.connection.listen((cs) {
         if (cs == ConnState.disconnected) {
           final serial = conn.state.serial;
@@ -1036,6 +1088,7 @@ class BatteryLogger {
     if (serial == null || serial.isEmpty) return;
     final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
     final s = conn.state;
+    _seedAlarmStats(serial); // #67: cheap once seeded
 
     // Per-cell voltages (volts) — EVERY cell present (M14): the VOL frame is
     // count-prefixed, so a bigger pack simply logs more `cellN` metrics.
@@ -1073,6 +1126,108 @@ class BatteryLogger {
     // bridge the expected gap between samples.
     _num(serial, Metric.sampleMode, now, sampleIntervalMs > 0 ? 1 : 0);
     _num(serial, Metric.sampleIntervalS, now, (sampleIntervalMs ~/ 1000).toDouble());
+  }
+
+  // --- #67 alarm EVENT records ---------------------------------------------
+
+  /// Per-serial count + latest event, kept in memory for the synchronous
+  /// Diagnostics summary; seeded from the table once per serial.
+  final Map<String, AlarmStats> _alarmStats = {};
+  final Set<String> _alarmStatsSeeded = {};
+
+  /// The in-memory tally for [serial] (session events plus, once seeded, the
+  /// stored history).
+  AlarmStats alarmStats(String serial) =>
+      _alarmStats[serial] ?? const AlarmStats();
+
+  /// "no alarm events" / "3 alarm events, last …" — the Diagnostics line.
+  String alarmSummaryLine(String serial) => alarmStats(serial).summaryLine;
+
+  void _seedAlarmStats(String serial) {
+    if (_alarmStatsSeeded.contains(serial) || _db == null) return;
+    _alarmStatsSeeded.add(serial);
+    unawaited(guard<void>('seed alarm stats $serial', () async {
+      final count = await alarmEventCount(serial);
+      final last = await alarmEvents(serial, limit: 1);
+      final live = _alarmStats[serial] ?? const AlarmStats();
+      // Rows recorded this session before the seed landed are already in the
+      // stored count; take the larger of the two views.
+      final total = count > live.count ? count : live.count;
+      final latest = last.isEmpty
+          ? live.last
+          : live.last == null || last.first.atMs >= live.last!.atMs
+              ? last.first
+              : live.last;
+      _alarmStats[serial] = AlarmStats(count: total, last: latest);
+    }, source: _source));
+  }
+
+  /// Record one alarm-byte transition (#67). Best-effort through the
+  /// serialised write queue — a failure is counted like any other write, the
+  /// row is never retried (the raw log's `ALARM` line still has it). A
+  /// `cleared` row looks up its `set` row (the latest unresolved one for the
+  /// same serial / frame / byte — across app restarts too), takes the
+  /// duration from it and back-fills the same duration onto that row; when
+  /// no stored `set` row exists, the connection's own in-memory duration is
+  /// kept.
+  void recordAlarmEvent(AlarmEvent ev) {
+    if (ev.serial.isEmpty) return;
+    _alarmStats[ev.serial] = alarmStats(ev.serial).add(ev);
+    if (_db == null) {
+      _maybeReopen();
+      return;
+    }
+    _enqueue('insert alarm event', (db) async {
+      await db.transaction((txn) async {
+        var row = ev;
+        if (!ev.isSet) {
+          final open = await txn.query(
+            _kAlarms,
+            columns: ['id', 'at_ms'],
+            where: 'serial = ? AND frame = ? AND byte_index = ? '
+                "AND transition = 'set' AND duration_ms IS NULL",
+            whereArgs: [ev.serial, ev.frame, ev.byteIndex],
+            orderBy: 'at_ms DESC, id DESC',
+            limit: 1,
+          );
+          if (open.isNotEmpty) {
+            final setId = open.first['id'] as int;
+            final setAt = (open.first['at_ms'] as num).toInt();
+            final d = ev.atMs - setAt;
+            final duration = d >= 0 ? d : ev.durationMs;
+            await txn.update(_kAlarms, {'duration_ms': duration},
+                where: 'id = ?', whereArgs: [setId]);
+            row = ev.withDuration(duration);
+          }
+        }
+        await txn.insert(_kAlarms, row.toRow());
+      });
+    });
+  }
+
+  /// Alarm events for [serial], NEWEST first; [limit] 0 = all.
+  Future<List<AlarmEvent>> alarmEvents(String serial,
+      {int limit = 50, int offset = 0}) async {
+    final db = _db;
+    if (db == null) return const [];
+    final rows = await db.query(
+      _kAlarms,
+      where: 'serial = ?',
+      whereArgs: [serial],
+      orderBy: 'at_ms DESC, id DESC',
+      limit: limit > 0 ? limit : null,
+      offset: offset > 0 ? offset : null,
+    );
+    return [for (final r in rows) AlarmEvent.fromRow(r)];
+  }
+
+  /// How many alarm events are stored for [serial].
+  Future<int> alarmEventCount(String serial) async {
+    final db = _db;
+    if (db == null) return 0;
+    final r = await db.rawQuery(
+        'SELECT COUNT(*) AS n FROM $_kAlarms WHERE serial = ?', [serial]);
+    return (r.first['n'] as num?)?.toInt() ?? 0;
   }
 
   // --- typed observe helpers ------------------------------------------------

@@ -14,6 +14,8 @@ import 'package:flutter/services.dart'
 import 'package:share_plus/share_plus.dart';
 import 'package:sqflite_common_ffi/sqflite_common_ffi.dart';
 
+import 'alarm_events.dart';
+import 'alarm_events_view.dart';
 import 'alert_notifications.dart';
 import 'alias_store.dart';
 import 'battery_charts.dart';
@@ -713,8 +715,11 @@ class _BatteryListPageState extends State<BatteryListPage>
           onExit: _exitApp,
           scanError: _demoMode ? null : _manager.scanErrorText,
           // #55: control availability per battery, live at each refresh.
-          batteryStatus: () =>
-              [for (final b in _manager.batteries) b.gateStatusSummary()],
+          batteryStatus: () => [
+            for (final b in _manager.batteries)
+              '${b.gateStatusSummary()} · '
+                  '${BatteryLogger.instance.alarmSummaryLine(b.state.serial ?? '')}'
+          ],
         ),
       ),
     );
@@ -2099,6 +2104,13 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
   /// M6: a sparkline load in flight — the 3 s timer never overlaps a slow one.
   bool _sparkLoading = false;
 
+  /// #67: the pack's alarm events (newest first), the stored total and
+  /// whether the user asked for all of them. Loaded with the sparklines.
+  List<AlarmEvent> _alarms = const [];
+  int _alarmTotal = 0;
+  bool _alarmsAll = false;
+  String? _alarmError;
+
   /// M4: in-flight write flags shared by the Controls section and the latched
   /// over-temp card (both can send Restart BMS).
   final _busy = BusyWrites();
@@ -2158,12 +2170,33 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
         _sparkTo = range.toMs;
         _sparkError = null;
       });
+      await _loadAlarms(serial);
     } catch (e) {
       AppLog.instance
           .record('Sparklines', 'history load for $serial failed: $e');
       if (mounted) setState(() => _sparkError = '$e');
     } finally {
       _sparkLoading = false;
+    }
+  }
+
+  /// #67: the alarm-event rows (last [AlarmEventsSection.pageSize], or all).
+  Future<void> _loadAlarms(String serial) async {
+    try {
+      final log = BatteryLogger.instance;
+      final rows = await log.alarmEvents(serial,
+          limit: _alarmsAll ? 0 : AlarmEventsSection.pageSize);
+      final total = await log.alarmEventCount(serial);
+      if (!mounted) return;
+      setState(() {
+        _alarms = rows;
+        _alarmTotal = total;
+        _alarmError = null;
+      });
+    } catch (e) {
+      AppLog.instance
+          .record('Alarm events', 'load for $serial failed: $e');
+      if (mounted) setState(() => _alarmError = '$e');
     }
   }
 
@@ -2316,6 +2349,19 @@ class _BatteryDetailPageState extends State<BatteryDetailPage> {
             _Warnings('Current alarms', s.currentWarnings),
             _Warnings('Voltage alarms', s.voltageWarnings),
             _Warnings('Temperature alarms', s.temperatureWarnings),
+            // #67: every alarm-byte transition with its snapshot.
+            AlarmEventsSection(
+              serial: s.serial ?? '',
+              events: _alarms,
+              total: _alarmTotal,
+              showingAll: _alarmsAll,
+              error: _alarmError,
+              onShowAll: () {
+                setState(() => _alarmsAll = true);
+                final serial = s.serial;
+                if (serial != null && serial.isNotEmpty) _loadAlarms(serial);
+              },
+            ),
             _ControlsSection(
               conn: widget.conn,
               busy: _busy,

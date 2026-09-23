@@ -5,6 +5,7 @@ library;
 
 import 'dart:async';
 
+import 'alarm_events.dart';
 import 'battery_protocol.dart';
 import 'ble_transport.dart';
 import 'demo_source.dart';
@@ -122,6 +123,14 @@ class BatteryConnection {
         }
         _integrateThroughput(DateTime.now().millisecondsSinceEpoch);
         _detectAlerts();
+        // #67: an alarm-byte transition becomes an alarm EVENT record with a
+        // snapshot of the state just decoded. Best-effort — it can never
+        // throw into the parser.
+        if (e is WarningEvent) {
+          guardSync<void>('alarm event capture',
+              () => _trackAlarmBytes(e.category, lastFrameMs!),
+              source: _source);
+        }
         // L11: a frame that lands after dispose() must not throw on the closed
         // controller (a demo/link callback can still be in flight).
         if (!_events.isClosed) _events.add(e);
@@ -586,6 +595,82 @@ class BatteryConnection {
 
   bool _prevFault = false;
 
+  // --- #67 alarm EVENT records ----------------------------------------------
+
+  /// The last command written to this pack (any label passed to `_send`,
+  /// handshake included), its bytes and when: the "0.5 s after 'Output ON'"
+  /// context of an alarm event. Kept across reconnects.
+  String? lastTxLabel;
+  List<int> lastTxBytes = const [];
+  int? lastTxMs;
+
+  /// Epoch-ms the current link came up (null before the first connect).
+  int? get connectedAtMs => _connectedAtMs;
+
+  /// Every alarm-byte transition on this pack, as it is captured. The logger
+  /// subscribes in `attach()`. Synchronous delivery: the row is queued in the
+  /// same turn as the frame that produced it (before any later reading), and
+  /// the capture hook that adds to it is guarded, so a listener can never
+  /// throw into the parser.
+  Stream<AlarmEvent> get alarmEvents => _alarmEvents.stream;
+  final _alarmEvents = StreamController<AlarmEvent>.broadcast(sync: true);
+
+  /// The alarm bytes of the last decoded frame per alarm frame name. The
+  /// FIRST frame of each is the baseline (a bit already set at first contact
+  /// is not a transition); every later change of ANY byte is an event.
+  /// Deliberately NOT reset on reconnect: a bit that changed while the link
+  /// was down is still a transition, stamped at the first frame after.
+  final Map<String, List<int>> _prevAlarmBytes = {};
+
+  /// When each currently-set alarm byte (`frame|index`) was seen to set, so
+  /// its clearing row can carry the duration even if the DB lookup fails.
+  final Map<String, int> _alarmSetAtMs = {};
+
+  /// #67: compare the alarm frame just decoded ([parser].lastFrameBytes, the
+  /// frame that produced [category]'s WarningEvent) with the previous one and
+  /// emit one [AlarmEvent] per byte that changed — documented bit or not.
+  void _trackAlarmBytes(String category, int atMs) {
+    final f = parser.lastFrameBytes;
+    if (f.length < 4) return;
+    final data = f.sublist(2, f.length - 2); // begin(2) … end(2)
+    final prev = _prevAlarmBytes[category];
+    _prevAlarmBytes[category] = data;
+    if (prev == null) return; // baseline
+    final n = prev.length < data.length ? prev.length : data.length;
+    for (var i = 0; i < n; i++) {
+      final from = prev[i] & 0xff, to = data[i] & 0xff;
+      if (from == to) continue;
+      final key = '$category|$i';
+      int? duration;
+      if (to != 0) {
+        _alarmSetAtMs[key] = atMs;
+      } else {
+        final setAt = _alarmSetAtMs.remove(key);
+        if (setAt != null) duration = atMs - setAt;
+      }
+      final ev = AlarmEvent.capture(
+        serial: state.serial ?? '',
+        atMs: atMs,
+        frame: category,
+        byteIndex: i,
+        fromValue: from,
+        toValue: to,
+        state: state,
+        signedCurrent: signedCurrent,
+        durationMs: duration,
+        lastTxLabel: lastTxLabel,
+        lastTxBytes: lastTxBytes,
+        lastTxMs: lastTxMs,
+        connectedAtMs: _connectedAtMs,
+      );
+      final text = ev.snapshotText();
+      final serial = state.serial ?? '';
+      AppLog.instance.record('Alarm ${serial.isEmpty ? '?' : serial}', text);
+      RawLogger.instance.logEvent(serial, 'ALARM', text, frame: f);
+      if (!_alarmEvents.isClosed) _alarmEvents.add(ev);
+    }
+  }
+
   List<String> _faultList() => [
         if (state.faultCurrent) 'current',
         if (state.faultVoltage) 'voltage',
@@ -767,6 +852,7 @@ class BatteryConnection {
     final demo = _demo;
     if (demo != null) {
       RawLogger.instance.logTx(state.serial ?? '', '$label (demo)', bytes);
+      _noteTx(label, bytes);
       demo.handleWrite(bytes);
       return;
     }
@@ -783,7 +869,15 @@ class BatteryConnection {
     }
     // Issue #19: also record every command we send to the raw log (TX line).
     RawLogger.instance.logTx(state.serial ?? '', label, bytes);
+    _noteTx(label, bytes);
     await link.write(bytes);
+  }
+
+  /// #67: remember the command going out, for the alarm-event snapshot.
+  void _noteTx(String label, List<int> bytes) {
+    lastTxLabel = label;
+    lastTxBytes = List.unmodifiable(bytes);
+    lastTxMs = now().millisecondsSinceEpoch;
   }
 
   // --- #41 firmware update (OTA) -------------------------------------------
@@ -1440,6 +1534,7 @@ class BatteryConnection {
     loggerAttachment = null;
     await att?.cancel();
     await _events.close();
+    await _alarmEvents.close();
     await _conn.close();
   }
 
