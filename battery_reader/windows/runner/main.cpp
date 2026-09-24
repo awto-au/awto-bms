@@ -73,7 +73,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   Win32Window::Size size(static_cast<unsigned int>(width),
                          static_cast<unsigned int>(height));
   window.SetMinimumSize(Win32Window::Size(kMinWidth, kMinHeight));
-  if (!window.Create(L"battery_reader", origin, size)) {
+  if (!window.Create(L"Awto BMS", origin, size)) {
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);

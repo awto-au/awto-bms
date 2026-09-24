@@ -20,6 +20,7 @@ import 'bms_families.dart';
 import 'demo_source.dart';
 import 'diagnostics.dart';
 import 'intervals.dart' show sampleGapMs;
+import 'last_known.dart';
 import 'ota_update.dart' show OtaLock;
 import 'sample_scheduler.dart';
 
@@ -65,6 +66,13 @@ class FleetRecord {
   final double? fullAh;
   final int? lastSeenMs;
 
+  /// #71: the FULL last-known state (every value the sections show) and the
+  /// epoch-ms of the last decoded telemetry it came from — restored into the
+  /// offline placeholder on launch and rendered in the stale style with its
+  /// age. Null on a record that never held a decoded frame.
+  final LastKnownState? last;
+  final int? lastDataMs;
+
   const FleetRecord({
     required this.serial,
     this.profile = 'JS',
@@ -74,6 +82,8 @@ class FleetRecord {
     this.remainingAh,
     this.fullAh,
     this.lastSeenMs,
+    this.last,
+    this.lastDataMs,
   });
 
   Map<String, dynamic> toJson() => {
@@ -85,6 +95,8 @@ class FleetRecord {
         if (remainingAh != null) 'remainingAh': remainingAh,
         if (fullAh != null) 'fullAh': fullAh,
         if (lastSeenMs != null) 'lastSeenMs': lastSeenMs,
+        if (last != null) 'last': last!.toJson(),
+        if (lastDataMs != null) 'lastDataMs': lastDataMs,
       };
 
   factory FleetRecord.fromJson(Map<String, dynamic> j) => FleetRecord(
@@ -96,6 +108,11 @@ class FleetRecord {
         remainingAh: (j['remainingAh'] as num?)?.toDouble(),
         fullAh: (j['fullAh'] as num?)?.toDouble(),
         lastSeenMs: (j['lastSeenMs'] as num?)?.toInt(),
+        last: j['last'] is Map
+            ? LastKnownState.fromJson(
+                Map<String, dynamic>.from(j['last'] as Map))
+            : null,
+        lastDataMs: (j['lastDataMs'] as num?)?.toInt(),
       );
 
   @override
@@ -108,11 +125,13 @@ class FleetRecord {
       other.packVoltage == packVoltage &&
       other.remainingAh == remainingAh &&
       other.fullAh == fullAh &&
-      other.lastSeenMs == lastSeenMs;
+      other.lastSeenMs == lastSeenMs &&
+      other.last == last &&
+      other.lastDataMs == lastDataMs;
 
   @override
-  int get hashCode => Object.hash(
-      serial, profile, remoteId, soc, packVoltage, remainingAh, fullAh, lastSeenMs);
+  int get hashCode => Object.hash(serial, profile, remoteId, soc, packVoltage,
+      remainingAh, fullAh, lastSeenMs, last, lastDataMs);
 }
 
 /// Durable storage for fleet membership. Since #34 it persists a [FleetRecord]
@@ -757,11 +776,16 @@ class BatteryManager {
 
   BatteryConnection _makeRemembered(FleetRecord r) {
     final profile = r.profile == 'RV' ? DeviceProfile.rv : DeviceProfile.sphere;
-    final c = BatteryConnection(profile: profile, transport: transport)
+    // #71: on the manager's clock, so the placeholder's "last known · … ago"
+    // age is measured on the same clock its stamp came from.
+    final c = BatteryConnection(profile: profile, transport: transport, now: now)
       ..inFleet = true
       ..isRemembered = true
       ..rememberedRemoteId = r.remoteId
       ..lastSeenMs = r.lastSeenMs
+      // #71: the age of the last-known values; a pre-#71 record with a #34
+      // summary but no data stamp dates it from its last-seen time.
+      ..lastDataMs = r.lastDataMs ?? (r.soc == null ? null : r.lastSeenMs)
       ..connState = ConnState.disconnected; // offline until (re)discovered
     c.state
       ..serial = r.serial
@@ -769,6 +793,10 @@ class BatteryManager {
       ..packVoltage = r.packVoltage
       ..remainingAh = r.remainingAh
       ..fullAh = r.fullAh;
+    // #71: the FULL last-known state (cells, temps, gates, …) on top of the
+    // #34 summary, so the placeholder renders real figures in the stale
+    // style rather than dashes. Never-known values stay null ("—").
+    r.last?.applyTo(c.state);
     return c;
   }
 
@@ -888,6 +916,13 @@ class BatteryManager {
       lastSeenMs: connected
           ? now().millisecondsSinceEpoch
           : conn.lastSeenMs,
+      // #71: the full last-known state and the age of the telemetry behind
+      // it. A pack that never decoded a frame holds no snapshot (null), so a
+      // restart still shows it as a never-known placeholder ("—").
+      last: conn.lastDataMs == null
+          ? null
+          : LastKnownState.capture(s, signedCurrent: conn.signedCurrent),
+      lastDataMs: conn.lastDataMs,
     );
   }
 
@@ -1166,6 +1201,33 @@ class BatteryManager {
   /// offline packs has no charge state to show.
   ChargeState? get fleetStreamingState =>
       streamingFleetMembers.isEmpty ? null : fleetState;
+
+  /// #71: the fleet's net direction from EVERY member's last-known signed
+  /// power (offline and silent packs included) — what the panel's "Status"
+  /// shows, in the stale style, while nothing is live. Null when no member
+  /// has ever reported a charge state (a fleet of never-seen placeholders).
+  ChargeState? get fleetLastKnownState {
+    final known = fleetMembers
+        .where((b) => b.state.chargeState != ChargeState.unknown)
+        .toList();
+    if (known.isEmpty) return null;
+    final p = known.fold(0.0, (a, b) => a + b.signedPower);
+    if (p > 0.5) return ChargeState.charging;
+    if (p < -0.5) return ChargeState.discharging;
+    return ChargeState.idle;
+  }
+
+  /// #71: the epoch-ms of the most recent telemetry any fleet member holds
+  /// (live or restored), for the fleet panel's "last known · … ago" caption;
+  /// null when no member ever decoded a frame.
+  int? get fleetLastDataMs {
+    int? best;
+    for (final b in fleetMembers) {
+      final t = b.lastDataMs;
+      if (t != null && (best == null || t > best)) best = t;
+    }
+    return best;
+  }
 
   void disposeAll() {
     _aggTimer?.cancel();

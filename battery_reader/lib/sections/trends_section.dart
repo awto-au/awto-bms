@@ -11,6 +11,7 @@ import '../battery_log.dart' show ReadingInterval, sampleLegendText;
 import '../intervals.dart' show GapPolicy, LookbackWindow;
 import '../metrics.dart';
 import '../sparkline.dart';
+import '../stale.dart';
 
 /// One shared period selector drives every row; each row shows its metric's
 /// recent history as an alpha-blended held/step sparkline with the ACTUAL
@@ -34,6 +35,10 @@ class TrendsSection extends StatelessWidget {
   final String logging;
   final bool dense;
 
+  /// #71: null while live; otherwise the "now" figures are last-known (stale
+  /// style) and ONE caption sits in the title row.
+  final Staleness? stale;
+
   const TrendsSection({
     super.key,
     required this.window,
@@ -46,6 +51,7 @@ class TrendsSection extends StatelessWidget {
     this.error,
     this.policy,
     this.dense = false,
+    this.stale,
   });
 
   @override
@@ -63,6 +69,11 @@ class TrendsSection extends StatelessWidget {
                 const Icon(Icons.timeline, size: 18),
                 const SizedBox(width: 8),
                 Text('Trends', style: Theme.of(context).textTheme.titleMedium),
+                if (stale != null) ...[
+                  const SizedBox(width: 10),
+                  Flexible(
+                      child: StaleCaption(stale!, textAlign: TextAlign.left)),
+                ],
                 const Spacer(),
                 const Text('window',
                     style: TextStyle(color: Colors.white38, fontSize: 12)),
@@ -118,6 +129,7 @@ class TrendsSection extends StatelessWidget {
                 color: m.sparkColorFor(conn),
                 centreZero: m.centreZero,
                 policy: policy,
+                stale: stale != null,
               ),
           ],
         ),
@@ -166,7 +178,8 @@ class LoggingLine extends StatelessWidget {
 }
 
 /// One trend row: label, an inline sparkline (expanded), and the actual current
-/// value large/clear with units on the right.
+/// value large/clear with units on the right. #71: [stale] renders that "now"
+/// figure as last-known.
 class SparkRow extends StatelessWidget {
   final String label;
   final String value;
@@ -176,6 +189,7 @@ class SparkRow extends StatelessWidget {
   final Color color;
   final bool centreZero;
   final GapPolicy? policy; // #53
+  final bool stale;
 
   const SparkRow({
     super.key,
@@ -187,10 +201,12 @@ class SparkRow extends StatelessWidget {
     required this.color,
     this.centreZero = false,
     this.policy,
+    this.stale = false,
   });
 
   @override
   Widget build(BuildContext context) {
+    const valueStyle = TextStyle(fontSize: 16, fontWeight: FontWeight.w700);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
@@ -216,8 +232,7 @@ class SparkRow extends StatelessWidget {
             child: Text(
               value,
               textAlign: TextAlign.right,
-              style: const TextStyle(
-                  fontSize: 16, fontWeight: FontWeight.w700),
+              style: staleOr(stale, valueStyle, text: value),
             ),
           ),
         ],

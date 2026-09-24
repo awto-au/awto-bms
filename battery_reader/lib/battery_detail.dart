@@ -40,6 +40,7 @@ import 'sections/recovery_ladder_card.dart';
 import 'sections/temperatures_section.dart';
 import 'sections/trends_section.dart';
 import 'sections/warnings_section.dart';
+import 'stale.dart';
 import 'widgets.dart';
 import 'write_actions.dart' show BusyWrites;
 
@@ -310,7 +311,13 @@ class _BatteryDetailViewState extends State<BatteryDetailView> {
     );
   }
 
-  Widget _trends() => TrendsSection(
+  /// #71: the pack's staleness (null while live), computed ONCE per build
+  /// and handed to every section so they all flip together.
+  Staleness? _stale() => stalenessOf(widget.conn,
+      sampling: widget.manager.isSampling,
+      nextDueMs: widget.manager.nextSampleDueMs);
+
+  Widget _trends(Staleness? stale) => TrendsSection(
         window: _sparkWindow,
         onWindow: _setSparkWindow,
         series: _spark,
@@ -329,21 +336,25 @@ class _BatteryDetailViewState extends State<BatteryDetailView> {
           windowLabel: _sparkWindow.label,
         ),
         dense: widget.dense,
+        stale: stale,
       );
 
   /// The catalogue-driven sections, in [DetailSection] order — the one list
   /// both arrangements draw from (the drift-guard test walks it).
-  List<Widget> _metricSections() {
+  List<Widget> _metricSections(Staleness? stale) {
     final c = widget.conn;
     final d = widget.dense;
     return [
       for (final s in DetailSection.values)
         switch (s) {
-          DetailSection.pack => PackSection(conn: c, dense: d),
-          DetailSection.capacity => CapacitySection(conn: c, dense: d),
-          DetailSection.cells => CellsSection(conn: c, dense: d),
-          DetailSection.temperature => TemperaturesSection(conn: c, dense: d),
-          DetailSection.gates => GatesStatusSection(conn: c, dense: d),
+          DetailSection.pack => PackSection(conn: c, dense: d, stale: stale),
+          DetailSection.capacity =>
+            CapacitySection(conn: c, dense: d, stale: stale),
+          DetailSection.cells => CellsSection(conn: c, dense: d, stale: stale),
+          DetailSection.temperature =>
+            TemperaturesSection(conn: c, dense: d, stale: stale),
+          DetailSection.gates =>
+            GatesStatusSection(conn: c, dense: d, stale: stale),
         },
     ];
   }
@@ -398,6 +409,7 @@ class _BatteryDetailViewState extends State<BatteryDetailView> {
     final banner = _banner();
     final latched = _latched();
     final recovery = _recovery();
+    final stale = _stale(); // #71
     return switch (widget.arrangement) {
       DetailArrangement.stacked => ListView(
           padding: const EdgeInsets.all(16),
@@ -407,8 +419,8 @@ class _BatteryDetailViewState extends State<BatteryDetailView> {
             _header(alias),
             if (recovery != null) recovery,
             const SizedBox(height: 12),
-            _trends(),
-            ..._metricSections(),
+            _trends(stale),
+            ..._metricSections(stale),
             ..._warnings(),
             _alarmEvents(),
             _controls(),
@@ -423,7 +435,7 @@ class _BatteryDetailViewState extends State<BatteryDetailView> {
             final twoUp = box.maxWidth >= kDetailGridTwoColumnMin;
             // The small sections two-up (in catalogue order, Controls last),
             // then the wide ones full-width. Wrapping preserves the order.
-            final small = [..._metricSections(), _controls()];
+            final small = [..._metricSections(stale), _controls()];
             return ListView(
               padding: const EdgeInsets.all(8),
               children: [
@@ -449,7 +461,7 @@ class _BatteryDetailViewState extends State<BatteryDetailView> {
                   ...small,
                 ..._warnings(),
                 _alarmEvents(),
-                _trends(),
+                _trends(stale),
                 _advanced(),
                 const SizedBox(height: 24),
               ],

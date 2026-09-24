@@ -114,6 +114,7 @@ class BatteryConnection {
           // ack answers a command and must not clear the silence.
           lastTelemetryMs = lastFrameMs;
           lastFrameEverMs = lastFrameMs;
+          lastDataMs = lastFrameMs; // #71: the age of the last-known values
           _cycleSeen.add(e.runtimeType);
           streamClass = StreamClass.streaming;
         }
@@ -981,6 +982,20 @@ class BatteryConnection {
   /// #34: last-known BLE device id for a favourite, persisted for reconnect /
   /// identification. Set when a live device binds to this row.
   String? rememberedRemoteId;
+
+  /// #71: epoch-ms of the telemetry behind the values in [state] — the last
+  /// decoded telemetry frame on ANY link this session, or the persisted
+  /// snapshot's stamp restored into a remembered placeholder. Unlike
+  /// [lastFrameEverMs] it survives a restart, and unlike [lastSeenMs] it
+  /// dates the DATA, not the link (a connected-but-silent pack is "seen" now
+  /// but its values are as old as its last frame). Null when no value was
+  /// ever known — the sections then show "—", never a stale figure.
+  int? lastDataMs;
+
+  /// #71: the direction-signed current, or null while the pack has never
+  /// reported one (so a never-known placeholder reads "—", not "0.0 A").
+  double? get signedCurrentOrNull =>
+      state.packCurrent == null ? null : signedCurrent;
 
   /// #34: true when this is a remembered favourite that is not currently
   /// connected — i.e. an offline placeholder showing last-known values.

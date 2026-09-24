@@ -13,6 +13,7 @@ import '../battery_manager.dart';
 import '../fmt.dart';
 import '../health_palette.dart';
 import '../live_indicator.dart';
+import '../stale.dart';
 import '../widgets.dart';
 import 'signal_chip.dart';
 
@@ -56,15 +57,14 @@ class SummaryCard extends StatelessWidget {
     // and labelled "Offline · last seen …", never as a live/alarm card.
     // #53: a pack released between background samples is NOT offline.
     final offline = conn.isOffline && !manager.isSampling;
-    // #65: no data behind the screen (silent / dormant / waiting / offline):
-    // the charge state, current and voltage are NOT shown anywhere on the
-    // card — the status line reads "No data · …" and the figures "—". The
-    // SOC bar keeps the last-known SOC, dimmed as offline favourites are.
-    final noData = offline ||
-        !liveStatusOf(conn,
-                sampling: manager.isSampling,
-                nextDueMs: manager.nextSampleDueMs)
-            .hasData;
+    // #65 / #71: no data behind the screen (silent / dormant / waiting /
+    // offline): the status line reads "No data · …" / "Offline · …" and the
+    // figures show the LAST-KNOWN values in the stale style (red, dimmed,
+    // tabular) with ONE "last known · … ago" caption on the switches row.
+    // Never-known values still read "—". The SOC bar's fill is dimmed.
+    final stale = stalenessOf(conn,
+        sampling: manager.isSampling, nextDueMs: manager.nextSampleDueMs);
+    final noData = stale != null;
     final track = HealthPalette.track(Theme.of(context).brightness);
     // Issue #13: SOC-graded fill / identity accent; a fault overrides to red.
     final health = HealthPalette.socOrFault((soc ?? 0).toDouble(), fault: alarm);
@@ -189,16 +189,14 @@ class SummaryCard extends StatelessWidget {
                       const SizedBox(height: 2),
                       // Prominent (issue #16): SOC %, signed current, remaining
                       // Ah. Voltage is demoted to the small line below. With no
-                      // data (#34 offline, #65 silent) the last-known SOC is
-                      // dimmed and the current reads "—".
-                      Opacity(
-                       opacity: noData ? 0.45 : 1.0,
-                       child: Column(
+                      // data (#34 offline, #65 silent, #71) the bar is dimmed
+                      // and the figures are last-known, in the stale style.
+                      Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
                       SocBar(
                         frac: frac,
-                        fill: health,
+                        fill: noData ? health.withValues(alpha: 0.45) : health,
                         track: track,
                         height: dense ? 26 : 46,
                         radius: dense ? 7 : 12,
@@ -210,11 +208,15 @@ class SummaryCard extends StatelessWidget {
                             // (#28 fix): "93%  ·  -12.3 A out  ·  87 Ah".
                             Text(
                               fPct(soc),
-                              style: TextStyle(
-                                fontSize: dense ? 15 : 22,
-                                fontWeight: FontWeight.bold,
-                                color: HealthPalette.onHealth,
-                                shadows: shadow,
+                              style: staleOr(
+                                noData,
+                                text: fPct(soc),
+                                TextStyle(
+                                  fontSize: dense ? 15 : 22,
+                                  fontWeight: FontWeight.bold,
+                                  color: HealthPalette.onHealth,
+                                  shadows: shadow,
+                                ),
                               ),
                             ),
                             const Spacer(),
@@ -223,13 +225,18 @@ class SummaryCard extends StatelessWidget {
                                 fit: BoxFit.scaleDown,
                                 alignment: Alignment.centerRight,
                                 child: Text(
-                                  '${noData ? '—' : fSignedA(conn.signedCurrent)}  ·  ${fAh(s.remainingAh)}',
+                                  '${fSignedA(conn.signedCurrentOrNull)}  ·  ${fAh(s.remainingAh)}',
                                   maxLines: 1,
-                                  style: TextStyle(
-                                    fontSize: dense ? 12 : 16,
-                                    fontWeight: FontWeight.w700,
-                                    color: HealthPalette.onHealth,
-                                    shadows: shadow,
+                                  style: staleOr(
+                                    noData,
+                                    text:
+                                        '${fSignedA(conn.signedCurrentOrNull)}  ·  ${fAh(s.remainingAh)}',
+                                    TextStyle(
+                                      fontSize: dense ? 12 : 16,
+                                      fontWeight: FontWeight.w700,
+                                      color: HealthPalette.onHealth,
+                                      shadows: shadow,
+                                    ),
                                   ),
                                 ),
                               ),
@@ -245,7 +252,8 @@ class SummaryCard extends StatelessWidget {
                       // live dot (green blinking per cycle, amber stale, red
                       // silent), its text the charge direction while data
                       // flows and "No data · <why>" / "Offline · last seen …"
-                      // when it does not; the figures then read "—".
+                      // when it does not; the figures are then last-known,
+                      // in the stale style (#71).
                       LiveStatusLine(
                         conn: conn,
                         dir: dir,
@@ -256,31 +264,41 @@ class SummaryCard extends StatelessWidget {
                         gap: 6,
                         fontSize: 12,
                         trailing: (hasData) => [
-                          Text(hasData ? fV(s.packVoltage) : '—',
-                              style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: dense ? 12 : 14,
-                                  fontWeight: FontWeight.w600)),
+                          Text(fV(s.packVoltage),
+                              style: staleOr(
+                                  !hasData,
+                                  text: fV(s.packVoltage),
+                                  TextStyle(
+                                      color: Colors.white,
+                                      fontSize: dense ? 12 : 14,
+                                      fontWeight: FontWeight.w600))),
                           const Text('  ·  ',
                               style: TextStyle(color: Colors.white38)),
-                          Text(hasData ? fSignedA(conn.signedCurrent) : '—',
-                              style: TextStyle(
-                                  color: hasData ? dir.color : Colors.white38,
-                                  fontSize: dense ? 12 : 14,
-                                  fontWeight: FontWeight.w600)),
+                          Text(fSignedA(conn.signedCurrentOrNull),
+                              style: staleOr(
+                                  !hasData,
+                                  text: fSignedA(conn.signedCurrentOrNull),
+                                  TextStyle(
+                                      color: dir.color,
+                                      fontSize: dense ? 12 : 14,
+                                      fontWeight: FontWeight.w600))),
                         ],
                       ),
                       SizedBox(height: dense ? 1 : 3),
-                      // #58: the two MOSFET switches, each on its own.
+                      // #58: the two MOSFET switches, each on its own; #71:
+                      // stale look + the card's ONE last-known caption.
                       Row(
                         children: [
-                          SwitchBadge('Charge', s.chargeMos),
+                          SwitchBadge('Charge', s.chargeMos, stale: noData),
                           const SizedBox(width: 10),
-                          SwitchBadge('Output', s.dischargeMos),
+                          SwitchBadge('Output', s.dischargeMos, stale: noData),
+                          if (stale != null) ...[
+                            const Spacer(),
+                            Flexible(child: StaleCaption(stale)),
+                          ],
                         ],
                       ),
                         ],
-                       ),
                       ),
                     ],
                   ),

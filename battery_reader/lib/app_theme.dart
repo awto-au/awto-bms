@@ -19,6 +19,30 @@ const kRed = HealthPalette.faultRed;
 const kIdle = HealthPalette.idle;
 const kTrack = Color(0xFF222A35); // dark SOC-bar track (HealthPalette.track resolves per theme)
 
+/// #71: a LAST-KNOWN (not live) figure — the fault red at 75 % opacity. Every
+/// shared widget renders a remembered value in this colour, with tabular
+/// numerals ([staleFigure]), whenever the connection is not streaming, so
+/// the phone and desktop layouts cannot drift apart on how "stale" looks.
+const kStale = Color(0xBFE5484D); // HealthPalette.faultRed, alpha 0xBF
+
+/// #71: the stale text style — [kStale] + tabular numerals — layered over a
+/// widget's own size / weight ([base]) so only the colour says "not live".
+TextStyle staleFigure([TextStyle? base]) => (base ?? const TextStyle()).copyWith(
+      color: kStale,
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+
+/// [base] while live, [staleFigure] of it while [stale] — the one switch
+/// every figure in the shared widgets goes through. With [text] given, a
+/// figure that holds no value at all ("—", "—  ·  —") keeps [base]: a
+/// never-known value is a plain dash, not a stale one.
+TextStyle staleOr(bool stale, TextStyle base, {String? text}) =>
+    stale && (text == null || !_noValue.hasMatch(text))
+        ? staleFigure(base)
+        : base;
+
+final RegExp _noValue = RegExp(r'^[—\s·]*$');
+
 /// Resolve an effective charge state, filling `unknown` from the flags.
 ChargeState effState(BatteryState s) {
   final cs = s.chargeState;

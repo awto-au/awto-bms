@@ -1,21 +1,28 @@
 /// "Cells" detail section: the per-cell voltages in a row, then the catalogue
 /// rows of [DetailSection.cells] (delta, min/max, sum / average …).
+/// #71: [stale] (null while live) renders the cells and rows as last-known
+/// with one caption on the card.
 library;
 
 import 'package:flutter/material.dart';
 
+import '../app_theme.dart';
 import '../battery_connection.dart';
 import '../metrics.dart';
+import '../stale.dart';
 import 'section_card.dart';
 
 class CellsSection extends StatelessWidget {
   final BatteryConnection conn;
   final bool dense;
-  const CellsSection({super.key, required this.conn, this.dense = false});
+  final Staleness? stale;
+  const CellsSection(
+      {super.key, required this.conn, this.dense = false, this.stale});
 
   @override
   Widget build(BuildContext context) {
     final s = conn.state;
+    const cellStyle = TextStyle(fontWeight: FontWeight.w600);
     return SectionCard(
       'Cells',
       [
@@ -29,14 +36,16 @@ class CellsSection extends StatelessWidget {
               children: [
                 for (final mv in s.cellsMv)
                   Text('${(mv / 1000).toStringAsFixed(3)} V',
-                      style: const TextStyle(fontWeight: FontWeight.w600)),
+                      style:
+                          stale != null ? staleFigure(cellStyle) : cellStyle),
               ],
             ),
           ),
         const Divider(height: 20),
-        ...metricKvRows(DetailSection.cells, conn),
+        ...metricKvRows(DetailSection.cells, conn, stale: stale != null),
       ],
       dense: dense,
+      stale: stale,
     );
   }
 }

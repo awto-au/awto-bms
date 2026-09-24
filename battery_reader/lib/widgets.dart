@@ -6,6 +6,7 @@ library;
 
 import 'package:flutter/material.dart';
 
+import 'app_theme.dart' show kStale, staleOr;
 import 'health_palette.dart';
 
 /// The page body shell every screen used to spell out by hand:
@@ -78,19 +79,25 @@ class SocBar extends StatelessWidget {
 
 /// #58: one MOSFET switch's state as a compact "Charge on" / "Output off"
 /// badge — green when on, muted when off, an em dash while not yet reported.
+/// #71: [stale] renders a last-known state in the stale red (same glyph and
+/// word, dimmed red text) — never-known stays the em dash.
 class SwitchBadge extends StatelessWidget {
   final String label;
   final bool? on;
   final double fontSize;
-  const SwitchBadge(this.label, this.on, {super.key, this.fontSize = 12});
+  final bool stale;
+  const SwitchBadge(this.label, this.on,
+      {super.key, this.fontSize = 12, this.stale = false});
 
   @override
   Widget build(BuildContext context) {
     final color = on == null
         ? Colors.white38
-        : on!
-            ? HealthPalette.healthy
-            : HealthPalette.idle;
+        : stale
+            ? kStale
+            : on!
+                ? HealthPalette.healthy
+                : HealthPalette.idle;
     final word = on == null ? '—' : (on! ? 'on' : 'off');
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -99,8 +106,12 @@ class SwitchBadge extends StatelessWidget {
             size: fontSize + 6, color: color),
         const SizedBox(width: 4),
         Text('$label $word',
-            style: TextStyle(
-                color: color, fontSize: fontSize, fontWeight: FontWeight.w600)),
+            style: staleOr(
+                stale && on != null,
+                TextStyle(
+                    color: color,
+                    fontSize: fontSize,
+                    fontWeight: FontWeight.w600))),
       ],
     );
   }
@@ -135,13 +146,18 @@ class LegendSwatch extends StatelessWidget {
 
 /// A key/value row. The default layout is the detail-section / fleet-panel
 /// row (key left, bold value right); [KvRow.info] is the denser fixed-key-
-/// column layout of the detected-device info sheet.
+/// column layout of the detected-device info sheet. #71: [stale] renders a
+/// last-known value in the stale style (red, tabular); an em dash value is a
+/// never-known one and keeps its plain look.
 class KvRow extends StatelessWidget {
   final String k;
   final String v;
   final bool info;
-  const KvRow(this.k, this.v, {super.key}) : info = false;
-  const KvRow.info(this.k, this.v, {super.key}) : info = true;
+  final bool stale;
+  const KvRow(this.k, this.v, {super.key, this.stale = false}) : info = false;
+  const KvRow.info(this.k, this.v, {super.key})
+      : info = true,
+        stale = false;
 
   @override
   Widget build(BuildContext context) {
@@ -170,7 +186,10 @@ class KvRow extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Text(k, style: const TextStyle(color: Colors.white70)),
-          Text(v, style: const TextStyle(fontWeight: FontWeight.w600)),
+          Text(v,
+              style: staleOr(stale,
+                  const TextStyle(fontWeight: FontWeight.w600),
+                  text: v)),
         ],
       ),
     );

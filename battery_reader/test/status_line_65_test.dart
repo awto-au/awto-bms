@@ -1,17 +1,22 @@
 /// GitHub #65: ONE status line per card / detail header, with liveness
-/// folded in — and never a stale "Idle · no load" (or any charge state,
-/// current, voltage) when there is no data behind it.
+/// folded in — and never a stale "Idle · no load" (or any charge state) on
+/// the status line when there is no data behind it.
+///
+/// #71 changed what the FIGURES do without data: they now show the
+/// last-known values in the stale style (red, tabular, one "last known · …"
+/// caption) rather than "—" — see stale_71_test.dart. "—" remains only for
+/// a value that was never known. The status LINE text is unchanged.
 ///
 ///  * [statusTextFor] — the pure text rules: streaming / stale / no-data
 ///    variants / offline placeholder / background sampling;
 ///  * a card for a silent connection has exactly ONE status line, reads
-///    "No data · …", its figures are "—" and no "Idle" / "no load" / charge
-///    state / voltage / current appears anywhere on it;
+///    "No data · …", and no "Idle" / "no load" / charge state appears
+///    anywhere on it; its figures are the last-known values, stale;
 ///  * a streaming card shows the state text and its dot flashes on
 ///    BAL_STATUS (#64 kept);
 ///  * the detail header follows the same rule;
-///  * the fleet panel's Status is "No data" when nothing streams, and net
-///    current / power exclude silent packs.
+///  * the fleet panel's Status comes from last-known values (stale) when
+///    nothing streams, and net current / power exclude silent packs.
 library;
 
 import 'package:battery_reader/battery_connection.dart';
@@ -21,6 +26,8 @@ import 'package:battery_reader/health_palette.dart';
 import 'package:battery_reader/live_indicator.dart';
 import 'package:battery_reader/main.dart';
 import 'package:battery_reader/alias_store.dart';
+import 'package:battery_reader/stale.dart' show StaleCaption;
+import 'package:battery_reader/widgets.dart' show KvRow;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -32,9 +39,16 @@ const bal = [0xA8, 0xAC, 0x01, 1, 1, 0, 1, 0, 0, 0xB9, 0x21];
 
 /// The status line's two figures (V and A) reading "—" — the 14 px texts;
 /// the SOC "—" (22 px) and the RSSI chip's (12 px) are not the figures.
+/// #71: only a NEVER-known figure reads "—" now.
 int dashFigures(WidgetTester tester) => tester
     .widgetList<Text>(find.text('—'))
     .where((t) => t.style?.fontSize == 14)
+    .length;
+
+/// #71: the status line's two figures (V and A) in the stale style.
+int staleFigures(WidgetTester tester) => tester
+    .widgetList<Text>(find.byType(Text))
+    .where((t) => t.style?.fontSize == 14 && t.style?.color == kStale)
     .length;
 
 /// Every piece of text on screen (plain and rich), for "never anywhere"
@@ -240,6 +254,9 @@ void main() {
           onToggleFleet: () {},
         )));
 
+    /// No charge state anywhere without data (#65). #71: the VALUES
+    /// ("53.21 V", "+12.3 A in") are allowed — they are the last-known
+    /// figures, rendered stale.
     void expectNoStaleState(WidgetTester tester) {
       for (final t in allText(tester)) {
         for (final stale in const [
@@ -247,16 +264,25 @@ void main() {
           'no load',
           'Charging',
           'Discharging',
-          '53.21',
-          '12.3 A',
         ]) {
           expect(t, isNot(contains(stale)), reason: 'stale "$stale" in "$t"');
         }
       }
     }
 
+    /// #71: the last-known V and A figures are on the card, in the stale
+    /// style, with the one caption.
+    void expectStaleFigures(WidgetTester tester) {
+      expect(dashFigures(tester), 0, reason: 'known values are never "—"');
+      expect(staleFigures(tester), 2, reason: 'V and A in the stale style');
+      expect(find.text('53.21 V'), findsOneWidget);
+      expect(find.text('+12.3 A in'), findsWidgets);
+      expect(find.byType(StaleCaption), findsOneWidget);
+    }
+
     testWidgets('silent pack: exactly ONE status line, "No data · …", '
-        'figures "—", no charge state / V / A anywhere', (tester) async {
+        'figures last-known (stale), no charge state anywhere',
+        (tester) async {
       final c = await streamed(tester);
       final m = manager();
       // The pack goes silent: 15 s without a frame, probe says dormant.
@@ -268,8 +294,8 @@ void main() {
       expect(find.byType(LiveDot), findsOneWidget, reason: 'one dot');
       expect(find.text('No data · not streaming — BMS not running'),
           findsOneWidget);
-      expect(dashFigures(tester), 2, reason: 'V and A read "—"');
-      expect(find.text('80%'), findsOneWidget, reason: 'last SOC kept, dimmed');
+      expectStaleFigures(tester); // #71
+      expect(find.text('80%'), findsOneWidget, reason: 'last SOC kept, stale');
       expectNoStaleState(tester);
       final line = tester.widget<LiveDot>(find.byType(LiveDot));
       expect(line.color, HealthPalette.faultRed);
@@ -298,7 +324,8 @@ void main() {
       await pumpCard(tester, c, manager());
       expect(find.byType(LiveStatusLine), findsOneWidget);
       expect(find.text('No data · waiting for the first frame'), findsOneWidget);
-      expect(dashFigures(tester), 2);
+      expect(dashFigures(tester), 2, reason: 'never known: still "—" (#71)');
+      expect(staleFigures(tester), 0);
       expectNoStaleState(tester);
       await tester.pumpWidget(const SizedBox());
       await tester.runAsync(c.dispose);
@@ -339,17 +366,18 @@ void main() {
       expect(find.text('No data · not streaming — 11 s silent'), findsOneWidget);
       expect(find.byType(LiveStatusLine), findsOneWidget);
       // … and the list page's 300 ms signature tick (hasData is in the
-      // signature) rebuilds the card, which blanks the SOC-bar current too.
+      // signature) rebuilds the card, whose figures turn stale (#71).
       await pumpCard(tester, c, manager());
       expect(find.byType(LiveStatusLine), findsOneWidget);
       expectNoStaleState(tester);
+      expectStaleFigures(tester);
 
       await tester.pumpWidget(const SizedBox());
       await tester.runAsync(c.dispose);
     });
 
     testWidgets('offline favourite placeholder: "Offline · last seen …" as '
-        'the one line, figures "—"', (tester) async {
+        'the one line, known figures stale, never-known "—"', (tester) async {
       final m = manager();
       final c = BatteryConnection(profile: DeviceProfile.sphere);
       c.state
@@ -367,14 +395,17 @@ void main() {
       expect(find.text('Offline · last seen 5 min ago'), findsOneWidget);
       expect(find.byIcon(Icons.cloud_off), findsNothing,
           reason: 'the separate offline row is gone');
-      expect(dashFigures(tester), 2);
+      // #71: the voltage was known (stale); the current never was ("—").
+      expect(dashFigures(tester), 1);
+      expect(staleFigures(tester), 1);
+      expect(find.text('52.00 V'), findsOneWidget);
       expect(find.text('70%'), findsOneWidget);
       expectNoStaleState(tester);
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('detail header: the same single line; Current "—" when silent',
-        (tester) async {
+    testWidgets('detail header: the same single line; Current last-known '
+        '(stale) when silent', (tester) async {
       SharedPreferences.setMockInitialValues({});
       final c = await streamed(tester);
       final m = manager();
@@ -391,11 +422,14 @@ void main() {
       expect(find.byType(LiveStatusLine), findsOneWidget);
       expect(find.text('No data · not streaming — BMS not running'),
           findsOneWidget);
-      expect(find.text('—  ·  —'), findsOneWidget, reason: 'V · W');
-      expect(find.text('—'), findsWidgets, reason: 'the big Current figure');
-      expect(find.text('+12.3 A in'), findsNothing);
+      // #71: V known, W never known; Current last-known — all stale.
+      expect(find.text('53.21 V  ·  —'), findsOneWidget, reason: 'V · W');
+      expect(tester.widget<Text>(find.text('53.21 V  ·  —')).style!.color,
+          kStale);
+      final current = tester.widget<Text>(find.text('+12.3 A in').first);
+      expect(current.style!.color, kStale, reason: 'the big Current figure');
       expect(find.text('Charging'), findsNothing);
-      expect(find.text('53.21 V'), findsNothing);
+      expect(find.byType(StaleCaption), findsWidgets);
       // The #62 recovery card stays.
       expect(find.textContaining('BMS not running'), findsWidgets);
       await tester.pumpWidget(const SizedBox());
@@ -445,8 +479,8 @@ void main() {
       m.disposeAll();
     });
 
-    testWidgets('Status row reads "No data" when nothing streams, the state '
-        'when something does', (tester) async {
+    testWidgets('Status row reads the last-known state (stale) when nothing '
+        'streams, the live state when something does', (tester) async {
       SharedPreferences.setMockInitialValues({});
       final m = BatteryManager(
           transport: NoopTransport(), fleetStore: FakeFleetStore());
@@ -460,15 +494,25 @@ void main() {
           );
       await tester.pumpWidget(panel());
       expect(find.text('Status'), findsOneWidget);
-      expect(find.text('No data'), findsOneWidget);
-      expect(find.text('Charging'), findsNothing);
+      // #71: the last-known state, in the stale style.
+      expect(find.text('No data'), findsNothing);
+      expect(find.text('Charging'), findsOneWidget);
+      expect(tester.widget<Text>(find.text('Charging')).style!.color, kStale);
+      expect(
+          tester
+              .widget<KvRow>(
+                  find.byWidgetPredicate((w) => w is KvRow && w.k == 'Status'))
+              .stale,
+          isTrue);
       expect(find.text('Idle · no load'), findsNothing);
-      // The pack starts streaming: its state shows.
+      // The pack starts streaming: its live state shows, normal colour.
       c.lastTelemetryMs = DateTime.now().millisecondsSinceEpoch;
       await tester.pumpWidget(const SizedBox());
       await tester.pumpWidget(panel());
       expect(find.text('No data'), findsNothing);
       expect(find.text('Charging'), findsOneWidget);
+      expect(tester.widget<Text>(find.text('Charging')).style!.color,
+          isNot(kStale));
       await tester.pumpWidget(const SizedBox());
       m.disposeAll();
     });

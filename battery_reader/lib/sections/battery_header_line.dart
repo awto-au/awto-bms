@@ -23,6 +23,7 @@ import '../health_palette.dart';
 import '../intervals.dart' show GapPolicy;
 import '../live_indicator.dart';
 import '../sparkline.dart';
+import '../stale.dart';
 import '../widgets.dart';
 import 'section_card.dart';
 
@@ -56,14 +57,14 @@ class BatteryHeaderLine extends StatelessWidget {
     final frac = ((soc ?? 0) / 100).clamp(0.0, 1.0);
     final cap = state.fullAh;
     final alarm = conn.alarmActive;
-    // #65: same rule as the card — no charge state / current / voltage while
-    // there is no data behind them (silent, waiting, offline).
+    // #65 / #71: same rule as the card — no charge state on the status line
+    // while there is no data behind it (silent, waiting, offline); every
+    // figure then shows its LAST-KNOWN value in the stale style with ONE
+    // "last known · … ago" caption on the switches row.
     final offline = conn.isOffline && !manager.isSampling;
-    final noData = offline ||
-        !liveStatusOf(conn,
-                sampling: manager.isSampling,
-                nextDueMs: manager.nextSampleDueMs)
-            .hasData;
+    final stale = stalenessOf(conn,
+        sampling: manager.isSampling, nextDueMs: manager.nextSampleDueMs);
+    final noData = stale != null;
     // Issue #13: SOC colour is graded; an active fault overrides to red.
     final health = HealthPalette.socOrFault((soc ?? 0).toDouble(), fault: alarm);
     final track = HealthPalette.track(Theme.of(context).brightness);
@@ -76,11 +77,15 @@ class BatteryHeaderLine extends StatelessWidget {
       children: [
         Text(
           soc == null ? '—' : '$soc',
-          style: TextStyle(
-            fontSize: dense ? 32 : 56,
-            fontWeight: FontWeight.bold,
-            height: 1.0,
-            color: health,
+          style: staleOr(
+            noData,
+            text: soc == null ? '—' : '$soc',
+            TextStyle(
+              fontSize: dense ? 32 : 56,
+              fontWeight: FontWeight.bold,
+              height: 1.0,
+              color: health,
+            ),
           ),
         ),
         const Text('% SOC', style: small),
@@ -92,11 +97,14 @@ class BatteryHeaderLine extends StatelessWidget {
       children: [
         const Text('Current', style: small),
         Text(
-          noData ? '—' : fSignedA(conn.signedCurrent),
-          style: TextStyle(
-              fontSize: dense ? 20 : 26,
-              fontWeight: FontWeight.bold,
-              color: noData ? Colors.white38 : dir.color),
+          fSignedA(conn.signedCurrentOrNull),
+          style: staleOr(
+              noData,
+              text: fSignedA(conn.signedCurrentOrNull),
+              TextStyle(
+                  fontSize: dense ? 20 : 26,
+                  fontWeight: FontWeight.bold,
+                  color: dir.color)),
         ),
       ],
     );
@@ -107,14 +115,17 @@ class BatteryHeaderLine extends StatelessWidget {
         const Text('Remaining', style: small),
         Text(
           fAh(state.remainingAh),
-          style: TextStyle(
-              fontSize: dense ? 20 : 26, fontWeight: FontWeight.bold),
+          style: staleOr(
+              noData,
+              text: fAh(state.remainingAh),
+              TextStyle(
+                  fontSize: dense ? 20 : 26, fontWeight: FontWeight.bold)),
         ),
       ],
     );
     // Secondary details (demoted): voltage, power and status — the ONE status
     // line (#61 / #64 / #65): live dot, charge direction while streaming,
-    // "No data · <why>" otherwise, figures "—".
+    // "No data · <why>" otherwise, figures last-known in the stale style (#71).
     final statusLine = LiveStatusLine(
       conn: conn,
       dir: dir,
@@ -125,22 +136,23 @@ class BatteryHeaderLine extends StatelessWidget {
       gap: 8,
       fontSize: 13,
       trailing: (hasData) => [
-        Text(
-            hasData
-                ? '${fV(state.packVoltage)}  ·  ${fW(state.power)}'
-                : '—  ·  —',
-            style: const TextStyle(color: Colors.white54, fontSize: 13)),
+        Text('${fV(state.packVoltage)}  ·  ${fW(state.power)}',
+            style: staleOr(!hasData,
+                const TextStyle(color: Colors.white54, fontSize: 13),
+                text: '${fV(state.packVoltage)}  ·  ${fW(state.power)}')),
       ],
     );
-    // #58: the two MOSFET switches, each on its own.
+    // #58: the two MOSFET switches, each on its own (#71: stale look).
     final badges = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        SwitchBadge('Charge', state.chargeMos, fontSize: 13),
+        SwitchBadge('Charge', state.chargeMos, fontSize: 13, stale: noData),
         const SizedBox(width: 12),
-        SwitchBadge('Output', state.dischargeMos, fontSize: 13),
+        SwitchBadge('Output', state.dischargeMos, fontSize: 13, stale: noData),
       ],
     );
+    // #71: the header's ONE last-known caption, beside the badges.
+    final caption = stale == null ? null : StaleCaption(stale, fontSize: 12);
 
     return Card(
       child: Padding(
@@ -193,10 +205,11 @@ class BatteryHeaderLine extends StatelessWidget {
                 ],
               ),
             SizedBox(height: dense ? 8 : 14),
-            // Horizontal SOC bar (linear fill on a track), coloured like the %.
+            // Horizontal SOC bar (linear fill on a track), coloured like the %
+            // (dimmed while the figures are last-known, #71).
             SocBar(
               frac: frac,
-              fill: health,
+              fill: noData ? health.withValues(alpha: 0.45) : health,
               track: track,
               height: dense ? 8 : 14,
               radius: dense ? 4 : 8,
@@ -208,10 +221,13 @@ class BatteryHeaderLine extends StatelessWidget {
                 const Text('SOC over time', style: small),
                 const Spacer(),
                 Text(soc == null ? '—' : '$soc%',
-                    style: TextStyle(
-                        fontSize: 12,
-                        color: health,
-                        fontWeight: FontWeight.w600)),
+                    style: staleOr(
+                        noData,
+                        text: soc == null ? '—' : '$soc%',
+                        TextStyle(
+                            fontSize: 12,
+                            color: health,
+                            fontWeight: FontWeight.w600))),
               ],
             ),
             const SizedBox(height: 4),
@@ -224,19 +240,32 @@ class BatteryHeaderLine extends StatelessWidget {
               policy: policy,
             ),
             SizedBox(height: dense ? 6 : 12),
-            // #68 dense: status + switch badges on ONE line.
+            // #68 dense: status + switch badges (+ the #71 caption) on ONE
+            // line; the phone stacks them.
             if (dense)
               Row(
                 children: [
                   Expanded(child: statusLine),
                   const SizedBox(width: 12),
                   badges,
+                  if (caption != null) ...[
+                    const SizedBox(width: 12),
+                    Flexible(child: caption),
+                  ],
                 ],
               )
             else ...[
               statusLine,
               const SizedBox(height: 6),
-              badges,
+              Row(
+                children: [
+                  badges,
+                  if (caption != null) ...[
+                    const Spacer(),
+                    Flexible(child: caption),
+                  ],
+                ],
+              ),
             ],
           ],
         ),

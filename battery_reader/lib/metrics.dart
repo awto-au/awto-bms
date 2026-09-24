@@ -283,8 +283,9 @@ final List<MetricDef> metricTable = <MetricDef>[
     label: 'Current',
     unit: 'A',
     // Logged SIGNED (+in / −out); the detail row shows the BMS magnitude.
+    // #71: "—" (not "0.0 A") while the pack never reported a current.
     extract: (c) => c.signedCurrent,
-    format: (c) => fSignedA(c.signedCurrent),
+    format: (c) => fSignedA(c.signedCurrentOrNull),
     color: HealthPalette.healthy,
     sparkColor: HealthPalette.telemetryAccent,
     centreZero: true,

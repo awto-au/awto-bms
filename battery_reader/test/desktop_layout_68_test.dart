@@ -10,7 +10,9 @@ import 'dart:io';
 
 import 'package:battery_reader/alias_store.dart';
 import 'package:battery_reader/battery_charts.dart';
+import 'package:battery_reader/battery_connection.dart';
 import 'package:battery_reader/battery_manager.dart';
+import 'package:battery_reader/battery_protocol.dart' show ChargeState;
 import 'package:battery_reader/desktop_shell.dart';
 import 'package:battery_reader/intervals.dart' show LookbackWindow;
 import 'package:battery_reader/main.dart';
@@ -26,6 +28,7 @@ import 'package:battery_reader/sections/section_card.dart';
 import 'package:battery_reader/sections/temperatures_section.dart';
 import 'package:battery_reader/alarm_events_view.dart';
 import 'package:battery_reader/settings_store.dart';
+import 'package:battery_reader/stale.dart' show StaleCaption;
 import 'package:battery_reader/widgets.dart';
 import 'package:battery_reader/window_memory.dart';
 import 'package:flutter/material.dart';
@@ -229,6 +232,126 @@ void main() {
       await tester.pumpWidget(const SizedBox());
       manager.disposeAll();
       await tester.pump();
+    });
+
+    testWidgets(
+        '#71: a silent pack renders the SAME stale rows, captions and badges '
+        'at 400 px and 1280 px', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      var clock = DateTime.utc(2026, 9, 21, 12);
+      final manager = BatteryManager(
+          transport: NoopTransport(),
+          fleetStore: FakeFleetStore(),
+          now: () => clock);
+      final aliases = AliasStore(prefs: SharedPreferences.getInstance);
+      final conn = BatteryConnection(transport: FakeTransport(), now: () => clock);
+      await tester.runAsync(() => conn.connectTo('dev-1', name: 'dev-1'));
+      conn.parser.addBytes(const [0xA8, 0xAC, 0x01, 1, 1, 0, 1, 0, 0, 0xB9, 0x21]);
+      conn.state
+        ..serial = 'JS-STALE'
+        ..socPercent = 80
+        ..remainingAh = 80
+        ..fullAh = 100
+        ..packVoltage = 53.21
+        ..packCurrent = 12.3
+        ..power = 654
+        ..chargeState = ChargeState.charging
+        ..cellsMv = [3312, 3320, 3305, 3318]
+        ..temp1 = 22
+        ..temp2 = 23
+        ..firmwareVersion = '1.0.1';
+      manager.batteries.add(conn);
+      // Silent for 15 s, probe says dormant: every figure is last-known.
+      clock = clock.add(const Duration(seconds: 15));
+      conn.streamClass = StreamClass.dormant;
+
+      /// Everything the stale rendering consists of, per arrangement.
+      Map<String, Object> snapshot() => {
+            'rows': {
+              for (final s in DetailSection.values)
+                s.name: [
+                  for (final r in tester.widgetList<KvRow>(find.descendant(
+                      of: find.byType(sectionType(s)),
+                      matching: find.byType(KvRow))))
+                    (r.k, normaliseValue(r.v), r.stale),
+                ],
+            },
+            'captions': {
+              for (final s in DetailSection.values)
+                s.name: find
+                    .descendant(
+                        of: find.byType(sectionType(s)),
+                        matching: find.byType(StaleCaption))
+                    .evaluate()
+                    .length,
+            },
+            'captionText': tester
+                .widgetList<Text>(find.textContaining('last known'))
+                .map((t) => normaliseValue(t.data!))
+                .toSet()
+                .toList(),
+            'badges': [
+              for (final b
+                  in tester.widgetList<SwitchBadge>(find.byType(SwitchBadge)))
+                (b.label, b.on, b.stale),
+            ],
+            'staleTexts': tester
+                .widgetList<Text>(find.byType(Text))
+                .where((t) => t.style?.color == kStale && t.data != null)
+                .map((t) => normaliseValue(t.data!))
+                .toSet()
+                .toList()
+              ..sort(),
+            'status': find
+                .text('No data · not streaming — BMS not running')
+                .evaluate()
+                .length,
+          };
+
+      await view(tester, 400, 6000);
+      await tester.pumpWidget(app(
+          BatteryDetailPage(conn: conn, manager: manager, aliases: aliases)));
+      await tester.pump();
+      await tester.pump();
+      final phone = snapshot();
+      expect(tester.takeException(), isNull);
+
+      await view(tester, 1280, 6000);
+      await tester.pumpWidget(app(Scaffold(
+          body: BatteryDetailView(
+              conn: conn,
+              manager: manager,
+              aliases: aliases,
+              arrangement: DetailArrangement.grid,
+              dense: true))));
+      await tester.pump();
+      await tester.pump();
+      final desk = snapshot();
+      expect(tester.takeException(), isNull);
+
+      expect(desk, phone, reason: 'stale rendering identical in both layouts');
+      // And it really is the stale rendering, not two identical blanks.
+      final rows = phone['rows'] as Map<String, List<(String, String, bool)>>;
+      for (final s in DetailSection.values) {
+        expect(rows[s.name], isNotEmpty);
+        expect(rows[s.name]!.every((r) => r.$3), isTrue,
+            reason: '${s.name} rows stale');
+      }
+      expect((phone['captions'] as Map<String, int>).values.every((n) => n == 1),
+          isTrue,
+          reason: 'one caption per section card');
+      expect(phone['captionText'], ['last known · <age> ago']);
+      expect(find.text('last known · 15 s ago'), findsWidgets);
+      expect(phone['status'], 1);
+      expect(phone['staleTexts'] as List<String>,
+          containsAll(['53.21 V', '+12.3 A in', '80', '3.312 V', '1.0.1']));
+      expect((phone['badges'] as List).length, 2);
+      expect((phone['badges'] as List<(String, bool?, bool)>).every((b) => b.$3),
+          isTrue);
+
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+      manager.disposeAll();
     });
 
     test('main.dart defines no per-field row, section or list card inline',

@@ -11,6 +11,7 @@ import '../battery_manager.dart';
 import '../battery_protocol.dart';
 import '../fmt.dart';
 import '../health_palette.dart';
+import '../stale.dart';
 import '../widgets.dart';
 import '../write_actions.dart';
 
@@ -35,10 +36,22 @@ class FleetTotal extends StatelessWidget {
         HealthPalette.socOrFault((soc ?? 0).toDouble(), fault: alarm);
     // Direction word ("Charging"/"Idle · no load"/"Discharging") still comes
     // from the net-power state; only the COLOUR is now SOC-graded. #65: the
-    // state is derived from STREAMING members only — with none, "No data".
+    // state is derived from STREAMING members only. #71: with none, the
+    // Status and switch counts come from every member's LAST-KNOWN values,
+    // in the stale style with ONE caption; "No data" only when no member has
+    // ever reported a state.
     final fleetState = manager.fleetStreamingState;
-    final label =
-        fleetState == null ? 'No data' : ChargeStateStyle.of(fleetState).label;
+    final nothingLive = fleetState == null;
+    final lastKnown = nothingLive ? manager.fleetLastKnownState : null;
+    final label = fleetState != null
+        ? ChargeStateStyle.of(fleetState).label
+        : lastKnown != null
+            ? ChargeStateStyle.of(lastKnown).label
+            : 'No data';
+    final staleRows = nothingLive && lastKnown != null;
+    final stale = staleRows
+        ? Staleness(lastDataMs: manager.fleetLastDataMs, now: manager.now)
+        : null;
     final net = manager.netPowerW;
     final netText = net == 0
         ? '0 W'
@@ -107,13 +120,17 @@ class FleetTotal extends StatelessWidget {
             ),
           ),
           SizedBox(height: dense ? 6 : 12),
-          KvRow('Status', label),
-          // #58: how many members have each MOSFET switch on.
+          KvRow('Status', label, stale: staleRows),
+          // #58: how many members have each MOSFET switch on (#71: last-known
+          // counts in the stale style while nothing is live).
           if (favs.isNotEmpty)
             KvRow(
                 'Switches',
                 'Charge ${manager.fleetChargeOnCount}/${favs.length} on  ·  '
-                'Output ${manager.fleetOutputOnCount}/${favs.length} on'),
+                'Output ${manager.fleetOutputOnCount}/${favs.length} on',
+                stale: staleRows),
+          if (stale != null)
+            Align(alignment: Alignment.centerRight, child: StaleCaption(stale)),
           // #36: total battery capacity = sum of every fleet member's fullAh
           // (offline members keep contributing their last-known fullAh, so the
           // total stays stable when a pack drops off), and total remaining Ah.

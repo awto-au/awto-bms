@@ -89,7 +89,7 @@ class BatteryReaderApp extends StatelessWidget {
       brightness: Brightness.dark,
     );
     return MaterialApp(
-      title: 'Battery Reader',
+      title: 'Awto BMS',
       navigatorKey: gNavKey,
       // #68: lets the shell's keyboard handler see which page is on top.
       navigatorObservers: [gRouteTracker],

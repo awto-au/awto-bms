@@ -19,7 +19,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
     <application
-        android:label="battery_reader"
+        android:label="Awto BMS"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
