@@ -323,6 +323,9 @@ Begin `A1 4F`, end `B2 E3`. Read 6 bytes; end sentinel at `[4],[5]`.
 → `mListener.getTemperature(t1, t2)` (BM:357-366). (`InputDeviceCompat.SOURCE_ANY` = `0xFFFFFF00`
 = −256, i.e. sign-extension.)
 
+Live (`JS5.1`, see PROTOCOL.md): the ignored bytes are copies. p0 == p3 in every frame and p1 ≈ p2
+(±1 °C), so the frame is two sensors each sent twice.
+
 ### 2.3 `CMD_ALL_DATA` — main telemetry (BM:381-470, BatteryAllDataBean.java)
 
 Begin `A2 57`, end `B3 6C`. Read **24 bytes**; end sentinel at `[22],[23]`. On entry the
@@ -335,7 +338,7 @@ BM:385) — **ALL_DATA is what completes the handshake.**
 | 2..4 | allCur | u24 LE (`{[2],[3],[4],0}`) | `(byteToLong / 100) / 10.0f` → A magnitude (BM:440) |
 | 5 | loadStatus | u8 | `byteJudge` (`!=0`) (BM:441) |
 | 6 | chargerStatus | u8 | `byteJudge` (BM:442) |
-| 7 | chipTemputer | u8 | `b & 0xFF` → °C (BM:443) |
+| 7 | chipTemputer | u8 | `b & 0xFF` → °C (BM:443). Live: always 0 on `JS5.1` |
 | 8..9 | vsum (sum of cells) | u16 LE | `byteToInt / 10.0f` → V (BM:444) |
 | 10..11 | maxVol | u16 LE | `(byteToInt / 10) / 100.0f` → V (BM:445) |
 | 12..13 | minVol | u16 LE | `(byteToInt / 10) / 100.0f` → V (BM:446) |
@@ -395,6 +398,10 @@ Begin `A6 C0`, end `B7 72`. Read 9 bytes; end at `[7],[8]`.
 | 6 | `==1` MOS protect | `warn_mos_protect` (BM:659) |
 
 → `mListener.getTempWarnList(list)` (BM:663).
+
+The strings are the vendor's. Live (see PROTOCOL.md): byte 2 is a **latched over-temperature
+protection** (held after the pack cools, inhibits charging, cleared only by a BMS restart), not a
+MOS reading; bytes 3 and 6 never changed and their meaning is unknown.
 
 ### 2.8 `CMD_OTHER` (BM:562-563) — A7 4E
 

@@ -17,6 +17,52 @@ constraints. Recovery is physical. The vendor documents no procedure, the case
 has no button, and opening it voids the warranty. Ranked steps and contacts are
 in §5.
 
+## 0. What happened in the blind spot (reconstructed 2026-09-24)
+
+The phone and Windows histories were merged (`scripts/merge_history.py`, all
+four sources: both interval stores and both raw logs) and set against the
+Claude session transcript and task output of 20 Sep. The window was not
+unobserved after all: a stress test was run on this exact pack inside it.
+
+| Local time, 20 Sep | Evidence | What happened |
+|---|---|---|
+| 06:56:52 – 07:03:18.484 | phone interval store | AA and B8 streaming normally on the phone. AA's last frames: cells 3.332–3.335 V, 93 %, 0 A, MOS on, no alarm bits. **Last proof AA's BMS was running.** Both packs' sessions end in the same second: the phone app let go of both, not an AA-side drop. |
+| 07:03:48 – 07:13:13 | session transcript, `test_0x30.py` output | "0x30 A/B test" on the PC (Python + bleak/WinRT) **against JS-2C14AA**: 40 cycles of scan → connect → `CMD_BEGIN`, `CMD_GET_EST` (+ `AT+V` in the first 20) → 6 s dwell → disconnect, 1.5 s apart. 13 cycles ended in WinRT aborts mid-connection ("operation was canceled", "method called at an unexpected time", "object has been closed") and 4 found the pack not advertising. The phone's foreground service competed for the pack throughout, until the phone app was force-stopped at 07:11:25. |
+| 07:09:35 → | phone interval store | The phone reconnected **B8** and kept logging it all day. It never got a reading from AA again. |
+| 20:42:04 | phone raw log | First logged contact with AA after the test: handshake + `AT+V` → a lone `0x30` from the bridge and no frames. This is the dormant signature (§1). |
+
+**What the test could and could not see.** It counted stray `0x30` bytes and
+treated any connect that did not throw as "good". It never checked for framed
+telemetry. A dormant pack's bridge still answers `AT+V` with a lone `0x30`
+(§1), so the 14/14 result in the first arm looks the same whether the BMS was
+running or already dormant. The test's output therefore cannot say when during
+those ten minutes AA stopped.
+
+**Finding.** AA went dormant between 07:03:18 and 20:42:04. The only activity
+on AA in that span was ~40 rapid connect / handshake / abort cycles from two
+competing centrals, starting 30 s after the last good frame. The untested pack
+(B8), on the same bank, stayed healthy.
+
+**Confidence:**
+- **High** that the test ran on AA in that window. The transcript, output and
+  commit `1d09b55` (07:15) all agree.
+- **Medium** that the test caused, or triggered, the dormancy. The timing is
+  tight: last proof of life 30 s before the test, dormant at the next contact,
+  and no other event. But no frame from inside the test survives to show AA
+  stop, and a spontaneous hang that happened to coincide cannot be excluded.
+  The raw logs have no lines for that span (phone: nothing from 19 Sep 21:21 to
+  20 Sep 20:09).
+
+A plausible mechanism, unproven: connections torn down during the bridge ↔ MCU
+UART exchange (WinRT aborts right after `CMD_BEGIN`) leave the MCU in the
+STANDBY-class state described in §2.
+
+**Consequences:**
+- The PROTOCOL.md note on the `0x30` byte stands: the byte is bridge-local.
+  But "the framed version reply" can't be assumed for that test.
+- **Do not repeat rapid reconnect / abort cycles against a real pack.** If the
+  mechanism is real, B8 would be lost the same way.
+
 ## 1. What the pack does (live, verified)
 
 | Probe | Result |
@@ -29,6 +75,7 @@ in §5.
 | `CMD_BEGIN` (wake), `CMD_GET_EST`, `CMD_SEND_MTU`, sleep-OFF `AA CC 01 01 DD EE`, the vendor's auto turn-on gate `C3 1E 01 01 01 00 00 00 00 00 D4 3B`, the restart gate frame, `CMD_UPDATE_END` | no reply, no telemetry — on `FCF1` (both write modes), and on the undocumented `11110002` / `11110003` characteristics (the Nations SDK's raw-UART pass-through service), with UART wake preambles and rapid repeats |
 | Vendor app (Sphere 1.0.24) | connects, shows SOC 0.0 %, 0.0 V, 0.0 A after its own automatic turn-on frame |
 | Charger on the parallel bank | charged B8 only (B8 rose 3.33 → 3.46 V/cell); AA unchanged |
+| Redarc BCDC1240 DC-DC charger on the parallel bank (user report, #93) | did not wake AA. The BCDC will not charge an auxiliary battery that reads below 4.2 V, so it cannot drive a pack whose terminals sit near 0 V |
 
 ## 2. Why nothing over Bluetooth can work
 
@@ -93,12 +140,20 @@ or wake command. Log: session scratchpad `fuzz_aa.log`.
    several connect/disconnect cycles to present voltage steps. Many smart
    chargers refuse a terminal reading that looks wrong, so if it shows "no
    battery" go to 3.
-3. **A source that outputs regardless of battery detect:** a charger with a
-   lithium "force / supply / 0 V activation" mode (Victron Blue Smart
-   "Li-ion force"/"Supply", Redarc/Projecta lithium-wake modes) or a bench
-   supply at 14.2–14.6 V with the current limit at ≤ 1 A. While it is attached,
-   try the app: if AA starts streaming, tap Charge ON and Output ON at once and
-   make sure Bluetooth standby is OFF.
+3. **A source that outputs into ~0 V:** an isolated pack with both FETs open
+   can read near 0 V at its posts, and a charger that checks for a battery
+   first will not start. The Redarc BCDC1240 is one: it refuses an auxiliary
+   battery below 4.2 V. Use a charger whose manual says it will output into
+   0 V (a lithium "force / supply / 0 V activation" mode, e.g. Victron Blue
+   Smart "Li-ion force"/"Supply"), or a bench supply set to 14.2–14.6 V with
+   the current limit at ≤ 1 A. **No vendor wake voltage exists:** the guide
+   and the apps give no activation voltage or procedure, and the JoySuny
+   datasheet says only "BMS Reconnect: Automatic" and a 0.8 A low-voltage
+   charging path, with no voltage. 14.2–14.6 V is the guide's bulk-charge
+   range (REFERENCES.md): a voltage the pack is specified to accept, not a
+   wake threshold. While the source is attached, try the app: if AA starts
+   streaming, tap Charge ON and Output ON at once and make sure Bluetooth
+   standby is OFF.
 4. **A direct load** (12 V lamp) on the isolated pack for 10–60 s, alternating
    with the charger — the opposite-polarity signal across the open FET stack.
 5. Jump-pack / charged battery in parallel on the isolated pack: adds nothing
@@ -117,9 +172,12 @@ or wake command. Log: session scratchpad `fuzz_aa.log`.
    - Manufacturer: Zhuhai JoySuny New Energy Tech, sales@joysuny.com,
      +86 137 2516 0159 (a Phoenix Technology Group JV).
    - State it precisely: *"BLE module (Nations NS-BLE-1.0) advertises and answers
-     AT+V, but the BMS MCU is not running after output-off with Bluetooth standby
-     on; with both MOS open no current path exists for the documented wake."* Ask
-     for a terminal-side activation procedure or dealer tool.
+     AT+V, but the BMS MCU no longer answers any framed command. Its last
+     telemetry (20 Sep 2026 07:03) showed MOS on, idle at 0 A, 93 %, no alarms,
+     Bluetooth standby OFF. The last activity before it stopped was a series of
+     rapid BLE connect/disconnect cycles from a PC tool. A charger on the
+     parallel bank, including a Redarc BCDC1240, does not wake it."* Ask for a
+     terminal-side activation procedure or dealer tool.
 
 ## 6. Sources
 

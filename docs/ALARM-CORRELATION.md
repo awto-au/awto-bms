@@ -1,8 +1,14 @@
 # Alarm bits vs. measured values — correlation (data to 2026-09-23)
 
 Sources: PC Python reader logs + `battery.db` (18–19 Sep), the phone app's raw
-log (19 Sep 20:38 → 23 Sep, with gaps) and its interval DB (19 → 22 Sep).
-Full method and queries: session analysis 2026-09-23 (`alarm_timeline.py`).
+log (19 Sep 20:38 → 23 Sep, with gaps; nothing from 19 Sep 21:21 to 20 Sep
+20:09) and its interval DB (19 → 22 Sep). Full method and queries: session
+analysis 2026-09-23 (`alarm_timeline.py`). Figures from the interval DB can
+lie outside the raw-log window: the 27.7 A charge (B8, 20 Sep 10:50–11:51,
+peak 11:48:18) is in the interval DB only, so PROTOCOL.md's raw-frame tables
+top out at 13.8 A. Demo-mode rows (the old demo serials JS-9F031B, JS-5A77C0,
+RV-1180E2, and JS-2C14AA rows inside demo windows, #115/#116) are left out;
+the demo generator's −22 A under JS-2C14AA is not real.
 
 ## Every alarm-byte change ever observed
 
@@ -24,10 +30,11 @@ frames, 5 000+ Python frames, every interval-DB row).
 - **Temp p2 = latched over-temperature protection.** Set on both packs before
   any of our logging existed; not correlated with temperature while held (25 h
   at 31–38 °C, 0 A); cleared **only** by the restart, once per pack; has not
-  re-set since, including B8's 2 h at 88–90 A (t1 43 °C) and 27.7 A charging.
+  re-set since, including B8's 2 h at 88–90 A (Temp B 43 °C) and 27.7 A charging.
   The original trip threshold is undetermined (predates data).
-- **Temp p3 / p6 ("MOS over-temp" per the vendor app)** — never toggled under
-  any condition we produced. Meaning unverified.
+- **Temp p3 / p6** — the vendor app labels them "MOS over temperature" /
+  "MOS protect", but they never toggled under any condition we produced.
+  Meaning unknown; the app keeps them as unknown bytes, never as faults.
 - **Current p2 (short-circuit)** — an **inrush check on FET turn-on with
   automatic retry**, not a steady-state threshold: 90 A continuous for nearly
   2 h never tripped it; closing the FETs into an attached 90 A load did, for
@@ -58,13 +65,16 @@ frames, 5 000+ Python frames, every interval-DB row).
   no alarms, stopped transmitting. Cause undetermined — a BMS hang or an
   undocumented protection state; the spec row "BMS Re-Connect: Auto" did not
   hold. Confidence in any specific cause: low (a 14 h blind spot, one event).
+  **Update 2026-09-24:** the blind spot was not unobserved. A 40-cycle
+  reconnect stress test ran on AA from 07:03:48 to 07:13:13, 30 s after its
+  last good frame. See WAKE-INVESTIGATION.md §0.
 
 ## Measured envelope (real frames only)
 
 | | JS-2C14AA | JS-2C14B8 |
 |---|---|---|
 | max current | 0.0 A (never carried current while observed) | −90.4 A discharge, +27.7 A charge |
-| temperatures t0..t3 | 25–38 °C | 25–43 °C |
+| temperatures (two sensors, each sent twice: A = p0/p3, B = p1/p2) | 25–38 °C | 25–43 °C (B is the one that heats under load) |
 | chip temperature | always 0 (field unused by this firmware) | always 0 |
 | cell voltage | 3.33 V flat | 3.25–3.56 V |
 | SOC | 100 % (latched) → 93 % after restart | 0–100 % |
@@ -83,7 +93,11 @@ frames, 5 000+ Python frames, every interval-DB row).
 ## Decoder consistency
 
 Python reader and app agree byte-for-byte on every alarm frame. Differences
-are labelling only: the Python reader still lists temp p2/p3/p6 as live
-"MOS over-temp" faults (pre-#50), the app treats p2 as the latched protection
-and p3/p6 as unknown; the reader decodes only t1/t2 where the app decodes
-t0..t3. Log tag names differ cosmetically.
+are labelling only: the Python reader (`python_ble/read_batteries.py`, frozen,
+so its table is not being changed) still labels temp p2/p3/p6 "MOS over
+temperature protection" and counts them as faults (pre-#50). Read them as: p2 =
+the latched over-temperature protection (charge inhibit, cleared by restart),
+p3/p6 = unknown. The reader keeps only p1/p3 (`t1`/`t2`); the app stores all
+four bytes (`temp0`/`temp1`/`temp2`/`temp3`, where `temp2` holds p3 and `temp3`
+holds p2, see PROTOCOL.md). The reader also logs the ALL_DATA chip byte
+(`chip=`), which is 0 in every real frame. Log tag names differ cosmetically.

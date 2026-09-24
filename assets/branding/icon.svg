@@ -1,0 +1,14 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- AWTO BMS app icon. Same treatment as the AWTO leveller icon
+       (awto_mark.svg): full-bleed flat AWTO red #DC0308, white square-cornered
+       outline. The mark is a car battery: body shares the AWTO box's width
+       (726) and the terminals stand on its top edge the way the AWTO ring
+       straddles it. Strokes are heavier than the leveller's 24 so the lines
+       stay solid at 48 px. Full-bleed so the launcher can apply its mask. -->
+  <rect width="1024" height="1024" fill="#DC0308"/>
+  <!-- battery outline: two terminal posts on top, then the body -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="32">
+    <path d="M228 296V204H372V296M652 296V204H796V296"/>
+    <rect x="149" y="296" width="726" height="516"/>
+  </g>
+</svg>

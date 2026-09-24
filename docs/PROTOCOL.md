@@ -12,8 +12,10 @@ re-derived line-by-line in a deep reverse pass. The exhaustive per-line write-up
 `docs/reverse/` (`01-ble-protocol.md` frames/commands, `02-transport-ibluz.md` the BLE
 transport, `03-app-logic.md` the UI/gesture/passwords, `04-history-versions.md` history +
 cross-version diff). Corrections from that pass are folded in below and flagged **[deep pass]**.
-TX write commands (gate / capacity / time / OTA) and the `A7 4E` frame are decompile-only,
-not exercised against hardware.
+Of the TX writes, gate control (MOS, restart, factory reset), Bluetooth standby on/off and
+`AT+V` have been sent to the live packs (see "TX commands as actually used"). Capacity, set-time,
+MTU, rename, history and OTA are decompile-only. The `A7 4E` frame arrives live but its all-zero
+payload has no known meaning.
 
 ## Builds covered
 
@@ -151,6 +153,12 @@ status/return-code character the firmware's AT-command bridge emits in reply to
 `AT+V`, alongside the framed version. It is harmless — the byte-level resync
 parser drops it and it is counted (`unrecognisedBytes`). Only `AT+V` triggers it.
 
+> Caveat (2026-09-24): the A/B test counted only `0x30` bytes, not framed
+> replies, and it ran on JS-2C14AA in the window where that pack went dormant.
+> The byte is bridge-local either way: a dormant pack's bridge sends it too.
+> Whether a framed version reply came with it during the test is not known.
+> See WAKE-INVESTIGATION.md §0.
+
 ### `CMD_GATE_CONTROL` payload (BM `setMos` / `setHeat` / `setPassiva` / `setRestart` / `setFactory`, L131–L166)
 
 ```
@@ -186,12 +194,12 @@ can still grep the decompile.
 | Report (BMS → app) | Begin | End | Java constant | What it carries |
 |---|---|---|---|---|
 | Cell voltages | `A0 C1` | `B1 D2` | `CMD_VOL` | count + per-cell mV → `getVolData` (BM ~L290) |
-| Temperatures | `A1 4F` | `B2 E3` | `CMD_TEMPUTER` | two signed temps → `getTemperature` |
+| Temperatures | `A1 4F` | `B2 E3` | `CMD_TEMPUTER` | four signed bytes = two sensors, each sent twice; the app reads p1, p3 → `getTemperature` |
 | Telemetry | `A2 57` | `B3 6C` | `CMD_ALL_DATA` | V/A/W, cells, cycles, flags → `BatteryAllDataBean`; **completes handshake** |
 | MOS status | `A3 9F` | `B4 C7` | `CMD_MOS_STATUS` | charge+discharge FET on iff `[0]==[1]==1` (L507) |
 | Current alarm | `A4 8B` | `B5 DD` | `CMD_WARN_CUR_ALARM` | over-current / short-circuit flags → `getCurWarnList` |
 | Voltage alarm | `A5 99` | `B6 17` | `CMD_WARN_VOL_ALARM` | cell/pack over/under-voltage flags → `getVolWarnList` |
-| Temperature alarm | `A6 C0` | `B7 72` | `CMD_WARN_TEMP_ALARM` | chip/MOS over/under-temp flags → `getTempWarnList` |
+| Temperature alarm | `A6 C0` | `B7 72` | `CMD_WARN_TEMP_ALARM` | chip over/under-temp, latched over-temp (p2), under-temp charge/discharge, two unknown bytes (p3, p6; the vendor app calls them "MOS") → `getTempWarnList` |
 | Unknown status | `A7 4E` | — | `CMD_OTHER` | 9 bytes **read and discarded** by the app; no end check, no callback; meaning undetermined **[deep pass]** (L562) |
 | Status (charge state + gates) | `A8 AC` | `B9 21` | `CMD_BAL_STATUS` | s0 charge-state, MOS, passive-bal, gate states (L530) — see diagram below |
 | State of charge | `A9 64` | `BA 5E` | `CMD_SOC` | SOC% + two u24 LE capacities → `getSOC` |
@@ -227,8 +235,9 @@ BM L281–L620 and `BatteryAllDataBean.java`. All multi-byte integers are **litt
 (`ByteUtils.byteToInt` = u16 LE, `byteToLong` = u24/u32 LE). Several fields divide by an
 integer *before* the float divide, so the truncation is real and caps resolution — the tables
 reproduce the app's exact math. Payload offsets are 0-based from the first byte after the
-2-byte begin sentinel. None of this is verified against a live pack; a reference Dart codec
-that implements every frame below lives in `battery_reader/lib/battery_protocol.dart`.
+2-byte begin sentinel. These layouts are confirmed against the live `JS5.1` packs (see
+"Per-frame value summary" below); the Dart codec that implements every frame lives in
+`lib/battery_protocol.dart`.
 
 ### `CMD_VOL` — per-cell voltages (BM L312–L346)
 
@@ -253,6 +262,27 @@ A1 4F  p0 t1 p2 t2  B2 E3       payload = 6 bytes, end at p4,p5
 
 p0 and p2 are ignored by the parser. Delivered as `getTemperature(t1, t2)`.
 
+**What the four bytes are (AWTO BMS, #114).** Two sensors, each sent twice: p0 == p3 in every
+real frame (sensor A) and p1 ≈ p2 within 1 °C (sensor B). Where either sensor sits is unknown, so
+the app calls them **Temp A** and **Temp B**, never cell temperatures. The Dart codec keeps all
+four bytes under the interval-store keys below. The keys are **not in byte order** (p2 → `temp3`,
+p3 → `temp2`): `temp1`/`temp2` were logged first (the vendor's p1/p3, the Python store's
+`t1`/`t2`), `temp0`/`temp3` were added later. Stored rows are never rewritten, so the mapping stays.
+
+| Byte | Stored key | Sensor | Shown as |
+|---|---|---|---|
+| p0 | `temp0` | A (copy of p3) | — (logged only) |
+| p1 | `temp1` | B | **Temp B** |
+| p2 | `temp3` | B (second reading, ±1 °C) | — (logged only) |
+| p3 | `temp2` | A | **Temp A** |
+
+Checked 2026-09-24 on the merged phone + Windows store: the raw frame `a1 4f 20 20 1f 20`
+(JS-2C14B8, 2026-09-19 21:15:34.806) has p2 = 31, and the stored `temp3` interval starting at that
+millisecond is 31 while `temp2` = 32 = p3. The decoded raw-log text `t0=… t1=… t2=… t3=…` used
+these key names, so its t2/t3 read as swapped against byte order; it now prints
+`A=… B=… p0..p3=…/…/…/…` in byte order. The chip byte (ALL_DATA p7) is logged as `chip` but
+never shown: it is 0 in every real frame.
+
 ### `CMD_ALL_DATA` — main telemetry (BM L381–L470, `BatteryAllDataBean`)
 
 ```
@@ -265,7 +295,7 @@ A2 57  <24-byte payload>  B3 6C     end at p22,p23
 | p2..4 | pack current | u24 LE | `(v ÷ 100) ÷ 10.0` → A (magnitude; sign not carried here — use load/charger flags or BAL `s0`) |
 | p5 | load connected | u8 | `!=0` |
 | p6 | charger connected | u8 | `!=0` |
-| p7 | chip temperature | u8 | °C |
+| p7 | chip temperature (0 on every real AWTO frame; not shown by the app, #114) | u8 | °C |
 | p8..9 | sum of cells | u16 LE | ÷10 → V |
 | p10..11 | max cell voltage | u16 LE | `(v ÷ 10) ÷ 100.0` → V |
 | p12..13 | min cell voltage | u16 LE | `(v ÷ 10) ÷ 100.0` → V |
@@ -276,6 +306,15 @@ A2 57  <24-byte payload>  B3 6C     end at p22,p23
 
 The `÷100 then ÷10` (current) and `÷10 then ÷100` (cell voltages) are integer divisions in the
 app, done before the float divide. Delivered as `getAllData(BatteryAllDataBean)`.
+
+Current and power agree within one frame (#120). The raw current is in mA; the truncation to
+0.1 A loses under 0.1 A, and power (0.1 W) matches V × I: across 945 real frames with current
+flowing, the median |raw mA ÷ 1000 − P ÷ V| is 0.005 A (the largest, 0.66 A at 89 A, is the
+0.1 V resolution of V). Raw current is never 1–99 mA in that data, so no reading truncates to
+0.0 A while power shows, and no frame has 0 A beside a non-zero power (13 214 zero-current
+frames, all 0 W). A "0.0 A" beside "19 W" came from the app, not the frame: the last-known
+snapshot stored the current signed by `s0`, which zeroed it while `s0` read idle (fixed with the
+Status rule below; a snapshot saved before the fix restores no current rather than 0.0 A).
 
 ### `CMD_SOC` — state of charge and capacity (BM L564–L590)
 
@@ -330,6 +369,9 @@ A6 C0  b0 b1 b2 b3 b4 b5 b6  B7 72      end at p7,p8
 Only p0, p1, p4, p5 are genuine live temperature faults. p2 is decoded as its own latched
 status (`overTempLatched` in the Dart codec, `overTempLatched` metric in the store); p3 and p6
 remain unknown-meaning MOS flags and are captured as unknown-byte metrics so any change is caught.
+The frozen Python reader's `WARN_TEMP` table still labels p2, p3 and p6 "MOS over temperature
+protection" and counts them as temperature faults; read its p2 as the latched protection and
+p3/p6 as unknown.
 
 ### `CMD_BAL_STATUS` — the status frame (BM L530–L548)
 
@@ -347,14 +389,58 @@ A8 AC  s0 s1 s2 s3 s4 s5 s6  B9 21
 The normal main screen consumes only `s0` (dial label). `s3` is dropped there and only
 surfaces in the hidden service screen (`fragment_dial.xml` → `sbtn_bla`), display-only.
 
+### Status rule: s0 alone is not the pack's direction
+
+`s0` stays **0 ("idle") during low-current discharge**. In the merged phone + Windows raw log
+(`logs/pull-20260924-1458/merged.db`), counting real `A2 57` frames (chip byte 0; demo-mode frames
+excluded) whose BAL frames either side agree:
+
+| BAL `s0` (both sides) | load | charger | frames | frames with current > 0 | current range |
+|---|---|---|---|---|---|
+| 0 | 0 | 0 | 11 289 | 0 | 0 |
+| 0 | 1 | 0 | 2 359 | 447 | 0.613–3.992 A |
+| 1 | 0 | 0 | 2 | 2 | 13.195–13.816 A |
+| 2 | 1 | 0 | 307 | 307 | 2.425–90.496 A |
+
+So `s0 = 2` appears only from about 2.4 A, and `s0 = 0` holds up to about 4 A with a load
+drawing current. Example, `JS-2C14B8` 2026-09-21 13:20:13.409, between two `s0 = 0` frames
+(`a8 ac 00 01 01 00 01 00 00 b9 21` at 13:20:12.748 and 13:20:13.586):
+`a2 57 86 00 99 05 00 01 00 00 86 00 25 0d 23 0d 01 00 c0 00 00 00 24 0d b3 6c` = 13.4 V,
+raw current 1433 mA (1.4 A), load 1, 19.2 W. The pack is discharging; `s0` says idle.
+
+The app's **Status** (Pack card; also the direction that signs current and power) is
+`BatteryState.status`, in this order. "Flow" means ALL_DATA current or power above 0; the same
+frame carries both, and they are zero together in every real frame.
+
+1. No ALL_DATA current or power yet → `s0` as reported (unknown before any BAL frame).
+2. No flow → **Idle**. A load or charger flag only means something is attached.
+3. Flow and `s0` = 1 / 2 → **Charging** / **Discharging**.
+4. Flow and `s0` = 0 or unknown → the one attachment flag that is set: charger → Charging,
+   load → Discharging.
+5. Flow and no direction from either → shown as **Active**, signed as 0 (not counted as
+   charge or discharge). One real frame hits this: 2026-09-21 10:27:11.144, 13.8 A charging
+   with load = charger = 0, before `s0` turned 1 at 10:27:11.393.
+
+The raw `s0` byte is still stored as reported: the `flags` metric (bits 10–11) and the alarm-event
+`charge_state` column record the frame, not this rule.
+
 ## Frame table with value summaries and the sentinel pattern
 
 Added 2026-09-23 from a read-only pass over every `CMD_*` constant in `BatteryCMD.java`, the
-two reference parsers (`python_ble/read_batteries.py` `Parser.FIXED`, `battery_reader/lib/battery_protocol.dart`
+two reference parsers (`python_ble/read_batteries.py` `Parser.FIXED`, `lib/battery_protocol.dart`
 `_fixed`) and three captures: `python_ble/logs/JS-2C14B8.log` + `JS-2C14AA.log` (2026-09-19
 14:00–16:13, both packs) and the phone raw log (2026-09-19 20:38 → 2026-09-23 05:25, ~13.3 k
 frames of each periodic type, mostly `JS-2C14B8`). Both packs are 4S LiFePO4, 100 Ah, firmware
 `JS5.1`. Timestamps below are from those logs; `hh:mm:ss` alone means the 2026-09-19 Python log.
+
+**Data window.** Every count and range in this section comes from raw frames, which cover
+2026-09-19 14:00–16:13 (Python) and 2026-09-19 20:38 → 2026-09-23 05:25 (phone), with no phone raw
+lines from 2026-09-19 21:21 to 2026-09-20 20:09. The phone's interval store covers that gap and
+holds higher figures: `JS-2C14B8` charging at up to **27.7 A** on 2026-09-20 10:50–11:51 (peak
+11:48:18), BAL `s0` = 1 and the charger flag 0 throughout. docs/ALARM-CORRELATION.md, which uses the
+interval store too, gives +27.7 A as the charge maximum; both figures are right for their data.
+Demo-mode data is not pack data: its serials are `DEMO-1`…`DEMO-4` since #115 (JS-9F031B /
+JS-5A77C0 / RV-1180E2 before, plus demo rows logged under JS-2C14AA, e.g. its −22 A).
 
 ### Sentinel pattern
 
@@ -445,20 +531,20 @@ A9 AA` once per cycle, ~0.85 s per cycle (e.g. VOL at 2026-09-21 15:06:48.270, 4
 |---|---|---|---|
 | `A0 C1` VOL | `n` then `2n`, end `B1 D2` | p0 = cell count n; then n × u16 LE mV | n = 4 in 13 569/13 569 frames. Cells 3246–3503 mV (`JS-2C14B8`: 3246 under ~90 A at 2026-09-21 15:07:21.932 `a0 c1 04 c8 0c c5 0c bb 0c ae 0c b1 d2`; 3503 at rest after charge 2026-09-21 10:32:10.567; `JS-2C14AA`: 3333–3339 over its 2 h). |
 | `A1 4F` TEMPUTER | 6 | p0..p3 = four signed-8 °C; app reads p1 and p3 | **p0 == p3 in 18 487/18 487 frames; p1 == p2 in 14 293 and differs by 1 °C in 4 194** — the frame is two sensors each sent twice (A = p0/p3, B = p1/p2). 25–43 °C; sensor B is the one that heats under load (43 °C at 2026-09-21 15:09:10.177 `a1 4f 24 2b 2a 24 b2 e3` after the 90 A run; A peaks at 38). Never negative here. |
-| `A2 57` ALL_DATA | 24 | p0..1 packV u16 ÷10 V; p2..4 current u24 ÷100 then ÷10 A (magnitude); p5 load flag; p6 charger flag; p7 chip °C; p8..9 cell sum ÷10 V; p10..11 max, p12..13 min, p14..15 delta, p20..21 avg cell mV (÷10 then ÷100 → V); p16..17 power ÷10 W; p18..19 cycles | packV 13.0–13.9 V, always == cell sum. Current 0–90.4 A (raw 90 496 at 2026-09-21 15:06:10.910, 1188.4 W); charging 13.8 A (raw 13 816) at 2026-09-21 10:27:11.143 with **load = charger = 0**. Sign never carried (no raw > 0x7FFFFF). p5 load = 1 in 5 887 frames, 5 111 of them at 0 A; p6 charger = 1 in 1 985 frames, all at 0 A on 2026-09-19 (charger present, charging inhibited by the latched over-temp) and **never while actually charging**; p5 and p6 never both 1. p7 chip = 0 in 18 468/18 468 (unused). Cell max/min/avg 3246–3503 mV, delta 0–39 mV (0x27 at 2026-09-21 06:48:18.843). Cycles 0 or 1 only (see oddities). |
+| `A2 57` ALL_DATA | 24 | p0..1 packV u16 ÷10 V; p2..4 current u24 ÷100 then ÷10 A (magnitude); p5 load flag; p6 charger flag; p7 chip °C; p8..9 cell sum ÷10 V; p10..11 max, p12..13 min, p14..15 delta, p20..21 avg cell mV (÷10 then ÷100 → V); p16..17 power ÷10 W; p18..19 cycles | packV 13.0–13.9 V, always == cell sum. Current 0–90.4 A (raw 90 496 at 2026-09-21 15:06:10.910, 1188.4 W); charging 13.8 A (raw 13 816) at 2026-09-21 10:27:11.143 with **load = charger = 0** (the highest charge current in the raw frames; 27.7 A in the interval store, see "Data window"). Sign never carried (no raw > 0x7FFFFF). p5 load = 1 in 5 887 frames, 5 111 of them at 0 A; p6 charger = 1 in 1 985 frames, all at 0 A on 2026-09-19 (charger present, charging inhibited by the latched over-temp) and **never while actually charging**; p5 and p6 never both 1. p7 chip = 0 in 18 468/18 468 (unused). Cell max/min/avg 3246–3503 mV, delta 0–39 mV (0x27 at 2026-09-21 06:48:18.843). Cycles 0 or 1 only (see oddities). |
 | `A3 9F` MOS_STATUS | 8 | p0 charge MOS, p1 discharge MOS (app: on iff both 1); p2..p5 unknown | p0 == p1 in every frame; `01 01` in 13 501/13 512, `00 00` for 11 frames 2026-09-21 15:06:50.889–15:07:00.136 (deliberate MOS-off). p3 = 1 exactly once, 15:07:00.136 `a3 9f 00 00 00 01 00 00 b4 c7`, coincident with the short-circuit flag (below). p2, p4, p5 always 0. |
 | `A4 8B` WARN_CUR_ALARM | 7 | p0 over-current discharge, p1 over-current charge, p2 short-circuit, p3..p4 unused | All zero except p2 = 1 in two frames, 2026-09-21 15:06:59.329 and 15:07:00.194 `a4 8b 00 00 01 00 00 b5 dd`, as the MOS was re-closed onto the ~90 A load (TX `c3 1e 01 01 01 …` 15:06:58.849); cleared by itself, MOS back on at 15:07:00.976, current 1.5 → 2.2 → 89 A by 15:07:10. |
 | `A5 99` WARN_VOL_ALARM | 11 | p0 cell over-charge, p1 cell over-discharge, p3 delta alarm, p6 pack over-charge, p7 pack over-discharge, rest unused | All nine bytes zero in 13 247/13 247 frames. |
 | `A6 C0` WARN_TEMP_ALARM | 9 | p0 chip OT, p1 chip UT, p2 latched OT (charge inhibit), p3 unknown MOS, p4 UT discharge, p5 UT charge, p6 unknown MOS | All zero except p2 = 1 in 5 192 frames — every frame from both packs on 2026-09-19 until the restart (last `JS-2C14AA` 16:13:38.101), 0 since. p0, p1, p3–p6 never set. |
 | `A7 4E` OTHER | 9 (discarded) | 7 bytes + `B8 29` | `a7 4e 00 00 00 00 00 00 00 b8 29` in 13 496/13 496 frames — payload all zero, trailer constant. |
-| `A8 AC` BAL_STATUS | 9 | s0 charge state 0/1/2, s1 charge MOS, s2 discharge MOS, s3 passive balance, s4 temp-control gate, s5 smoke gate, s6 heater gate | s0: 0 idle (13 139), 2 discharging (331, whenever load current flowed), 1 charging (3 frames 2026-09-21 10:27:11.392–12.427 at 13.8 A). s1 == s2 always, mirrors MOS frame (00 during the MOS-off test). s3 = 0, s4 = 1, s5 = 0, s6 = 0 in every frame. |
+| `A8 AC` BAL_STATUS | 9 | s0 charge state 0/1/2, s1 charge MOS, s2 discharge MOS, s3 passive balance, s4 temp-control gate, s5 smoke gate, s6 heater gate | s0: 0 idle (13 139), 2 discharging (331, only from ~2.4 A; low-current discharge up to ~4 A keeps s0 = 0, see "Status rule"), 1 charging (3 frames 2026-09-21 10:27:11.392–12.427 at 13.8 A). s1 == s2 always, mirrors MOS frame (00 during the MOS-off test). s3 = 0, s4 = 1, s5 = 0, s6 = 0 in every frame. |
 | `A9 64` SOC | 9 | p0 SOC %, p1..3 full u24 LE mAh, p4..6 remaining u24 LE mAh | p0 ∈ {100, 99, 98, 93, 83, 0}. full = 100 000 (`a0 86 01`) always. **remaining = p0 × 1000 exactly** in every frame (99 000 = `b8 82 01`, 93 000 = `48 6b 01`, 83 000 = `38 44 01`) — no finer resolution than the percentage. SOC 0 / remaining 0 only in the first two SOC frames after a BMS restart (2026-09-20 21:03:59.294 and .626 `a9 64 00 a0 86 01 00 00 00 ba 5e`), then 100 % again from 21:04:00.464. 100 → 93 after the 2026-09-19 restart; 100 → 83 one second after the factory-reset frame (2026-09-21 08:13:05.342). |
 | `AA AF` EST_TIME | 8 | p0..2 time-to-full s, p3..5 time-to-empty s (u24 LE) | time-to-full = 0 in 13 456/13 456 frames. time-to-empty: 3 960 s minimum (66 min at ~90 A, 2026-09-21 15:05:29.918 `aa af 00 00 00 78 0f 00 bb 22`) up to a cap of 360 000 s = 100 h (`40 7e 05`, 10 910 frames, whenever idle); all 115 distinct values are multiples of 60 s; 0 only in the two post-restart frames. |
 | `AC 9A` VERSION | 7 | p0..4 ASCII | `JS5.1` in 105/105 frames, 0.1–4 s after `AT+V`, accompanied by the stray `0x30`. |
 | `AC CA` SLEEP_SET_SUCCESS | 3 (end not checked) | p0: 0 = standby on, 1 = off | End `DE ED` present in 167/167 frames. p0 = 1 in 163; p0 = 0 in 4 (2026-09-20 21:02:41.452, 0.3 s after `aa cc 00 01 dd ee`; 21:03:28.597; 21:08:09.799; 21:08:57.913). Sent unsolicited ~0.5 s after every `CMD_BEGIN` handshake and as the ack to `AA CC`. |
 | `AB BA` SETTING_RESPOND | 3 | p0 type (1 vol, 2 cur, 3 temp, 4 capacity) | Never observed (no capacity/threshold write was ever sent). |
 | `D2 7E` GATE_SET | 10 | p0..7 echo of the gate-control bytes | 20 frames, each 0.1–0.3 s after a `C3 1E` TX, from `JS-2C14B8` only. Echoes b0–b6 exactly, including restart b5 = 1 (`d2 7e 01 01 01 00 00 01 00 00 fa 4b`, 2026-09-20 21:02:56.061). **b7 is not echoed**: the factory frame `c3 1e 01 01 01 00 00 00 00 01 d4 3b` at 2026-09-21 08:13:04.305 was acked `d2 7e 01 01 01 00 00 00 00 00 fa 4b`. |
-| `FE C9 BD 8A` HISTORY | — | never parsed | Never observed; 5 × `CMD_GET_HISTORY` sent (Python log 14:00:08 …) with no reply. |
+| `FE C9 BD 8A` HISTORY | — | never parsed | Never observed; 5 × `CMD_GET_HISTORY` sent (Python log 14:00:08 …) with no reply. The Python reader no longer sends it (its handshake is `CMD_BEGIN`, `CMD_GET_EST`, `AT+V`). |
 | `0D 0A` NAME_SET | 4 | `OK\r\n` | Not exercised. |
 | OTA acks | 3 / 4 / 3 | see "Firmware update" | Not exercised. |
 | stray `0x30` | — | AT bridge return code | 153 single-byte notifications plus two `30 30`, always within seconds of `AT+V`. |
@@ -472,7 +558,7 @@ TX commands as actually used in these captures:
 | `AT+V\r\n` | `41 54 2b 56 0d 0a` | after every handshake (228) + probes (273) | `AC 9A` VERSION + one `0x30` |
 | `CMD_GATE_CONTROL` | `c3 1e b0…b7 d4 3b` | 39: restart 13, both MOS on 12, output on 6, charge on 4, output off 1, charge off 1, both off 1, factory 1 | `D2 7E` ack 0.1–0.3 s later; restart re-handshakes ~6 s later (21:03:52.720 → 21:03:58.877) |
 | `CMD_OPEN/CLOSE_SLEEP_CONTROL` | `aa cc 00/01 01 dd ee` | 5 on, 1 off | `AC CA` ack within 0.3 s mirroring the flag |
-| `CMD_GET_HISTORY` | `c6 7c cf 00 d7 52` | 5 (Python log) | no reply |
+| `CMD_GET_HISTORY` | `c6 7c cf 00 d7 52` | 5 (Python log, 2026-09-19; the reader has not sent it since) | no reply |
 | capacity `C5 60`, time `C8 18`, MTU `C3 F2`, clear/set history, OTA, rename | | never sent | |
 
 ### Oddities found in this pass
@@ -485,7 +571,9 @@ TX commands as actually used in these captures:
   p1 and p3 happens to pick one of each. The hotter sensor (B) is the one that tracks load.
 - **The load/charger flags are not a current sign.** Load = 1 at 0 A 87 % of the time; charger = 1
   only during inhibited charging and never during real charging; current is unsigned. Direction
-  has to come from BAL `s0` (1/2), as the doc already says — the flags mean "something attached".
+  comes from BAL `s0` (1/2) where it gives one — the flags mean "something attached". But `s0`
+  reads 0 through low-current discharge (up to ~4 A), so the app falls back to the load flag
+  when current flows: see "Status rule" above.
 - **Cycle count flickers 0 ↔ 1** within seconds on both packs on 2026-09-19 (`JS-2C14B8` cyc = 1 at
   14:00:20, 0 at 14:00:26, 1 at 14:00:29 …; 218 and 348 frames at 1) and is 0 ever since. It is
   not a monotonic counter on this firmware; do not trend it.
@@ -522,7 +610,18 @@ Not linked from any menu. Unlock on the main screen (`actvm/MainViewModel.java` 
 3. long-press the **info icon**
 4. password **`339933`** (`Global.DEFAULT_BACK_PWD`)
 
-Any other click in between resets the sequence. This launches `BatteryActivity`:
+**[deep pass]** Timing and resets (`MultiClickListener`: 4 hits, 2000 ms window, ring buffer of
+tap times; details in `docs/reverse/03-app-logic.md` §1):
+
+- Each 4-tap burst has its own 2 s window. There is no overall timeout between the steps: the
+  logo and current flags stay set until reset.
+- Order is enforced: the current-readout burst only counts once the logo flag is set, and the
+  long-press does nothing unless both flags are set.
+- Reset: a tap on the screen background (`cl_background`) or the dial (`cl_dial`), Cancel on the
+  password dialog, or a wrong password. Taps on the logo or current readout do not clear the
+  other flag.
+
+This launches `BatteryActivity`:
 
 - **Dial tab** — MOS and passive-balance status indicators (display-only), a "more" button
   forced `INVISIBLE` with an empty `more()` handler (stub).
@@ -533,21 +632,42 @@ Any other click in between resets the sequence. This launches `BatteryActivity`:
   **[deep pass]** There is **no** low-temp-protect control and **no** history read/clear control
   in the UI (the earlier note was wrong): `setLowTemProtect` is auto-sent during the handshake,
   not a UI toggle, and `getHistory`/`setHistoryStatus`/`cleanAllHistory` have no UI callers.
-  Also note a second, **unauthenticated** path exists outside service mode: the main-screen
-  info button opens a screen offering a BMS **restart** and a **capacity write** with no
-  password and no confirmation (see `docs/reverse/03-app-logic.md`).
+  Also note a second, **unauthenticated** path exists outside service mode: the normal
+  main-screen info button (`MainViewModel.getInfo`, not the `iv_info` long-press) opens
+  `GuideActivity`, whose `GuideViewModel` offers a BMS **restart** (`setRestart`, gate restart
+  byte) and a **capacity write** (`setBattery`, `CMD_BATTERY`, dropdown 50–300 Ah) with no
+  password and no confirmation (`docs/reverse/03-app-logic.md` §7).
 
 Other gates, all plain constants in `global/Global.java`:
 
 | Constant | Value | Gates |
 |---|---|---|
-| `DEFAULT_CONNECT_PASSWORD` | `JS2023` | per-device connect prompt (`MainViewModel` L532) |
+| `DEFAULT_CONNECT_PASSWORD` | `JS2023` | per-device connect prompt (`MainViewModel` L532). **[deep pass]** Read from pref `connect_password`, which no code ever writes, so it is a fixed `JS2023`, **not user-changeable**. The only user-changeable password is the Settings-tab one (`fragment_password`). |
 | `DEFAULT_UPDATE_PWD` | `332211` | firmware update (`UpdateActivity`) |
 | `IS_INSIDE` | `true` | referenced nowhere — dead |
 | `IS_DEBUG` | `false` | |
 
 Firmware families / OTA images named in `Global`: `JS1.0` → `PB51250506.bin`,
 `JS5.1` → `8803250506.bin`; also `JS3.2`, `JS5.2`.
+
+### SharedPreferences keys **[deep pass]**
+
+All under `battery_path` (`sp/SpManager.java`); full table with writers and readers in
+`docs/reverse/03-app-logic.md` §5.
+
+| Key | Holds |
+|---|---|
+| `device_0`…`device_3` | saved device names (max 4) |
+| `sphere_mtu` | negotiated MTU, capped at 200, default 20 (sizes OTA chunks) |
+| `connect_password` | connect password, default `JS2023`; never written |
+| `fragment_password` | Settings-tab password, default `JS20230801`; changed by `ResetDialog` |
+| `setting_mos`, `temcontorl_gate`, `smoke_gate`, `heat_gate` | gate cache, refilled from each STATUS frame |
+| `setting_passiva` | passive-balance cache, written only by the UI (see gate-control note) |
+| `setting_sleep_mode` | last sleep toggle / `AC CA` reply |
+| `sp_setting_battery_capacity` | rated capacity string, default `100` |
+| `setting_temp_type` | °C (true) or °F |
+| `update_file_path` | last OTA file path (the resend path seeks in it) |
+| `setting_bluetooth_name` | declared, never read or written |
 
 ## Caveats
 
@@ -597,7 +717,8 @@ byte→argument mapping is certain (`getSOC(pct, bytes4..6/1000, bytes1..3/1000)
 the semantic labels **remaining vs full/rated are not stated in the code** — the app only logs
 the two raw values. Our reader labels bytes 4..6 = remaining and 1..3 = full, which is
 consistent with the main screen showing the first as `"x.xx AH"`, but this is inference, not
-code-confirmed. On live hardware both read 100.0 Ah at 100% SOC, which fits either reading.
+code-confirmed. On the live packs bytes 1..3 are always 100 000 (100.0 Ah) and bytes 4..6 are
+always SOC × 1000, which fits full = 1..3 and remaining = 4..6 (see the value summary).
 
 `p` is shown on the dial as-is (only clamped 0..100). So a battery that "always shows 100%"
 is the **BMS reporting 100** in that byte — the app is a dumb display. Classic LiFePO4
@@ -642,7 +763,8 @@ dealer, not published anywhere.
 
 ### File name-lock and family mapping (Sphere)
 
-`UpdateActivity.onActivityResult` (L119–123) only accepts a picked file whose name is exactly:
+**[deep pass]** The lock applies only on the main-screen path (entry A below).
+`UpdateActivity.onActivityResult` (L119–123) then only accepts a picked file whose name is exactly:
 
 | `Global` const | File name | For BMS family |
 |---|---|---|
@@ -668,9 +790,15 @@ board/chip prefixes. **RV Battery 1.0.4 dropped the name-lock** — its picker t
                         └ payload length (u8)
    ```
 
-   Payload size = `(MTU/10)*9 - 6` bytes (default pref MTU 20 → 12 B/chunk; larger after MTU
-   negotiation). Payload is read straight from the file at offset `payloadLen * i` via
+   Payload size = `(MTU/10)*9 - 6` bytes, integer division, MTU from pref `sphere_mtu` (default
+   20 → 12 B/chunk; the pref is capped at 200 → 174 B/chunk). Chunk `i` starts at file offset
+   `payloadSize * i`; the last chunk is clamped to the bytes left, so the chunk count is
+   `ceil(fileLen / payloadSize)`. Payload is read straight from the file via
    `RandomAccessFile.seek` — the `.bin` is shipped raw, no header parsing app-side.
+   **[deep pass]** The BMS ACK is `01 01 seqHi seqLo x ck`. The app advances only if the
+   big-endian seq equals the current chunk **and** `ck == (byte)(~(seqHi + 2 + seqLo + 6) + 1)`
+   (`getRecallSum`, the two's complement of `seqHi + seqLo + 8`; the `+2`/`+6` are unexplained).
+   The 2 s timer resends the current chunk up to 10 times, then reports failure.
 4. `FF 01` + `B1 02 EF` (`CMD_UPDATE_RECALL_1/2`) from the BMS = restart from chunk 0
    (`mCurNum = 0`).
 5. When offset ≥ file length: 300 ms later send `01 01 EC 00 00 12` (`CMD_UPDATE_FINISH`).
@@ -680,8 +808,14 @@ board/chip prefixes. **RV Battery 1.0.4 dropped the name-lock** — its picker t
 Checksum (`getSum`): `(byte)(~sum + 1)` over the frame minus the checksum byte — i.e. the byte
 that makes the 8-bit sum of the whole frame zero.
 
-Gate: the update screen itself is behind the `332211` password (`DEFAULT_UPDATE_PWD`), reached
-from the main screen's version check, not from the hidden service mode.
+Gates **[deep pass]** — two entry points (`docs/reverse/03-app-logic.md` §4):
+
+- **A. Main-screen update button**: `AT+V` version check (an unrecognised version silently does
+  nothing), then the `332211` password (`DEFAULT_UPDATE_PWD`), then the file name-lock above.
+- **B. Parameter tab "BMS Firmware Update"** (hidden service mode, behind `339933` and
+  `JS20230801`): no `332211` prompt and **no name-lock** — any single picked file is flashed.
+
+On entry the update screen asks the BLE stack for MTU 512 (`UpdateViewModel` L42).
 
 ### Getting the actual images
 
@@ -717,8 +851,8 @@ fixed constant (`FB C8 7C 9D 26 EC`). So **any** BLE central can read the full l
 3. write `FB C8 7C 9D 26 EC` to the write characteristic
 
 …and the BMS streams VOL / TEMP / ALL_DATA / SOC / STATUS unsolicited — from any phone,
-regardless of who "owns" the battery. (Established from the code; not yet run against real
-hardware.)
+regardless of who "owns" the battery. Live-confirmed: the Python reader and the AWTO BMS app read
+both `JS5.1` packs this way, with no password and no pairing.
 
 **Security implication:** the *write* commands are equally unauthenticated — `CMD_GATE_CONTROL`
 (MOS-off, passive-balance, **factory reset**) and the OTA sequence take effect with no

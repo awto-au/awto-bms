@@ -1,0 +1,81 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- BLE (flutter_blue_plus). Android 12+ scan/connect; neverForLocation
+         avoids needing location. Legacy perms capped at API 30 for Android <=11. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!-- #45: system notifications for faults/alerts (Android 13+ runtime perm). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- #45: background monitoring foreground service (flutter_foreground_task).
+         The service keeps BLE + the alert logic alive while backgrounded and
+         shows the persistent "Monitoring N batteries" notification. The
+         connectedDevice type matches the app's BLE-connected batteries. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <application
+        android:label="AWTO BMS"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!-- #45: flutter_foreground_task's service. Do NOT rename. The
+             foregroundServiceType must be declared on Android 14+.
+             #52: stopWithTask="true" — the plugin reads this flag and then
+             (a) returns START_NOT_STICKY, (b) stopSelf()s in onTaskRemoved
+             instead of arming its 1 s restart alarm, (c) skips the 5 s
+             "not correctly stopped" restart alarm in onDestroy and (d) ignores
+             its boot / package-replaced receiver. Swiping the app away or
+             force-stopping it therefore STOPS monitoring for good; nothing
+             resurrects the service until the app is opened again. (The main
+             isolate — where BLE + the alert logic run — dies with the
+             activity anyway, so a service that outlived a swipe could not
+             monitor; it only re-grabbed the batteries.) -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="connectedDevice"
+            android:stopWithTask="true"
+            android:exported="false" />
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>

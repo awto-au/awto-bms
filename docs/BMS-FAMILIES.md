@@ -75,7 +75,7 @@ Battery** (and possibly Phoenix's SolarKing/Stealth-Energy, unconfirmed — no a
 
 ## Wiring into `battery_reader`
 
-Suggested shape (not yet implemented — see `battery_reader/lib/battery_protocol.dart`):
+Suggested shape (not yet implemented — see `lib/battery_protocol.dart`):
 1. A `BmsFamily` interface: `serviceUuid`, `notifyUuid`, `writeUuid`, `handshake()`,
    `decode(List<int> frame) → BatterySample`, plus a `matches(discoveredServices, firstFrame)`.
 2. Implementations: `JoySunyBms` (done — our protocol), then `JbdBms`, `JkBms`, `DalyBms`,
