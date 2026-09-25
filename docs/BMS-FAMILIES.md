@@ -73,16 +73,29 @@ Redodo / Power Queen** (same OEM). JK: Jikong DIY packs. Daly: Daly-equipped pac
 Renogy, CBT Power/Creabest each have their own `aiobmsble` plugin. **JoySuny: Sphere, RV
 Battery** (and possibly Phoenix's SolarKing/Stealth-Energy, unconfirmed — no app to check).
 
-## Wiring into `battery_reader`
+## Wiring into `battery_reader` (#75, implemented, read-only)
 
-Suggested shape (not yet implemented — see `lib/battery_protocol.dart`):
-1. A `BmsFamily` interface: `serviceUuid`, `notifyUuid`, `writeUuid`, `handshake()`,
-   `decode(List<int> frame) → BatterySample`, plus a `matches(discoveredServices, firstFrame)`.
-2. Implementations: `JoySunyBms` (done — our protocol), then `JbdBms`, `JkBms`, `DalyBms`,
-   `RedodoBms` ported from the specs above.
-3. On connect: enumerate GATT services → pick the family whose `serviceUuid` is present →
-   confirm via first-frame header → run that decoder. Fall back to "unknown BMS" with a raw
-   hex log (reuse `battery_log.dart`).
-4. Keep the JoySuny path as the reference implementation; the others are additive.
+- `lib/bms_codecs.dart` has one `BmsCodec` per family: `JbdCodec` (JBD and Stealth),
+  `JkCodec`, `AntCodec`, `DalyCodec` (D2 and 0x81 variants, probed),
+  `RedodoCodec` and `OgtCodec` (SmartBat-A/B, XOR key from the advertised serial).
+  Each codec gives the GATT UUIDs and the poll commands, reassembles and
+  checksum-validates replies, and decodes them into a `FamilySample`.
+  `FamilySample.applyTo` maps that onto `BatteryState`.
+- The offsets are ported from `patman15/aiobmsble`. `test/bms_codecs_test.dart`
+  replays that project's captured frames and checks the values its tests
+  expect. **No physical pack of any of these families has been tested.**
+- `BatteryManager` connects any recognised family that has a codec. The row is
+  created with `BatteryConnection(codec: …)`. It binds the codec's service
+  (`GattTarget`), writes only the codec's poll frames on a timer, and publishes
+  the decoded values through the same events, logging and UI as JoySuny.
+- These rows are **read-only**. `_send` refuses every non-poll write (handshake,
+  gate, sleep, OTA, AT+V, wake ladder), and the UI shows every control as
+  unavailable.
+- A SmartBat whose name has no A/B type and numeric serial has no key, so it
+  stays detect-only.
+- The family is not persisted. A remembered row gets its codec back from its
+  serial where the name alone identifies the family. Stealth and Redodo
+  prefixes need the advertised service, so those rows get their codec from the
+  next scan sighting.
 
 Evidence APKs kept under `artifacts/_comparison/<pkg>/base.apk` (heavy — candidate for `.gitignore`).

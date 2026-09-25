@@ -58,6 +58,26 @@ class BleScanHit {
 
 enum BleLinkState { connected, disconnected }
 
+/// #75: the service + characteristics a link binds to. JoySuny (FCF0 /
+/// FCF2 notify / FCF1 write) is the default; the other BMS families pass
+/// their own from `BmsCodec`. [notify] and [write] may be the same
+/// characteristic (JK and ANT use FFE1 for both).
+class GattTarget {
+  final String service;
+  final String notify;
+  final String write;
+  const GattTarget(
+      {required this.service, required this.notify, required this.write});
+
+  static const joySuny = GattTarget(
+      service: BleUuids.service,
+      notify: BleUuids.notifyChar,
+      write: BleUuids.writeChar);
+
+  @override
+  String toString() => 'service $service (notify $notify, write $write)';
+}
+
 /// A live link to one peripheral. Owns the discovered FCF1/FCF2 characteristics
 /// and the notify subscription; hides the vendor characteristic objects.
 abstract class BleLink {
@@ -66,13 +86,16 @@ abstract class BleLink {
   /// Emits [BleLinkState.disconnected] when the link drops.
   Stream<BleLinkState> get state;
 
-  /// Discover the FCF0 service, locate FCF1 (write) + FCF2 (notify), enable
-  /// notifications and route every inbound packet to [onData].
+  /// Discover the [target] service (FCF0 by default), locate its write +
+  /// notify characteristics, enable notifications and route every inbound
+  /// packet to [onData].
   /// Throws [StateError] if the service or characteristics are missing.
-  Future<void> discoverAndSubscribe(void Function(List<int> data) onData);
+  Future<void> discoverAndSubscribe(void Function(List<int> data) onData,
+      {GattTarget target = GattTarget.joySuny});
 
-  /// Write [bytes] to FCF1 (without response when the characteristic supports
-  /// it, matching the original flutter_blue_plus behaviour).
+  /// Write [bytes] to the bound write characteristic (FCF1 by default;
+  /// without response when the characteristic supports it, matching the
+  /// original flutter_blue_plus behaviour).
   Future<void> write(List<int> bytes);
 
   /// #41: the negotiated ATT MTU as the platform reports it, or null when
@@ -179,21 +202,22 @@ class _FbpLink implements BleLink {
           : BleLinkState.connected);
 
   @override
-  Future<void> discoverAndSubscribe(void Function(List<int> data) onData) async {
+  Future<void> discoverAndSubscribe(void Function(List<int> data) onData,
+      {GattTarget target = GattTarget.joySuny}) async {
     final services = await _device.discoverServices();
     fbp.BluetoothService? svc;
     for (final s in services) {
-      if (s.uuid.str128 == BleUuids.service) svc = s;
+      if (s.uuid.str128 == target.service) svc = s;
     }
-    svc ??= throw StateError('FCF0 service not found');
+    svc ??= throw StateError('service ${target.service} not found');
 
     for (final c in svc.characteristics) {
       final u = c.uuid.str128;
-      if (u == BleUuids.writeChar) _write = c;
-      if (u == BleUuids.notifyChar) _notify = c;
+      if (u == target.write) _write = c;
+      if (u == target.notify) _notify = c;
     }
     if (_write == null || _notify == null) {
-      throw StateError('FCF1/FCF2 characteristics not found');
+      throw StateError('characteristics not found: $target');
     }
 
     await _notify!.setNotifyValue(true);
@@ -324,13 +348,19 @@ class _UniversalBleLink implements BleLink {
 
   StreamSubscription<Uint8List>? _valueSub;
 
+  /// #75: the service / write characteristic bound by [discoverAndSubscribe]
+  /// (JoySuny FCF0 / FCF1 until then, the original behaviour).
+  String _serviceUuid = BleUuids.service;
+  String _writeUuid = BleUuids.writeChar;
+
   @override
   Stream<BleLinkState> get state => ub.UniversalBle.connectionStream(deviceId).map(
       (connected) =>
           connected ? BleLinkState.connected : BleLinkState.disconnected);
 
   @override
-  Future<void> discoverAndSubscribe(void Function(List<int> data) onData) async {
+  Future<void> discoverAndSubscribe(void Function(List<int> data) onData,
+      {GattTarget target = GattTarget.joySuny}) async {
     // WinRT frequently reports services as empty or throws 'Failed to get
     // services: Unreachable' in the first moments after a connect — especially
     // at weak signal (issue #49). Retry a few times with a short, growing
@@ -362,20 +392,22 @@ class _UniversalBleLink implements BleLink {
 
     ub.BleService? svc;
     for (final s in services) {
-      if (s.uuid.toLowerCase() == BleUuids.service) svc = s;
+      if (s.uuid.toLowerCase() == target.service) svc = s;
     }
-    svc ??= throw StateError('FCF0 service not found');
+    svc ??= throw StateError('service ${target.service} not found');
 
     String? writeUuid;
     String? notifyUuid;
     for (final c in svc.characteristics) {
       final u = c.uuid.toLowerCase();
-      if (u == BleUuids.writeChar) writeUuid = c.uuid;
-      if (u == BleUuids.notifyChar) notifyUuid = c.uuid;
+      if (u == target.write) writeUuid = c.uuid;
+      if (u == target.notify) notifyUuid = c.uuid;
     }
     if (writeUuid == null || notifyUuid == null) {
-      throw StateError('FCF1/FCF2 characteristics not found');
+      throw StateError('characteristics not found: $target');
     }
+    _serviceUuid = svc.uuid;
+    _writeUuid = writeUuid;
 
     _valueSub = ub.UniversalBle
         .characteristicValueStream(deviceId, notifyUuid)
@@ -387,7 +419,7 @@ class _UniversalBleLink implements BleLink {
                 .record(_source, 'notify stream $deviceId: $e'));
     await ub.UniversalBle.setNotifiable(
       deviceId,
-      BleUuids.service,
+      svc.uuid,
       notifyUuid,
       ub.BleInputProperty.notification,
     );
@@ -397,8 +429,8 @@ class _UniversalBleLink implements BleLink {
   Future<void> write(List<int> bytes) async {
     await ub.UniversalBle.writeValue(
       deviceId,
-      BleUuids.service,
-      BleUuids.writeChar,
+      _serviceUuid,
+      _writeUuid,
       Uint8List.fromList(bytes),
       // The BMS accepts write-without-response on FCF1; mirror the FBP path.
       ub.BleOutputProperty.withoutResponse,

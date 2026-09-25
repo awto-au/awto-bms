@@ -7,6 +7,7 @@ import 'dart:async';
 
 import 'alarm_events.dart';
 import 'battery_protocol.dart';
+import 'bms_codecs.dart';
 import 'ble_transport.dart';
 import 'demo_source.dart';
 import 'diagnostics.dart';
@@ -87,6 +88,18 @@ class BatteryConnection {
 
   static const Duration defaultConnectTimeout = Duration(seconds: 45);
 
+  /// #75: set for a non-JoySuny pack (JBD, JK, ANT, Daly, Redodo, SmartBat).
+  /// Such a row is READ-ONLY: it binds the codec's service, polls with the
+  /// codec's commands and decodes with the codec instead of [parser]. Every
+  /// other write (handshake, gate, sleep, OTA, AT+V probe, wake ladder) is
+  /// refused in [_send], since those are JoySuny frames. Null for JoySuny.
+  /// Assignable only so a remembered row (restored from its serial, family
+  /// unknown) gets its codec when the scan recognises it again.
+  BmsCodec? codec;
+
+  /// True for a read-only non-JoySuny row (see [codec]).
+  bool get isReadOnlyFamily => codec != null;
+
   BatteryConnection({
     this.profile = DeviceProfile.sphere,
     this.sendLowTempGate = false,
@@ -94,49 +107,13 @@ class BatteryConnection {
     this.now = DateTime.now,
     this.connectTimeout = defaultConnectTimeout,
     this.probeWindow = defaultProbeWindow,
+    this.codec,
   })  : transport = transport ?? defaultBleTransport,
         commands = BatteryCommands(profile),
         state = BatteryState() {
     parser = BatteryParser(
       state: state,
-      onEvent: (e) {
-        // C1: a decoded BAL_STATUS is the ONLY thing that makes the gate base
-        // fresh enough to build a gate-control write from.
-        lastFrameMs = now().millisecondsSinceEpoch; // #59 streaming watchdog
-        // #61 / #62 / #53: frame bookkeeping for the live indicator, the
-        // dormant-BMS probe and the one-cycle background sample.
-        frameCount++;
-        totalFrameCount++;
-        if (e is VersionEvent) {
-          lastVersionFrameMs = lastFrameMs;
-        } else if (isTelemetryEvent(e)) {
-          // Only the STREAM counts as "streaming": a version frame or an
-          // ack answers a command and must not clear the silence.
-          lastTelemetryMs = lastFrameMs;
-          lastFrameEverMs = lastFrameMs;
-          lastDataMs = lastFrameMs; // #71: the age of the last-known values
-          _cycleSeen.add(e.runtimeType);
-          streamClass = StreamClass.streaming;
-        }
-        if (e is BalancerEvent) {
-          lastGateStatusMs = lastFrameMs;
-          _noteGateAvailability();
-        }
-        _integrateThroughput(DateTime.now().millisecondsSinceEpoch);
-        _detectAlerts();
-        // #67: an alarm-byte transition becomes an alarm EVENT record with a
-        // snapshot of the state just decoded. Best-effort — it can never
-        // throw into the parser.
-        if (e is WarningEvent) {
-          guardSync<void>('alarm event capture',
-              () => _trackAlarmBytes(e.category, lastFrameMs!),
-              source: _source);
-        }
-        // L11: a frame that lands after dispose() must not throw on the closed
-        // controller (a demo/link callback can still be in flight).
-        if (!_events.isClosed) _events.add(e);
-        _logDecoded(e);
-      },
+      onEvent: _onDecoded,
       // Issue #20: each stray byte the resync path drops is written to the raw
       // log as an UNRECOGNISED line, with its running per-battery count.
       onUnrecognisedByte: (b) => RawLogger.instance.logUnrecognised(
@@ -158,6 +135,47 @@ class BatteryConnection {
   final BatteryCommands commands;
   final BatteryState state;
   late final BatteryParser parser;
+
+  /// Bookkeeping for every decoded frame: the JoySuny [parser]'s event hook,
+  /// and (#75) each event a [codec] sample produces.
+  void _onDecoded(BatteryEvent e) {
+    // C1: a decoded BAL_STATUS is the ONLY thing that makes the gate base
+    // fresh enough to build a gate-control write from.
+    lastFrameMs = now().millisecondsSinceEpoch; // #59 streaming watchdog
+    // #61 / #62 / #53: frame bookkeeping for the live indicator, the
+    // dormant-BMS probe and the one-cycle background sample.
+    frameCount++;
+    totalFrameCount++;
+    if (e is VersionEvent) {
+      lastVersionFrameMs = lastFrameMs;
+    } else if (isTelemetryEvent(e)) {
+      // Only the STREAM counts as "streaming": a version frame or an
+      // ack answers a command and must not clear the silence.
+      lastTelemetryMs = lastFrameMs;
+      lastFrameEverMs = lastFrameMs;
+      lastDataMs = lastFrameMs; // #71: the age of the last-known values
+      _cycleSeen.add(e.runtimeType);
+      streamClass = StreamClass.streaming;
+    }
+    if (e is BalancerEvent) {
+      lastGateStatusMs = lastFrameMs;
+      _noteGateAvailability();
+    }
+    _integrateThroughput(DateTime.now().millisecondsSinceEpoch);
+    _detectAlerts();
+    // #67: an alarm-byte transition becomes an alarm EVENT record with a
+    // snapshot of the state just decoded. Best-effort — it can never
+    // throw into the parser.
+    if (e is WarningEvent) {
+      guardSync<void>('alarm event capture',
+          () => _trackAlarmBytes(e.category, lastFrameMs!),
+          source: _source);
+    }
+    // L11: a frame that lands after dispose() must not throw on the closed
+    // controller (a demo/link callback can still be in flight).
+    if (!_events.isClosed) _events.add(e);
+    _logDecoded(e);
+  }
 
   final _events = StreamController<BatteryEvent>.broadcast();
   final _conn = StreamController<ConnState>.broadcast();
@@ -204,6 +222,7 @@ class BatteryConnection {
     // skipped once the controller is closed.
     final prev = connState;
     connState = s;
+    if (s != ConnState.connected) _stopPolling();
     _noteGateAvailability();
     if (_conn.isClosed) return;
     // H3: alert ONLY on a TRUE connected -> disconnected transition — a live
@@ -353,6 +372,7 @@ class BatteryConnection {
   /// never implies a user approval step: every reason clears by itself once
   /// the battery is connected and reporting.
   String? get gateControlsDisabledReason {
+    if (codec != null) return reasonReadOnlyFamily(codec!.family);
     if (connState != ConnState.connected) return reasonNotConnected;
     if (notStreaming) return reasonNotStreaming(silenceMs!, streamClass);
     if (gateBase == null) return reasonNoGateStatus;
@@ -367,8 +387,15 @@ class BatteryConnection {
   /// fresh-status gate refused "Output ON", and the pack idled into sleep
   /// unreachable. See [safeWriteBase] for the frame such a write carries
   /// without a fresh base.
-  String? get safeWritesDisabledReason =>
-      connState != ConnState.connected ? reasonNotConnected : null;
+  String? get safeWritesDisabledReason => codec != null
+      ? reasonReadOnlyFamily(codec!.family)
+      : connState != ConnState.connected
+          ? reasonNotConnected
+          : null;
+
+  /// #75: a non-JoySuny pack is monitored only; it has no app controls.
+  static String reasonReadOnlyFamily(String family) =>
+      '$family: read-only (monitoring only, no controls)';
 
   /// #59 / #58: true for the writes that cannot turn anything off: a MOS
   /// switch ON (Charge ON, Output ON, Both ON) and Restart. NOT passive /
@@ -736,6 +763,8 @@ class BatteryConnection {
     // Best effort — the old link may already be gone (recorded, never thrown).
     await _dropLink(_link, 'disconnect stale link before reconnect');
     parser.reset();
+    _stopPolling();
+    codec?.reset();
     // C1: the gate base from the previous link is untrusted until THIS link
     // decodes a BAL_STATUS.
     lastGateStatusMs = null;
@@ -814,14 +843,25 @@ class BatteryConnection {
       },
     );
 
+    final c = codec;
     await link.discoverAndSubscribe((data) {
       // ignore: avoid_print
       logLine('RX', hex(data));
       // Issue #19: capture the RAW notification bytes verbatim, BEFORE framing,
       // so nothing is ever lost (stray 0x30 resync byte / unrecognised bytes).
       RawLogger.instance.logRaw(state.serial ?? deviceId, data);
-      parser.addBytes(data);
-    });
+      if (c == null) {
+        parser.addBytes(data);
+      } else {
+        _onCodecBytes(c, data);
+      }
+    },
+        target: c == null
+            ? GattTarget.joySuny
+            : GattTarget(
+                service: c.serviceUuid,
+                notify: c.notifyUuid,
+                write: c.writeUuid));
     if (gen != _connectGen) {
       throw StateError('connect attempt to $deviceId was superseded');
     }
@@ -829,8 +869,84 @@ class BatteryConnection {
     final resolvedName = name ?? '';
     state.serial = resolvedName.isNotEmpty ? resolvedName : deviceId;
     _setConn(ConnState.connected);
-    await _handshake();
+    if (c == null) {
+      await _handshake();
+    } else {
+      _startPolling(c, gen);
+    }
     return resolvedName;
+  }
+
+  // --- #75 read-only families: poll + decode via [codec] --------------------
+
+  Timer? _pollTimer;
+  bool _polling = false;
+
+  /// Run one poll cycle now, then one every [BmsCodec.pollInterval] while this
+  /// link ([gen]) stays connected.
+  void _startPolling(BmsCodec c, int gen) {
+    _pollTimer?.cancel();
+    unawaited(_pollCycle(c, gen));
+    _pollTimer = Timer.periodic(c.pollInterval, (_) {
+      if (gen != _connectGen || connState != ConnState.connected) {
+        _stopPolling();
+        return;
+      }
+      unawaited(_pollCycle(c, gen));
+    });
+  }
+
+  void _stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  Future<void> _pollCycle(BmsCodec c, int gen) async {
+    if (_polling) return; // the previous cycle is still writing
+    _polling = true;
+    try {
+      final cmds = c.pollCommands();
+      for (var k = 0; k < cmds.length; k++) {
+        if (gen != _connectGen || connState != ConnState.connected) return;
+        if (k > 0) await Future<void>.delayed(c.commandGap);
+        await _send(cmds[k], label: '$_pollLabel ${c.family}');
+      }
+    } catch (e) {
+      // A write on a dropping link: the state listener marks the row
+      // disconnected and the manager reconnects; nothing to escalate here.
+      AppLog.instance.record(_source, '${state.serial} poll failed: $e');
+    } finally {
+      _polling = false;
+    }
+  }
+
+  static const String _pollLabel = 'poll';
+
+  /// Decode one notification with [c] and publish what it completed through
+  /// the same bookkeeping as a JoySuny frame. BalancerEvent is deliberately
+  /// never emitted: it is what makes a JoySuny gate base "fresh".
+  void _onCodecBytes(BmsCodec c, List<int> data) {
+    final samples = guardSync<List<FamilySample>>(
+            'decode ${c.family}', () => c.addBytes(data),
+            source: _source) ??
+        const [];
+    for (final smp in samples) {
+      smp.applyTo(state);
+      if (smp.voltage != null || smp.current != null) {
+        _onDecoded(const AllDataEvent());
+      }
+      if (smp.cellsMv != null) _onDecoded(const VoltageEvent());
+      if (smp.temps != null || smp.mosTemp != null) {
+        _onDecoded(const TempEvent());
+      }
+      if (smp.socPercent != null || smp.remainingAh != null) {
+        _onDecoded(const SocEvent());
+      }
+      if (smp.chargeMos != null || smp.dischargeMos != null) {
+        _onDecoded(const MosEvent());
+      }
+      if (smp.firmware != null) _onDecoded(const VersionEvent());
+    }
   }
 
   Future<void> _handshake() async {
@@ -865,6 +981,13 @@ class BatteryConnection {
     final link = _link;
     if (link == null || connState != ConnState.connected) {
       throw StateError('Not connected — $label was not sent');
+    }
+    // #75: a read-only family row only ever sends its codec's poll frames.
+    // Every other command here is a JoySuny frame and means nothing (or worse)
+    // to a JBD / JK / Daly / … BMS.
+    if (codec != null && !label.startsWith(_pollLabel)) {
+      AppLog.instance.record(_source, 'refused "$label": read-only BMS family');
+      throw StateError('${codec!.family} is read-only — $label was not sent');
     }
     // #41: while a firmware update runs, ONLY the session's own frames
     // (labelled "OTA: …") go out — any other write could corrupt the flash.
@@ -1309,6 +1432,8 @@ class BatteryConnection {
     if (connState != ConnState.connected || !notStreaming || _probe != null) {
       return;
     }
+    // #75: AT+V is a JoySuny command; a read-only family re-polls on its own.
+    if (codec != null) return;
     // #41: the probe is a write (AT+V) — never during a firmware update.
     if (OtaLock.inProgress) return;
     final nowMs = now().millisecondsSinceEpoch;
@@ -1448,7 +1573,13 @@ class BatteryConnection {
   final Set<Type> _cycleSeen = {};
 
   /// True once every [requiredCycleTypes] frame has been decoded on this link.
-  bool get cycleComplete => requiredCycleTypes.every(_cycleSeen.contains);
+  bool get cycleComplete => codec != null
+      ? codecCycleTypes.every(_cycleSeen.contains)
+      : requiredCycleTypes.every(_cycleSeen.contains);
+
+  /// #75: what one poll cycle of a read-only family always yields (pack
+  /// values + cells). Temperatures / MOS are not reported by every family.
+  static const Set<Type> codecCycleTypes = {AllDataEvent, VoltageEvent};
 
   /// Completes true once [cycleComplete], false after [timeout].
   Future<bool> awaitFullCycle(

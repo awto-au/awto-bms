@@ -19,6 +19,7 @@ import 'battery_connection.dart';
 import 'battery_log.dart';
 import 'battery_protocol.dart';
 import 'ble_transport.dart';
+import 'bms_codecs.dart';
 import 'bms_families.dart';
 import 'demo_source.dart';
 import 'diagnostics.dart';
@@ -511,10 +512,15 @@ class BatteryManager {
     final family = matchBmsFamily(name: name, serviceUuids: r.serviceUuids);
     if (family == null) return;
 
-    // DETECT-only: an other-family BMS. Surface it as a muted entry, but do NOT
-    // connect, handshake, decode, or start a logging stream. DECODE is future
-    // work (each family has its own frame protocol).
-    if (!family.supported) {
+    // #75: an other-family BMS with a codec is connected READ-ONLY (poll +
+    // decode, no controls) through the same row / logging path as JoySuny.
+    final codec =
+        family.supported ? null : codecForFamily(family, name: name);
+
+    // DETECT-only: an other-family BMS with no codec (a SmartBat whose name
+    // carries no usable serial). Surface it as a muted entry, but do NOT
+    // connect, handshake, decode, or start a logging stream.
+    if (!family.supported && codec == null) {
       final existing = _othersById[r.deviceId];
       if (existing != null) {
         existing.rssi = r.rssi; // refresh signal strength every scan
@@ -533,13 +539,16 @@ class BatteryManager {
       return;
     }
 
-    // ---- Supported (JoySuny) path — unchanged behaviour. --------------------
-    final isRv = name.startsWith('RV');
+    // ---- Supported (JoySuny) path — unchanged behaviour; read-only families
+    // (#75) share it with their codec. -----------------------------------------
+    final isRv = codec == null && name.startsWith('RV');
 
     final id = r.deviceId;
     final existing = _byId[id];
     if (existing != null) {
       existing.state.rssi = r.rssi; // refresh signal strength every scan
+      // #75: a remembered row linked before any scan has no family yet.
+      if (codec != null) existing.codec ??= codec;
       // Reconnect a dropped battery that is advertising again (issue #49): the
       // rescan re-attempts it (subject to the connect backoff) whenever it is
       // seen disconnected while still advertising.
@@ -559,6 +568,7 @@ class BatteryManager {
       deviceId: id,
       profile: profile,
       rssi: r.rssi,
+      codec: codec,
     );
     logger.ensureAttached(conn); // record its telemetry to SQLite
     unawaited(_connect(conn, id, name));
@@ -916,8 +926,15 @@ class BatteryManager {
     final profile = r.profile == 'RV' ? DeviceProfile.rv : DeviceProfile.sphere;
     // #71: on the manager's clock, so the placeholder's "last known · … ago"
     // age is measured on the same clock its stamp came from.
-    final c =
-        BatteryConnection(profile: profile, transport: transport, now: now)
+    // #75: the family is not persisted; recover it from the serial (the
+    // advertised name) where the name alone identifies it. A service-gated
+    // family (Stealth, Redodo) gets its codec from the next scan instead.
+    final family = matchBmsFamily(name: r.serial);
+    final codec = family == null || family.supported
+        ? null
+        : codecForFamily(family, name: r.serial);
+    final c = BatteryConnection(
+        profile: profile, transport: transport, now: now, codec: codec)
           ..inFleet = inFleet
           ..isRemembered = true
           ..rememberedRemoteId = r.remoteId
@@ -986,10 +1003,14 @@ class BatteryManager {
     required String deviceId,
     required DeviceProfile profile,
     int? rssi,
+    BmsCodec? codec,
   }) {
     final bindable = bindableBySerial(serial) ?? rebindableBySerial(serial);
     if (bindable != null) {
       if (rssi != null) bindable.state.rssi = rssi;
+      // #75: a remembered row is restored without its family; the scan that
+      // recognised it supplies the codec (never replaced once set).
+      if (codec != null) bindable.codec ??= codec;
       // M12: forget the stale id (and its backoff) so the row is reachable
       // ONLY through the id it currently advertises.
       final oldId = deviceIdOf(bindable);
@@ -1007,7 +1028,8 @@ class BatteryManager {
     }
     // New battery: NOT in the fleet by default (#10) unless this serial is a
     // persisted favourite, in which case restore membership.
-    final conn = BatteryConnection(profile: profile, transport: transport);
+    final conn =
+        BatteryConnection(profile: profile, transport: transport, codec: codec);
     if (rssi != null) conn.state.rssi = rssi;
     conn.state.serial = serial;
     conn.rememberedRemoteId = deviceId;

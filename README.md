@@ -11,6 +11,11 @@ Supports both re-badges of the same firmware:
 - **Sphere Battery** (`com.joysuny.batteryutil`), advertised name prefix `JS`
 - **RV Battery** (`com.joysuny.mimibattery`), advertised name prefix `RV`
 
+It also reads, **read-only**, the other BMS families it recognises: JBD /
+Xiaoxiang / Stealth, JK, ANT, Daly, Redodo / LiTime / Power Queen, and
+Offgridtec SmartBat. See `docs/BMS-FAMILIES.md` (#75). Those decoders are ported
+from aiobmsble and checked against its captured frames, not against real packs.
+
 ## Project layout
 
 Paths are relative to `projects/awto-bms/`.

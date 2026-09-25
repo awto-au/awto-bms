@@ -90,8 +90,13 @@ class FakeLink implements BleLink {
   /// replies through the REAL parser (`link.onData!(bytes)`).
   void Function(List<int> data)? onData;
 
+  /// #75: the service/characteristics the connection asked this link to bind.
+  GattTarget? lastTarget;
+
   @override
-  Future<void> discoverAndSubscribe(void Function(List<int> data) onData) async {
+  Future<void> discoverAndSubscribe(void Function(List<int> data) onData,
+      {GattTarget target = GattTarget.joySuny}) async {
+    lastTarget = target;
     if (transport.failDiscover) {
       throw StateError('Failed to get services: Unreachable');
     }

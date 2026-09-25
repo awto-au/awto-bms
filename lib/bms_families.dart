@@ -182,6 +182,22 @@ final List<BmsFamily> families = [
     writeChars: [u16('ffe1')],
   ),
 
+  // Redodo / LiTime / Power Queen / Starry Sea (#75): FFE0 service, FFE1
+  // notify / FFE2 write. Prefixes from aiobmsble's redodo_bms matcher. They are
+  // short ("R-", "L-", "S-"), so a name hit is trusted ONLY with FFE0
+  // advertised.
+  BmsFamily(
+    name: 'Redodo / LiTime',
+    namePrefixes: const [
+      'P-12', 'P-24', 'PQ-12', 'PQ-24', 'R-12', 'R-24', 'RO-12', 'RO-24', //
+      'L-12', 'L-24', 'L-51', 'LT-12', 'LT-24', 'LT-51', 'S-', 'SS-',
+    ],
+    serviceUuid: u16('ffe0'),
+    notifyChars: [u16('ffe1')],
+    writeChars: [u16('ffe2')],
+    namePrefixNeedsService: true,
+  ),
+
   // Daly: FFF0 service, FFF1 notify / FFF2 write.
   BmsFamily(
     name: 'Daly BMS',
