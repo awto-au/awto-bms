@@ -53,7 +53,14 @@ Future<void> loadRealFonts() async {
     throw StateError('material_fonts not found under the Flutter SDK cache '
         '(${cache?.path}); run `flutter precache`');
   }
-  File mf(String n) => File('${dir.path}/$n');
+  // The SDK ships `Roboto-Regular.ttf`; match names case-insensitively so the
+  // lookup works on case-sensitive file systems (Linux CI), not only Windows.
+  final byLower = {
+    for (final e in dir.listSync().whereType<File>())
+      e.uri.pathSegments.last.toLowerCase(): e,
+  };
+  File mf(String n) =>
+      byLower[n.toLowerCase()] ?? File('${dir.path}/$n');
   final roboto = [
     for (final n in const [
       'roboto-regular.ttf',

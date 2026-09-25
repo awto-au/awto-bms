@@ -22,23 +22,8 @@ void main() {
         disconnected: disconnected,
       );
 
-  group('notificationIdFor', () {
-    test('is stable and positive for a (serial, condition)', () {
-      final a = notificationIdFor('JS-1', AlertCondition.fault);
-      final b = notificationIdFor('JS-1', AlertCondition.fault);
-      expect(a, b, reason: 'same inputs -> same id (updates in place)');
-      expect(a, greaterThanOrEqualTo(0));
-    });
-
-    test('differs by condition and by serial', () {
-      final fault = notificationIdFor('JS-1', AlertCondition.fault);
-      final unknown = notificationIdFor('JS-1', AlertCondition.unknownChange);
-      final disc = notificationIdFor('JS-1', AlertCondition.disconnect);
-      final other = notificationIdFor('JS-2', AlertCondition.fault);
-      expect({fault, unknown, disc, other}.length, 4,
-          reason: 'no collisions across the conditions/serials used here');
-    });
-  });
+  // notificationIdFor (stable, positive, distinct ids) is pinned against the
+  // published FNV-1a vectors in review_pass_c2_test.dart (L14).
 
   group('desiredNotifications', () {
     test('a genuine fault -> one Faults-channel notification with the reason',

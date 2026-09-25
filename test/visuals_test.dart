@@ -53,6 +53,7 @@ void main() {
     });
   });
 
+  // Run splitting on offline gaps is splitRuns's, tested in intervals_test.dart.
   group('buildSparklineRuns (offline gaps unbridged)', () {
     ReadingInterval iv(int s, int e, double v) =>
         ReadingInterval(startMs: s, endMs: e, valueNum: v);
@@ -66,19 +67,6 @@ void main() {
       expect(runs.length, 1);
       // step points: (start,v)(end,v) per interval.
       expect(runs.first.length, 6);
-    });
-
-    test('a gap wider than the threshold SPLITS into two runs (unbridged)', () {
-      final runs = buildSparklineRuns([
-        iv(0, 1000, 5),
-        // ...offline... next row starts > 10 s after the previous end:
-        iv(20000, 21000, 5),
-      ], gapMs: 10000);
-      expect(runs.length, 2);
-      // The two runs are separate: the first ends at 1000, the second starts
-      // at 20000 — nothing bridges [1000, 20000).
-      expect(runs[0].last.ms, 1000);
-      expect(runs[1].first.ms, 20000);
     });
 
     test('null-valued rows are skipped', () {
@@ -97,10 +85,6 @@ void main() {
       expect(runs.first.length, lessThanOrEqualTo(200));
       expect(runs.first.first.ms, 0); // first preserved
       expect(runs.first.last.ms, many.last.endMs.toDouble()); // last preserved
-    });
-
-    test('empty input yields no runs', () {
-      expect(buildSparklineRuns(const []), isEmpty);
     });
   });
 
@@ -228,34 +212,12 @@ void main() {
           [for (final v in vs) SparkPoint(0, v)]
         ];
 
-    test('all-positive data spans 0..max (includes 0, no zoomed band)', () {
-      final b = sparkYBounds(runs([3.2, 3.4, 3.35]));
-      expect(b, isNotNull);
-      expect(b!.$1, 0); // lo pinned to 0
-      expect(b.$2, 3.4); // hi = data max
-    });
-
-    test('all-negative data spans min..0 (includes 0)', () {
-      final b = sparkYBounds(runs([-3, -1, -2]))!;
-      expect(b.$1, -3);
-      expect(b.$2, 0);
-    });
-
+    // The value policy itself (0..max, min..0, flat) is yBounds' and is
+    // tested in intervals_test.dart; these check what the wrapper adds.
     test('signed metric (centreZero) is symmetric about 0', () {
       final b = sparkYBounds(runs([-4, 12, 3]), centreZero: true)!;
       expect(b.$1, -12);
       expect(b.$2, 12);
-    });
-
-    test('a perfectly flat series is padded ±1 around its value+0', () {
-      // Flat at 5 → include 0 gives (0,5); not flat after including 0.
-      final b = sparkYBounds(runs([5, 5]))!;
-      expect(b.$1, 0);
-      expect(b.$2, 5);
-      // Flat at 0 → padded to (-1, 1).
-      final z = sparkYBounds(runs([0, 0]))!;
-      expect(z.$1, -1);
-      expect(z.$2, 1);
     });
 
     test('empty runs yield null', () {
