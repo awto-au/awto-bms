@@ -20,3 +20,7 @@ logs/
 .flutter-plugins
 .flutter-plugins-dependencies
 .packages
+
+# Flutter build output (the snapshot has no root .gitignore to carry these).
+.dart_tool/
+build/
