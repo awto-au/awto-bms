@@ -37,8 +37,6 @@ Alternatives considered:
   ESP-IDF, not Zephyr. It stays a design reference.
 - **Dart to WebAssembly on a Wasm runtime.** `dart2wasm` output still expects a
   JavaScript host; its standalone mode is under development. Not ready.
-- **A slim, Dartino-style runtime.** Not needed: the targets are high-end ESP32s
-  that can hold the standard runtime.
 
 ## Decision
 
@@ -51,8 +49,7 @@ Alternatives considered:
 | Zephyr on ESP32 RISC-V (P4 class) | Standard Dart ahead-of-time runtime, **ported to Zephyr**, using the SDK's 32-bit RISC-V backend | Flutter-style rendering on vygl |
 
 - **Embedded scope:** only the latest ESP32 RISC-V chips, P4 class, with PSRAM,
-  on current Zephyr. No minimal or slim runtime, and no support for small chips
-  (C3/C6/H2 class) or the Xtensa chips (original ESP32, S2, S3).
+  on current Zephyr, running the standard runtime.
 - **The Zephyr port:** Zephyr gets its own versions of the runtime's
   OS-specific files (threads, virtual memory, time, entropy, files, sockets),
   using Zephyr's POSIX layer where it fits. Memory protection is dropped: the
@@ -81,8 +78,7 @@ Alternatives considered:
   - a Flutter-style renderer on vygl for ESP32 displays.
 - **Maintenance:** AWTO will maintain a Dart runtime fork (the Zephyr platform
   files) and vygl.
-- **Hardware:** the embedded bill of materials is P4-class. Cheap headless
-  readers on small ESP32s are out of scope by choice.
+- **Hardware:** the embedded bill of materials is P4-class.
 
 ## Risks
 
