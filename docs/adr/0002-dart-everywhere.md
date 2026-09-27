@@ -145,6 +145,23 @@ double-heavy code matters. BMS decoding is almost entirely integer work.
 - **Embedder:** about 500 lines. Initialise with the linked-in program, run
   one isolate, run a message loop.
 
+## ESP32-P4 on Zephyr (checked in Zephyr source, `1ee3b93`, 2026-08-20)
+
+- **Board:** `esp32p4_function_ev_board/esp32p4/hpcore`. Listed support
+  includes display, entropy, Ethernet, Wi-Fi, SPI, I2C, SD host and DMA.
+- **ISA:** `rv32imafc` plus `zicsr` and `zifencei`; rev 3 adds `zba`, `zbb`,
+  `zbs` and `zcb`. No D extension, which confirms the floating-point finding.
+- **Memory protection:** PMP with 16 slots. The "MMU" in the Espressif code is
+  the cache MMU that maps external flash and PSRAM into a 64 MB window at
+  `0x48000000`. It is not page-based virtual memory: no `satp`/Sv32. So Dart's
+  page-level protect calls stay no-ops, and PMP guards a few regions (e.g.
+  stack ends).
+- **Internal SRAM:** 768 KB of HP SRAM. Heap and program live in PSRAM.
+- **Radio:** the P4 has no radio of its own. On the board, Wi-Fi and Bluetooth
+  go through an ESP-Hosted companion chip. Zephyr exposes it as a normal
+  Bluetooth HCI (`zephyr,bt-hci = &esp_hosted_mcu_hci`) and Wi-Fi interface,
+  so the Zephyr `BleTransport` uses Zephyr's standard Bluetooth host.
+
 ## Risks
 
 - **Floating point:** see above. The trap-emulation route is well understood
@@ -154,8 +171,7 @@ double-heavy code matters. BMS decoding is almost entirely integer work.
   built on a 32-bit host. CI coverage is unverified.
 - **Memory:** 512 KB heap pages, thread stacks, and the Bluetooth and Wi-Fi
   stacks all share PSRAM.
-- **Zephyr support for the ESP32-P4** (core, PSRAM, cache, running code from
-  PSRAM) is not yet verified.
+- **Running code from PSRAM** on Zephyr is not yet verified.
 - **Flutter rendering on vygl** is a separate, large piece of work.
 
 ## Next steps
