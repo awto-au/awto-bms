@@ -105,7 +105,19 @@ Two ways through, keeping the chip:
    compiler, and unlikely to be accepted upstream. Fast doubles, at the cost of
    maintaining a compiler fork.
 
-Recommended: start with option 1. Move to option 2 only if profiling shows
+Recommended: start with option 1. **Done 2026-09-28:** `platform/fpemu/`
+(Zephyr module plus Zephyr patch) passes a bit-exact differential test against
+a real F/D FPU, both bare-metal and on Zephyr with two threads. Size is about
+14.5 KB of code. Hardware performance is not yet measured.
+
+**Found while building it: no compressed double loads/stores on the P4.**
+- P4 rev 3 implements Zcmp/Zcmt. These reuse the compressed double-store
+  encoding space (`c.fsdsp`), so such instructions would execute as `cm.*`
+  instead of trapping.
+- The Zephyr patch therefore builds emulation mode with Zca+Zcf and no Zcd.
+- Dart's RISC-V assembler must also stop emitting `c.fld`/`c.fsd`/`c.fldsp`/
+  `c.fsdsp` for the P4. That is a small, required change in the Dart fork.
+- Confidence: medium. Confirm against the Espressif TRM. Move to option 2 only if profiling shows
 double-heavy code matters. BMS decoding is almost entirely integer work.
 
 **Other findings.**
@@ -183,5 +195,7 @@ double-heavy code matters. BMS decoding is almost entirely integer work.
    assembly, virtual memory on a static aligned arena, dart:io stubbed, D still
    enabled.
 3. **M2:** the same on an rv32imafc configuration with the F/D trap emulator.
+   The emulator itself is done and tested (`platform/fpemu/`). What remains is
+   running Dart on it, plus the Dart assembler change to drop Zcd.
 4. **M3:** ESP32-P4 hardware with PSRAM, then `battery_protocol.dart` and
    `bms_codecs.dart` passing the captured-frame tests on it.

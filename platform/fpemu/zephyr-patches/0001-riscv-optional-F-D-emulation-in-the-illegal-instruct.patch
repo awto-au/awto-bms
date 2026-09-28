@@ -1,0 +1,134 @@
+From f73f205618c79dda022b7741e51838c5d9ad2ce0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 00:20:50 +0000
+Subject: [PATCH] riscv: optional F/D emulation in the illegal-instruction trap
+
+Add CONFIG_RISCV_FP_EMULATION: compile for the hard-double ABI
+(-march=...fd, -mabi=ilp32d) while leaving the FPU off, and let the
+exception entry call z_riscv_fpemu_trap() on illegal instructions.
+When it returns non-zero the instruction was emulated (mepc advanced in
+the esf) and the exception returns directly.
+
+In this mode C is expressed as Zca+Zcf (no Zcd): cores with Zcmp/Zcmt
+(e.g. ESP32-P4 rev 3) reuse the compressed double load/store encodings.
+---
+ arch/riscv/Kconfig                    | 20 ++++++++++++++++++++
+ arch/riscv/core/isr.S                 | 21 +++++++++++++++++++++
+ cmake/compiler/gcc/target_riscv.cmake | 14 +++++++++++++-
+ 3 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index 012b05c6b..c694ca791 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -19,6 +19,26 @@ config FLOAT_HARD
+ 	  This option enables the hard-float calling convention.
+ 	  Adds eight floating-point argument registers.
+ 
++config RISCV_FP_EMULATION
++	bool "Emulate the F and D extensions in the illegal-instruction trap"
++	depends on !FPU
++	depends on !64BIT
++	depends on !RISCV_ISA_RV32E
++	depends on !USERSPACE
++	depends on !RISCV_SOC_HAS_ISR_STACKING
++	depends on THREAD_LOCAL_STORAGE
++	help
++	  Compile for the hard-double ABI (-march=...fd, -mabi=ilp32d) while
++	  leaving the FPU off (mstatus.FS = 0), so every F/D instruction and
++	  every fcsr/frm/fflags access raises an illegal-instruction exception.
++	  The exception entry calls z_riscv_fpemu_trap(), which must be
++	  provided (e.g. by the fpemu module) and returns non-zero when it
++	  emulated the instruction; execution then resumes after it.
++
++	  For cores whose FPU lacks the D extension (e.g. rv32imafc) running
++	  code generated for rv32imafdc/ilp32d. Floating-point state is kept
++	  per thread in thread-local storage; ISRs must not use floating point.
++
+ config RISCV_USE_MSAVE_RESTORE
+ 	bool "Compile with -msave-restore to reduce some code footprint"
+ 	help
+diff --git a/arch/riscv/core/isr.S b/arch/riscv/core/isr.S
+index bd41640bb..29b24795d 100644
+--- a/arch/riscv/core/isr.S
++++ b/arch/riscv/core/isr.S
+@@ -258,6 +258,23 @@ SECTION_FUNC(exception.entry, _isr_wrapper)
+ 	csrr t2, RV_STATUS
+ 	sr t2, __struct_arch_esf_mstatus_OFFSET(sp)
+ 
++#if defined(CONFIG_RISCV_FP_EMULATION)
++	/*
++	 * Illegal instruction: let the F/D emulator try it. It returns
++	 * non-zero after emulating the instruction and advancing mepc in the
++	 * esf; the exception then returns directly, like fp_trap_exit.
++	 */
++	csrr t0, RV_CAUSE
++	li t1, CONFIG_RISCV_MCAUSE_EXCEPTION_MASK
++	and t0, t0, t1
++	li t1, 2		/* 2 = illegal instruction */
++	bne t0, t1, 1f
++	mv a0, sp
++	call z_riscv_fpemu_trap
++	bnez a0, fpemu_exit
++1:
++#endif /* CONFIG_RISCV_FP_EMULATION */
++
+ #if defined(CONFIG_FPU_SHARING)
+ 	/* determine if FPU access was disabled */
+ 	li t1, MSTATUS_FS
+@@ -926,6 +943,10 @@ no_reschedule:
+ 	add t1, t1, -1
+ 	sb t1, _thread_offset_to_exception_depth(t0)
+ fp_trap_exit:
++#endif
++
++#if defined(CONFIG_RISCV_FP_EMULATION)
++fpemu_exit:
+ #endif
+ 
+ 	/* Restore RV_EPC and MSTATUS registers */
+diff --git a/cmake/compiler/gcc/target_riscv.cmake b/cmake/compiler/gcc/target_riscv.cmake
+index 315097af7..3cc96cc19 100644
+--- a/cmake/compiler/gcc/target_riscv.cmake
++++ b/cmake/compiler/gcc/target_riscv.cmake
+@@ -40,6 +40,9 @@ if(CONFIG_FLOAT_HARD)
+   else()
+     string(APPEND riscv_mabi "f")
+   endif()
++elseif(CONFIG_RISCV_FP_EMULATION)
++  # Hard-double ABI; the instructions are emulated (FPU left off).
++  string(APPEND riscv_mabi "d")
+ endif()
+ 
+ if(CONFIG_FPU)
+@@ -49,10 +52,18 @@ if(CONFIG_FPU)
+   if(CONFIG_RISCV_ISA_EXT_D)
+     string(APPEND riscv_march "d")
+   endif()
++elseif(CONFIG_RISCV_FP_EMULATION)
++  string(APPEND riscv_march "fd")
+ endif()
+ 
+ if(CONFIG_RISCV_ISA_EXT_C)
+-  string(APPEND riscv_march "c")
++  if(CONFIG_RISCV_FP_EMULATION)
++    # C without Zcd: cores with Zcmp/Zcmt (e.g. ESP32-P4 rev 3) reuse the
++    # compressed double load/store encodings, so they must never be emitted.
++    string(APPEND riscv_march "_zca_zcf")
++  else()
++    string(APPEND riscv_march "c")
++  endif()
+ endif()
+ 
+ if(CONFIG_RISCV_ISA_EXT_ZICNTR)
+@@ -99,6 +110,7 @@ endif()
+ 
+ # Zcd is implied by C+D
+ if(CONFIG_RISCV_ISA_EXT_ZCD AND
++   NOT CONFIG_RISCV_FP_EMULATION AND
+    NOT (CONFIG_RISCV_ISA_EXT_C AND CONFIG_RISCV_ISA_EXT_D))
+   string(APPEND riscv_march "_zcd")
+ endif()
+-- 
+2.43.0
+

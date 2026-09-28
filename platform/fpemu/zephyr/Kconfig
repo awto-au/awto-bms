@@ -1,0 +1,14 @@
+config FPEMU
+	bool "fpemu: RISC-V F/D emulation (provides z_riscv_fpemu_trap)"
+	default y if RISCV_FP_EMULATION
+	depends on RISCV_FP_EMULATION
+	help
+	  Emulates every RV32 F and D instruction (and fcsr/frm/fflags access)
+	  in the illegal-instruction trap using Berkeley SoftFloat 3e, with
+	  per-thread floating-point state in thread-local storage.
+
+config FPEMU_STATS
+	bool "Count emulated instructions"
+	depends on FPEMU
+	help
+	  Keep a global count of emulated instructions (fpemu_emulated_count()).
